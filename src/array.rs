@@ -11,6 +11,8 @@
 
 use std::marker::PhantomData;
 
+use bytes::Bytes;
+
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 
@@ -65,7 +67,7 @@ pub trait ArrayData: Send + Sync {
 /// Use [`values()`](PrimitiveArray::values) to get a typed `&[T]` slice.
 pub struct PrimitiveArray<T: NativeType> {
     dtype: DType,
-    data: Vec<u8>,
+    data: Bytes,
     _phantom: PhantomData<T>,
 }
 
@@ -73,31 +75,41 @@ impl<T: NativeType> PrimitiveArray<T> {
     /// Creates a new `PrimitiveArray` from a slice of values.
     pub fn from_slice(values: &[T]) -> Self {
         let byte_len = std::mem::size_of_val(values);
-        let data =
+        let data: Vec<u8> =
             unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) }.to_vec();
         Self {
             dtype: T::DTYPE,
-            data,
+            data: Bytes::from(data),
             _phantom: PhantomData,
         }
     }
 
-    /// Creates a `PrimitiveArray` from raw bytes that were previously
+    /// Creates a `PrimitiveArray` from `Bytes` that were previously
     /// stored in the format.
     ///
     /// Returns an error if `bytes.len()` is not a multiple of the element size.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+    pub fn from_bytes(bytes: impl Into<Bytes>) -> Result<Self> {
+        let data = bytes.into();
         let elem = std::mem::size_of::<T>();
-        if elem > 0 && bytes.len() % elem != 0 {
+        if elem > 0 && data.len() % elem != 0 {
             return Err(Error::InvalidFooter(format!(
                 "byte length {} is not a multiple of element size {}",
-                bytes.len(),
+                data.len(),
                 elem,
             )));
         }
+        // Ensure pointer alignment for safe reinterpret via values().
+        // In the common case (same-typed arrays packed sequentially),
+        // the data is already aligned and this is zero-copy.
+        let align = std::mem::align_of::<T>();
+        let data = if align > 1 && (data.as_ptr() as usize) % align != 0 {
+            Bytes::from(data.to_vec())
+        } else {
+            data
+        };
         Ok(Self {
             dtype: T::DTYPE,
-            data: bytes,
+            data,
             _phantom: PhantomData,
         })
     }
@@ -170,10 +182,10 @@ impl BinaryArray {
     }
 
     /// Creates a `BinaryArray` from raw bytes (offsets + values already encoded).
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         Self {
             dtype: DType::Binary,
-            data: bytes,
+            data: bytes.into(),
         }
     }
 
@@ -277,11 +289,11 @@ impl StringArray {
     }
 
     /// Creates a `StringArray` from raw bytes (offsets + values already encoded).
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         Self {
             inner: BinaryArray {
                 dtype: DType::String,
-                data: bytes,
+                data: bytes.into(),
             },
         }
     }
@@ -321,7 +333,8 @@ impl ArrayData for StringArray {
 /// For fixed-width types, produces a [`PrimitiveArray`]. For
 /// [`DType::String`] and [`DType::Binary`], produces [`StringArray`]
 /// and [`BinaryArray`] respectively.
-pub fn from_bytes_dynamic(dtype: &DType, bytes: Vec<u8>) -> Result<Box<dyn ArrayData>> {
+pub fn from_bytes_dynamic(dtype: &DType, bytes: impl Into<Bytes>) -> Result<Box<dyn ArrayData>> {
+    let bytes: Bytes = bytes.into();
     match dtype {
         DType::UInt8 => Ok(Box::new(PrimitiveArray::<u8>::from_bytes(bytes)?)),
         DType::UInt16 => Ok(Box::new(PrimitiveArray::<u16>::from_bytes(bytes)?)),
@@ -358,10 +371,7 @@ mod tests {
     #[test]
     fn primitive_array_from_bytes() {
         let values: Vec<i32> = vec![10, 20, 30];
-        let bytes: Vec<u8> = values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let arr = PrimitiveArray::<i32>::from_bytes(bytes).unwrap();
         assert_eq!(arr.values(), &[10i32, 20, 30]);
     }

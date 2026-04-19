@@ -64,7 +64,8 @@ async fn delete_and_compact() {
     // After compact: only a and c remain in footer.
     let r = Reader::open(storage, 1024).await.unwrap();
     assert_eq!(r.footer().arrays.len(), 2);
-    let names: Vec<_> = r.list_arrays().iter().map(|a| a.name.clone()).collect();
+    let mut names: Vec<_> = r.list_arrays().iter().map(|a| a.name.clone()).collect();
+    names.sort();
     assert_eq!(names, vec!["a", "c"]);
     let a = r.read_array::<u8>("a").await.unwrap();
     assert_eq!(a.values(), &[10u8; 20]);

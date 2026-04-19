@@ -8,7 +8,7 @@
 use bytes::Bytes;
 use moka::future::Cache;
 
-use crate::block::BlockMeta;
+use crate::block::{BlockMeta, CodecId};
 use crate::codec::decompress_by_id;
 use crate::error::{Error, Result};
 use crate::storage::Storage;
@@ -62,9 +62,13 @@ impl BlockCache {
 
         self.inner
             .try_get_with(block_id, async move {
-                let compressed = storage.read_range(range).await?;
-                let decompressed = decompress_by_id(&codec_id, &compressed, uncompressed_size)?;
-                Ok::<Bytes, Error>(Bytes::from(decompressed))
+                let raw = storage.read_range(range).await?;
+                let decompressed = if codec_id == CodecId::None {
+                    raw // zero-copy: no decompression needed
+                } else {
+                    Bytes::from(decompress_by_id(&codec_id, &raw, uncompressed_size)?)
+                };
+                Ok::<Bytes, Error>(decompressed)
             })
             .await
             .map_err(|e| Error::Storage(format!("cache load failed: {e}")))

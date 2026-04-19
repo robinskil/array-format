@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::address::BlockId;
 use crate::array::{self, ArrayData, NativeType, PrimitiveArray};
+use crate::block::BlockMeta;
 use crate::cache::BlockCache;
 use crate::error::{Error, Result};
 use crate::footer::Footer;
@@ -39,6 +41,8 @@ pub struct Reader {
     cache: BlockCache,
     /// name → index into `footer.arrays` for non-deleted arrays.
     array_index: HashMap<String, usize>,
+    /// block_id → index into `footer.blocks` for O(1) block lookup.
+    block_index: HashMap<BlockId, usize>,
 }
 
 /// Builds a name→index map for non-deleted arrays.
@@ -51,6 +55,11 @@ fn build_array_index(arrays: &[ArrayMeta]) -> HashMap<String, usize> {
         .collect()
 }
 
+/// Builds a block_id→index map for O(1) block lookup.
+fn build_block_index(blocks: &[BlockMeta]) -> HashMap<BlockId, usize> {
+    blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect()
+}
+
 impl Clone for Reader {
     fn clone(&self) -> Self {
         Self {
@@ -58,6 +67,7 @@ impl Clone for Reader {
             footer: self.footer.clone(),
             cache: self.cache.clone(),
             array_index: self.array_index.clone(),
+            block_index: self.block_index.clone(),
         }
     }
 }
@@ -77,12 +87,14 @@ impl Reader {
     pub async fn open_dyn(storage: Arc<dyn Storage>, cache_capacity_bytes: u64) -> Result<Self> {
         let footer = crate::footer::read_footer(storage.as_ref()).await?;
         let array_index = build_array_index(&footer.arrays);
+        let block_index = build_block_index(&footer.blocks);
 
         Ok(Self {
             storage,
             footer,
             cache: BlockCache::new(cache_capacity_bytes),
             array_index,
+            block_index,
         })
     }
 
@@ -133,7 +145,7 @@ impl Reader {
             });
         }
         let bytes = self.read_chunk_raw(name, coord).await?;
-        PrimitiveArray::<T>::from_bytes(bytes.to_vec())
+        PrimitiveArray::<T>::from_bytes(bytes)
     }
 
     /// Reads a single chunk as a `Box<dyn ArrayData>`.
@@ -145,7 +157,7 @@ impl Reader {
         let array = self.get_array(name)?;
         let dtype = array.dtype.clone();
         let bytes = self.read_chunk_raw(name, coord).await?;
-        array::from_bytes_dynamic(&dtype, bytes.to_vec())
+        array::from_bytes_dynamic(&dtype, bytes)
     }
 
     /// Returns a reference to the loaded footer.
@@ -155,39 +167,42 @@ impl Reader {
 
     // ── internal helpers ────────────────────────────────────────────
 
-    /// Reads the full concatenated raw bytes for an array.
-    pub async fn read_raw_bytes(&self, name: &str) -> Result<Vec<u8>> {
+    /// Reads the full raw bytes for an array.
+    ///
+    /// For flat arrays (single address) this returns a zero-copy
+    /// `Bytes::slice()` from the cached block with no allocation.
+    pub async fn read_raw_bytes(&self, name: &str) -> Result<Bytes> {
         let array = self.get_array(name)?;
 
-        let addresses = array.layout.all_addresses();
-        let mut out = Vec::new();
-
-        for addr in addresses {
-            let block_meta = self
-                .footer
-                .blocks
-                .iter()
-                .find(|b| b.id == addr.block_id)
-                .ok_or(Error::BlockOutOfRange {
-                    block_id: addr.block_id.0,
-                })?;
-
-            let block_bytes = self
-                .cache
-                .get_or_load(block_meta, self.storage.as_ref())
-                .await?;
-
-            let start = addr.offset as usize;
-            let end = start + addr.size as usize;
-            if end > block_bytes.len() {
-                return Err(Error::BlockOutOfRange {
-                    block_id: addr.block_id.0,
-                });
+        match &array.layout {
+            ArrayLayout::Flat { address } => {
+                let block_bytes = self.load_block(address.block_id).await?;
+                let start = address.offset as usize;
+                let end = start + address.size as usize;
+                if end > block_bytes.len() {
+                    return Err(Error::BlockOutOfRange {
+                        block_id: address.block_id.0,
+                    });
+                }
+                Ok(block_bytes.slice(start..end))
             }
-            out.extend_from_slice(&block_bytes[start..end]);
+            ArrayLayout::Chunked { chunks, .. } => {
+                let total: usize = chunks.iter().map(|(_, a)| a.size as usize).sum();
+                let mut out = Vec::with_capacity(total);
+                for (_, addr) in chunks {
+                    let block_bytes = self.load_block(addr.block_id).await?;
+                    let start = addr.offset as usize;
+                    let end = start + addr.size as usize;
+                    if end > block_bytes.len() {
+                        return Err(Error::BlockOutOfRange {
+                            block_id: addr.block_id.0,
+                        });
+                    }
+                    out.extend_from_slice(&block_bytes[start..end]);
+                }
+                Ok(Bytes::from(out))
+            }
         }
-
-        Ok(out)
     }
 
     /// Reads a single chunk's raw bytes.
@@ -209,20 +224,7 @@ impl Reader {
             }
         };
 
-        let block_meta = self
-            .footer
-            .blocks
-            .iter()
-            .find(|b| b.id == addr.block_id)
-            .ok_or(Error::BlockOutOfRange {
-                block_id: addr.block_id.0,
-            })?;
-
-        let block_bytes = self
-            .cache
-            .get_or_load(block_meta, self.storage.as_ref())
-            .await?;
-
+        let block_bytes = self.load_block(addr.block_id).await?;
         let start = addr.offset as usize;
         let end = start + addr.size as usize;
         if end > block_bytes.len() {
@@ -231,6 +233,20 @@ impl Reader {
             });
         }
         Ok(block_bytes.slice(start..end))
+    }
+
+    /// Loads a decompressed block by its id, using the block index for O(1) lookup.
+    async fn load_block(&self, block_id: BlockId) -> Result<Bytes> {
+        let &idx = self
+            .block_index
+            .get(&block_id)
+            .ok_or(Error::BlockOutOfRange {
+                block_id: block_id.0,
+            })?;
+        let block_meta = &self.footer.blocks[idx];
+        self.cache
+            .get_or_load(block_meta, self.storage.as_ref())
+            .await
     }
 
     /// O(1) lookup of a non-deleted array by name.

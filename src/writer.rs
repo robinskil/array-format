@@ -262,6 +262,13 @@ impl<C: CompressionCodec> Writer<C> {
         Ok(())
     }
 
+    /// Alignment for array data within a block.
+    ///
+    /// All payloads are padded to start at an 8-byte boundary so that
+    /// the reader can reinterpret cached block slices as typed arrays
+    /// without copying for alignment.
+    const BLOCK_ALIGN: usize = 8;
+
     /// Appends data into the current block as a single contiguous entry.
     ///
     /// If the current block is non-empty and would exceed the target size,
@@ -274,6 +281,14 @@ impl<C: CompressionCodec> Writer<C> {
         {
             self.finalize_current_block()
                 .expect("block finalization failed");
+        }
+
+        // Pad to 8-byte alignment so readers can zero-copy reinterpret.
+        let misalign = self.current_block.len() % Self::BLOCK_ALIGN;
+        if misalign != 0 {
+            let padding = Self::BLOCK_ALIGN - misalign;
+            self.current_block
+                .extend(std::iter::repeat(0u8).take(padding));
         }
 
         let offset = self.current_block.len() as u32;

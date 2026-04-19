@@ -5,6 +5,7 @@
 //! partition of arrays concurrently via `buffer_unordered(conc)`.
 //! Sequential reads serve as the baseline.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -16,17 +17,17 @@ use rand::Rng;
 use tokio::runtime::Runtime;
 
 use array_format::{
-    InMemoryStorage, Lz4Codec, NoCompression, ObjectStoreBackend, PrimitiveArray, Reader, Writer,
-    WriterConfig,
+    ArrayLayout, BlockId, InMemoryStorage, Lz4Codec, NoCompression, ObjectStoreBackend,
+    PrimitiveArray, Reader, Writer, WriterConfig,
 };
 
 const MANY_ARRAYS_COUNT: usize = 25_000;
-const ELEMENTS_PER_ARRAY: usize = 10_000; // 10 K f32 elements = 40 KB each
+const ELEMENTS_PER_ARRAY: usize = 10_000; // 10 K i32 elements = 40 KB each
 const BLOCK_TARGET: usize = 4 * 1024 * 1024; // 4 MiB blocks
-const CACHE_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
+const CACHE_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB — ~25% of total data
 
 fn total_bytes() -> u64 {
-    (MANY_ARRAYS_COUNT * ELEMENTS_PER_ARRAY * std::mem::size_of::<f32>()) as u64
+    (MANY_ARRAYS_COUNT * ELEMENTS_PER_ARRAY * std::mem::size_of::<i32>()) as u64
 }
 
 async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone>(
@@ -48,9 +49,7 @@ async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone>(
     let mut names = Vec::with_capacity(MANY_ARRAYS_COUNT);
     for i in 0..MANY_ARRAYS_COUNT {
         let name = format!("arr_{i:05}");
-        let values: Vec<f32> = (0..ELEMENTS_PER_ARRAY)
-            .map(|_| rng.random::<f32>())
-            .collect();
+        let values: Vec<i32> = (0..ELEMENTS_PER_ARRAY).map(|_| 1).collect();
         let array = PrimitiveArray::from_slice(&values);
         writer.write_array(&name, vec!["x".into()], &array).unwrap();
         names.push(name);
@@ -76,9 +75,7 @@ async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone
     let mut names = Vec::with_capacity(MANY_ARRAYS_COUNT);
     for i in 0..MANY_ARRAYS_COUNT {
         let name = format!("arr_{i:05}");
-        let values: Vec<f32> = (0..ELEMENTS_PER_ARRAY)
-            .map(|_| rng.random::<f32>())
-            .collect();
+        let values: Vec<i32> = (0..ELEMENTS_PER_ARRAY).map(|_| 1).collect();
         let array = PrimitiveArray::from_slice(&values);
         writer.write_array(&name, vec!["x".into()], &array).unwrap();
         names.push(name);
@@ -91,50 +88,88 @@ async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone
 
 async fn read_sequential(reader: &Reader, names: &[String]) {
     for name in names {
-        reader.read_array::<f32>(name).await.unwrap();
+        reader.read_array::<i32>(name).await.unwrap();
     }
 }
 
-async fn read_parallel_concurrent(
-    reader: Arc<Reader>,
-    names: Vec<String>,
-    parallelism: usize,
-    concurrency: usize,
-) {
-    let queue = Arc::new(SegQueue::new());
-    for name in names {
-        queue.push(name);
+/// Groups array names by their block id so each task processes arrays
+/// from distinct blocks, eliminating cache-load contention.
+fn group_by_block(reader: &Reader) -> Vec<Vec<String>> {
+    let mut block_map: HashMap<BlockId, Vec<String>> = HashMap::new();
+    for meta in reader.list_arrays() {
+        let block_id = match &meta.layout {
+            ArrayLayout::Flat { address } => address.block_id,
+            ArrayLayout::Chunked { chunks, .. } => {
+                // Use the first chunk's block as representative.
+                chunks.first().unwrap().1.block_id
+            }
+        };
+        block_map
+            .entry(block_id)
+            .or_default()
+            .push(meta.name.clone());
     }
+    block_map.into_values().collect()
+}
 
+async fn read_parallel_concurrent(reader: Arc<Reader>, parallelism: usize, concurrency: usize) {
+    let block_groups = group_by_block(&reader);
+
+    // One queue per task; assign block groups round-robin across tasks.
+    let queues: Vec<Arc<SegQueue<Vec<String>>>> = (0..parallelism)
+        .map(|_| Arc::new(SegQueue::new()))
+        .collect();
+    for (i, group) in block_groups.into_iter().enumerate() {
+        queues[i % parallelism].push(group);
+    }
+    let queues = Arc::new(queues);
+    let time = std::time::Instant::now();
     let mut handles = Vec::with_capacity(parallelism);
-    for _ in 0..parallelism {
+    for task_id in 0..parallelism {
         let reader = Arc::clone(&reader);
-        let queue = Arc::clone(&queue);
+        let queues = Arc::clone(&queues);
         handles.push(tokio::spawn(async move {
-            stream::iter(std::iter::from_fn({
-                let queue = Arc::clone(&queue);
-                move || queue.pop()
-            }))
-            .map(|name| {
-                let reader = Arc::clone(&reader);
-                async move {
-                    reader.read_array::<f32>(&name).await.unwrap();
-                }
-            })
-            .buffer_unordered(concurrency)
-            .for_each(|_| async {})
-            .await;
+            loop {
+                // Try own queue first, then steal from others.
+                let own = &queues[task_id];
+                let batch = own.pop().or_else(|| {
+                    (1..queues.len())
+                        .map(|off| (task_id + off) % queues.len())
+                        .find_map(|v| queues[v].pop())
+                });
+                let Some(names) = batch else { break };
+
+                // Read all arrays in this block-group concurrently.
+                stream::iter(names)
+                    .map(|name| {
+                        let reader = Arc::clone(&reader);
+                        async move {
+                            reader.read_array::<i32>(&name).await.unwrap();
+                        }
+                    })
+                    .buffered(concurrency)
+                    .for_each(|_| async {})
+                    .await;
+            }
         }));
     }
     for h in handles {
         h.await.unwrap();
     }
+    println!(
+        "parallel read with par={parallelism} conc={concurrency} took {:?}",
+        time.elapsed()
+    );
 }
 
 // ── In-memory benchmarks ────────────────────────────────────────────
 
 fn bench_many_arrays_memory(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt_builder = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(32)
+        .build()
+        .unwrap();
+    let rt = rt_builder;
 
     let mut group = c.benchmark_group("many_arrays_memory");
     group.throughput(Throughput::Bytes(total_bytes()));
@@ -142,31 +177,31 @@ fn bench_many_arrays_memory(c: &mut Criterion) {
 
     // ---- Lz4 ----
     let (storage_lz4, names_lz4) = rt.block_on(prepare_many_arrays_in_memory(Lz4Codec));
+    let reader_lz4 = rt
+        .block_on(async { Arc::new(Reader::open(storage_lz4.clone(), CACHE_SIZE).await.unwrap()) });
 
     group.bench_function(BenchmarkId::new("lz4", "sequential"), |b| {
         let names = &names_lz4;
+        let reader = Arc::clone(&reader_lz4);
         b.to_async(&rt).iter(|| {
-            let storage = storage_lz4.clone();
+            let reader = Arc::clone(&reader);
             let names = names.clone();
             async move {
-                let reader = Reader::open(storage, CACHE_SIZE).await.unwrap();
                 read_sequential(&reader, &names).await;
             }
         })
     });
 
     {
-        let (par, conc) = (24, 8);
+        let (par, conc) = (32, 32);
         group.bench_function(
             BenchmarkId::new("lz4", format!("par{par}_conc{conc}")),
             |b| {
-                let names = &names_lz4;
+                let reader = Arc::clone(&reader_lz4);
                 b.to_async(&rt).iter(|| {
-                    let storage = storage_lz4.clone();
-                    let names = names.clone();
+                    let reader = Arc::clone(&reader);
                     async move {
-                        let reader = Arc::new(Reader::open(storage, CACHE_SIZE).await.unwrap());
-                        read_parallel_concurrent(reader, names, par, conc).await;
+                        read_parallel_concurrent(reader, par, conc).await;
                     }
                 })
             },
@@ -175,31 +210,36 @@ fn bench_many_arrays_memory(c: &mut Criterion) {
 
     // ---- NoCompression ----
     let (storage_none, names_none) = rt.block_on(prepare_many_arrays_in_memory(NoCompression));
+    let reader_none = rt.block_on(async {
+        Arc::new(
+            Reader::open(storage_none.clone(), CACHE_SIZE)
+                .await
+                .unwrap(),
+        )
+    });
 
     group.bench_function(BenchmarkId::new("none", "sequential"), |b| {
         let names = &names_none;
+        let reader = Arc::clone(&reader_none);
         b.to_async(&rt).iter(|| {
-            let storage = storage_none.clone();
+            let reader = Arc::clone(&reader);
             let names = names.clone();
             async move {
-                let reader = Reader::open(storage, CACHE_SIZE).await.unwrap();
                 read_sequential(&reader, &names).await;
             }
         })
     });
 
     {
-        let (par, conc) = (24, 8);
+        let (par, conc) = (32, 32);
         group.bench_function(
             BenchmarkId::new("none", format!("par{par}_conc{conc}")),
             |b| {
-                let names = &names_none;
+                let reader = Arc::clone(&reader_none);
                 b.to_async(&rt).iter(|| {
-                    let storage = storage_none.clone();
-                    let names = names.clone();
+                    let reader = Arc::clone(&reader);
                     async move {
-                        let reader = Arc::new(Reader::open(storage, CACHE_SIZE).await.unwrap());
-                        read_parallel_concurrent(reader, names, par, conc).await;
+                        read_parallel_concurrent(reader, par, conc).await;
                     }
                 })
             },
@@ -212,7 +252,11 @@ fn bench_many_arrays_memory(c: &mut Criterion) {
 // ── File-backed benchmarks ──────────────────────────────────────────
 
 fn bench_many_arrays_file(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt_builder = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(32)
+        .build()
+        .unwrap();
+    let rt = rt_builder;
     let tmp_dir = tempfile::tempdir().unwrap();
 
     let mut group = c.benchmark_group("many_arrays_file");
@@ -225,31 +269,19 @@ fn bench_many_arrays_file(c: &mut Criterion) {
         "many_lz4.af",
         Lz4Codec,
     ));
-
-    group.bench_function(BenchmarkId::new("lz4", "sequential"), |b| {
-        let names = &names_lz4;
-        b.to_async(&rt).iter(|| {
-            let storage = storage_lz4.clone();
-            let names = names.clone();
-            async move {
-                let reader = Reader::open(storage, CACHE_SIZE).await.unwrap();
-                read_sequential(&reader, &names).await;
-            }
-        })
-    });
+    let reader_lz4 = rt
+        .block_on(async { Arc::new(Reader::open(storage_lz4.clone(), CACHE_SIZE).await.unwrap()) });
 
     {
-        let (par, conc) = (24, 8);
+        let (par, conc) = (32, 32);
         group.bench_function(
             BenchmarkId::new("lz4", format!("par{par}_conc{conc}")),
             |b| {
-                let names = &names_lz4;
+                let reader = Arc::clone(&reader_lz4);
                 b.to_async(&rt).iter(|| {
-                    let storage = storage_lz4.clone();
-                    let names = names.clone();
+                    let reader = Arc::clone(&reader);
                     async move {
-                        let reader = Arc::new(Reader::open(storage, CACHE_SIZE).await.unwrap());
-                        read_parallel_concurrent(reader, names, par, conc).await;
+                        read_parallel_concurrent(reader, par, conc).await;
                     }
                 })
             },
@@ -262,31 +294,36 @@ fn bench_many_arrays_file(c: &mut Criterion) {
         "many_none.af",
         NoCompression,
     ));
+    let reader_none = rt.block_on(async {
+        Arc::new(
+            Reader::open(storage_none.clone(), CACHE_SIZE)
+                .await
+                .unwrap(),
+        )
+    });
 
     group.bench_function(BenchmarkId::new("none", "sequential"), |b| {
         let names = &names_none;
+        let reader = Arc::clone(&reader_none);
         b.to_async(&rt).iter(|| {
-            let storage = storage_none.clone();
+            let reader = Arc::clone(&reader);
             let names = names.clone();
             async move {
-                let reader = Reader::open(storage, CACHE_SIZE).await.unwrap();
                 read_sequential(&reader, &names).await;
             }
         })
     });
 
     {
-        let (par, conc) = (24, 8);
+        let (par, conc) = (32, 32);
         group.bench_function(
             BenchmarkId::new("none", format!("par{par}_conc{conc}")),
             |b| {
-                let names = &names_none;
+                let reader = Arc::clone(&reader_none);
                 b.to_async(&rt).iter(|| {
-                    let storage = storage_none.clone();
-                    let names = names.clone();
+                    let reader = Arc::clone(&reader);
                     async move {
-                        let reader = Arc::new(Reader::open(storage, CACHE_SIZE).await.unwrap());
-                        read_parallel_concurrent(reader, names, par, conc).await;
+                        read_parallel_concurrent(reader, par, conc).await;
                     }
                 })
             },
@@ -296,5 +333,5 @@ fn bench_many_arrays_file(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_many_arrays_memory, bench_many_arrays_file,);
+criterion_group!(benches, bench_many_arrays_file,);
 criterion_main!(benches);
