@@ -287,8 +287,7 @@ impl<C: CompressionCodec> Writer<C> {
         let misalign = self.current_block.len() % Self::BLOCK_ALIGN;
         if misalign != 0 {
             let padding = Self::BLOCK_ALIGN - misalign;
-            self.current_block
-                .extend(std::iter::repeat(0u8).take(padding));
+            self.current_block.extend(std::iter::repeat_n(0u8, padding));
         }
 
         let offset = self.current_block.len() as u32;

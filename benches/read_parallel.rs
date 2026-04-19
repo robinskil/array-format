@@ -14,7 +14,6 @@ use futures::stream::{self, StreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use rand::Rng;
-use tokio::runtime::Runtime;
 
 use array_format::{
     ArrayLayout, BlockId, InMemoryStorage, Lz4Codec, NoCompression, ObjectStoreBackend,
@@ -49,7 +48,9 @@ async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone>(
     let mut names = Vec::with_capacity(MANY_ARRAYS_COUNT);
     for i in 0..MANY_ARRAYS_COUNT {
         let name = format!("arr_{i:05}");
-        let values: Vec<i32> = (0..ELEMENTS_PER_ARRAY).map(|_| 1).collect();
+        let values: Vec<i32> = (0..ELEMENTS_PER_ARRAY)
+            .map(|_| rng.random_range(0..10))
+            .collect();
         let array = PrimitiveArray::from_slice(&values);
         writer.write_array(&name, vec!["x".into()], &array).unwrap();
         names.push(name);
@@ -75,7 +76,9 @@ async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone
     let mut names = Vec::with_capacity(MANY_ARRAYS_COUNT);
     for i in 0..MANY_ARRAYS_COUNT {
         let name = format!("arr_{i:05}");
-        let values: Vec<i32> = (0..ELEMENTS_PER_ARRAY).map(|_| 1).collect();
+        let values: Vec<i32> = (0..ELEMENTS_PER_ARRAY)
+            .map(|_| rng.random_range(0..10))
+            .collect();
         let array = PrimitiveArray::from_slice(&values);
         writer.write_array(&name, vec!["x".into()], &array).unwrap();
         names.push(name);
@@ -123,7 +126,6 @@ async fn read_parallel_concurrent(reader: Arc<Reader>, parallelism: usize, concu
         queues[i % parallelism].push(group);
     }
     let queues = Arc::new(queues);
-    let time = std::time::Instant::now();
     let mut handles = Vec::with_capacity(parallelism);
     for task_id in 0..parallelism {
         let reader = Arc::clone(&reader);
@@ -156,10 +158,6 @@ async fn read_parallel_concurrent(reader: Arc<Reader>, parallelism: usize, concu
     for h in handles {
         h.await.unwrap();
     }
-    println!(
-        "parallel read with par={parallelism} conc={concurrency} took {:?}",
-        time.elapsed()
-    );
 }
 
 // ── In-memory benchmarks ────────────────────────────────────────────
@@ -264,7 +262,7 @@ fn bench_many_arrays_file(c: &mut Criterion) {
     group.sample_size(10);
 
     // ---- Lz4 on disk ----
-    let (storage_lz4, names_lz4) = rt.block_on(prepare_many_arrays_on_disk(
+    let (storage_lz4, _) = rt.block_on(prepare_many_arrays_on_disk(
         tmp_dir.path(),
         "many_lz4.af",
         Lz4Codec,
@@ -333,5 +331,5 @@ fn bench_many_arrays_file(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_many_arrays_file,);
+criterion_group!(benches, bench_many_arrays_memory, bench_many_arrays_file,);
 criterion_main!(benches);

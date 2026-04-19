@@ -102,7 +102,7 @@ impl<T: NativeType> PrimitiveArray<T> {
         // In the common case (same-typed arrays packed sequentially),
         // the data is already aligned and this is zero-copy.
         let align = std::mem::align_of::<T>();
-        let data = if align > 1 && (data.as_ptr() as usize) % align != 0 {
+        let data = if align > 1 && !(data.as_ptr() as usize).is_multiple_of(align) {
             Bytes::from(data.to_vec())
         } else {
             data

@@ -2,275 +2,196 @@
 
 `array-format` stores many n-dimensional arrays in one file.
 
-Instead of putting metadata next to every data chunk, this format writes array bytes first and keeps a footer index at the end of the file. The footer contains the metadata needed to reconstruct arrays and locate their bytes.
+Data bytes are written first into blocks and a footer index is appended at the end of the file. The footer contains all metadata needed to reconstruct arrays and locate their bytes. All I/O goes through a `Storage` trait backed by the `object_store` crate, so any backend (local filesystem, S3, GCS, Azure) works out of the box.
 
 ## Why this format exists
 
 This format is designed for workloads where you want:
 
 - multiple arrays in one object/file
-- either whole-array storage or chunked storage
+- either whole-array (`flat`) or chunked storage
 - append-friendly writes
 - efficient lookup via a single footer read
+- block-level compression with per-block codec metadata
+- parallel-safe, cache-backed reads with zero-copy slicing
 - logical deletes followed by periodic compaction
 
 ## Core concepts
 
-### 1) Arrays
+### Arrays
 
-Each stored array has a definition in the footer, including:
+Each stored array has a definition in the footer:
 
-- data type
-- dimensions and dimension names
-- layout mode (`flat` or `chunked`)
-- references to where the data bytes live
+- **name** — unique string identifier
+- **dtype** — data type (`Int32`, `Float64`, `String`, `List { child }`, …)
+- **dimensions** — ordered list of dimension names (e.g. `["x", "y", "time"]`)
+- **layout** — `Flat` (single address) or `Chunked` (coordinate → address map)
+- **deleted** — logical delete flag
 
-### 2) Blocks
+Typed access is provided through concrete array types (`PrimitiveArray<T>`, `BinaryArray`, `StringArray`) that implement the `ArrayData` trait.
 
-Array bytes are stored in blocks. A block has a configurable target size (default: `8 MiB`).
+### Blocks
+
+Array bytes are packed into blocks. A block has a configurable target size (default: 8 MiB).
 
 - one block can hold bytes from multiple arrays/chunks
-- one array can span multiple blocks
-- if a block has remaining space, more array bytes can be packed into it
-- each block may be compressed with a configured compression codec
+- a flat array is never split across blocks — it lives at a single address
+- data within a block is 8-byte aligned so typed slices can be constructed zero-copy
+- each block is compressed independently with the configured codec
+- the codec used is recorded per block in the block table, so the reader can decompress without knowing the writer's configuration
 
-This packing is useful for storage efficiency and compression behavior.
+### Addresses
 
-### 3) Addresses
+An array or chunk is located via a `ChunkAddress`:
 
-A chunk is located via a tuple:
+```text
+(block_id, offset, size)
+```
 
-`(block_id, offset_in_block, byte_size)`
+This means: find the decompressed block with id `block_id`, skip `offset` bytes, and read `size` bytes.
 
-This means: find block `block_id`, move `offset_in_block` bytes into it, and read `byte_size` bytes.
+### Footer
 
-### 4) Footer index
+The footer is serialized with `rkyv` and appended after the data region. A 12-byte trailer at the very end of the file stores the footer payload size (u64 LE) followed by a 4-byte magic number (`ARRF`).
 
 The footer contains:
 
-- block table: where each block is physically located in the file
-- block table also stores block compression metadata (for example codec)
-- array table: schema + logical layout + addresses for chunks
-- delete flags / logical state for entries
+- **version** — format version (currently `1`)
+- **block table** — `Vec<BlockMeta>`, one entry per block:
+  - `id: BlockId`
+  - `file_offset: u64` — byte position in the file
+  - `compressed_size: u64`
+  - `uncompressed_size: u64`
+  - `codec: CodecId` — `None` or `Named("lz4")`, `Named("zstd")`, etc.
+- **array table** — `Vec<ArrayMeta>`, one entry per array:
+  - `name`, `dtype`, `dimensions`
+  - `layout: ArrayLayout` — flat or chunked with chunk coordinates
+  - `deleted: bool`
 
-The footer is serialized using `rkyv` for fast decoding from bytes.
+Reading the footer is a two-pass operation: first read the 12-byte trailer to learn the footer size, then read the full footer payload.
 
-All I/O is performed through the `object_store` crate.
+## Supported data types
 
-## Supported data types and encoding
+```text
+DType
+├── Bool            1 byte (0 or 1)
+├── Int8            1 byte
+├── Int16           2 bytes LE
+├── Int32           4 bytes LE
+├── Int64           8 bytes LE
+├── UInt8           1 byte
+├── UInt16          2 bytes LE
+├── UInt32          4 bytes LE
+├── UInt64          8 bytes LE
+├── Float32         4 bytes IEEE 754 LE
+├── Float64         8 bytes IEEE 754 LE
+├── String          variable-length UTF-8
+├── Binary          variable-length bytes
+├── FixedSizeList   { child: DType, size: u32 }
+└── List            { child: DType }
+```
 
-This section defines how values are encoded in array payloads.
+### Fixed-width primitives
 
-### Type families
+Values are stored contiguously with no per-element header. Integer and float values are little-endian. Element size is constant and determined by the dtype.
 
-The format supports three families of element types:
-
-- fixed-width primitives
-- variable-length values (`string`, `binary` / vlen bytes)
-- list types (`fixed_size_list`, `list` / vlen list)
-
-Every array entry in the footer should include at least:
-
-- `dtype`: logical type
-- `layout`: `flat` or `chunked`
-- type-specific parameters (for example `list_size`, child type)
-
-Null values are currently unsupported. Validity bitmaps are not part of this format.
-
-### 1) Fixed-width primitives
-
-Supported primitive scalar types:
-
-- `bool` (1 byte: `0` or `1`)
-- signed integers: `int8`, `int16`, `int32`, `int64`
-- unsigned integers: `uint8`, `uint16`, `uint32`, `uint64`
-- floating point: `float32`, `float64`
-
-Storage rules:
-
-- values are stored contiguously with no per-element header
-- integer and float values are encoded little-endian
-- element size is constant and known from `dtype`
-
-Example (`int16`, values `[1, 2, 300]`):
+Example (`Int16`, values `[1, 2, 300]`):
 
 ```text
 01 00 02 00 2C 01
 ```
 
-### 2) Variable-length values
+### Variable-length values (String, Binary)
 
-Supported variable-length scalar types:
+Stored as two logical buffers:
 
-- `string` (UTF-8 bytes)
-- `binary` (vlen bytes)
+- offsets buffer — `N + 1` u32 offsets (little-endian)
+- values buffer — concatenated payload bytes
 
-Variable-length arrays are stored as three logical buffers:
-
-- offsets buffer (`N + 1` offsets)
-- values buffer (concatenated payload bytes)
-
-Recommended offsets type:
-
-- `uint32` offsets when total values buffer size is < 4 GiB
-- `uint64` offsets when larger payloads are required
-
-#### Variable-length `string` example
-
-Values: `[
-  "cat",
-  "",
-  "elephant"
-]`
+Example (`String`, values `["cat", "", "elephant"]`):
 
 ```text
 offsets (u32): [0, 3, 3, 11]
-values bytes : [63 61 74 65 6C 65 70 68 61 6E 74]  // "cat" + "elephant"
+values bytes : [63 61 74 65 6C 65 70 68 61 6E 74]
 
 index 0 => bytes[0..3]  = "cat"
 index 1 => bytes[3..3]  = ""
 index 2 => bytes[3..11] = "elephant"
 ```
 
-#### Variable-length `binary` (vlen byte) example
+### Fixed-size lists
 
-Values: `[
-  [AA BB],
-  [01],
-  []
-]`
+`FixedSizeList { child, size }` — each element is a list of exactly `size` child values. No offsets buffer needed.
+
+Example (`FixedSizeList { child: Int8, size: 3 }`, values `[[1,2,3], [4,5,6]]`):
 
 ```text
-offsets (u32): [0, 2, 3, 3]
-values bytes : [AA BB 01]
-
-index 0 => bytes[0..2] = [AA BB]
-index 1 => bytes[2..3] = [01]
-index 2 => bytes[3..3] = []
+child values: [01 02 03 04 05 06]
 ```
 
-### 3) Fixed-size lists
+### Variable-length lists
 
-Supported list type:
+`List { child }` — each element can contain a different number of child values.
 
-- `fixed_size_list<T, K>` where each element is a list of exactly `K` child values of type `T`
+- parent offsets buffer — `N + 1` u32 entries
+- child values buffer — all child elements concatenated
 
-Storage rules:
-
-- no offsets buffer is needed because list length is constant (`K`)
-- values are stored in a contiguous child buffer
-
-Example (`fixed_size_list<int8, 3>`):
-
-Values: `[[1,2,3], [4,5,6], [7,8,9]]`
-
-```text
-child values: [01 02 03 04 05 06 07 08 09]
-
-element 0 => child[0..3]
-element 1 => child[3..6]
-element 2 => child[6..9]
-```
-
-### 4) Variable-length lists (vlen lists)
-
-Supported list type:
-
-- `list<T>` where each element can contain a different number of child values of type `T`
-
-Storage rules:
-
-- parent offsets buffer has `N + 1` entries
-- child values buffer stores all child elements concatenated
-- each list element `i` is `child[offsets[i]..offsets[i+1]]`
-
-Example (`list<int16>`):
-
-Values: `[[10,20,30], [], [40]]`
+Example (`List { child: Int16 }`, values `[[10, 20, 30], [], [40]]`):
 
 ```text
 parent offsets (u32): [0, 3, 3, 4]
 child values (int16 LE): [0A 00 14 00 1E 00 28 00]
-
-element 0 => child[0..3] = [10,20,30]
-element 1 => child[3..3] = []
-element 2 => child[3..4] = [40]
 ```
 
-Nested variable-length example (`list<string>`):
-
-```text
-parent offsets (lists): [0, 2, 3]
-child string offsets  : [0, 1, 3, 6]
-child string values   : [61 62 63 64 65 66]  // "a", "bc", "def"
-
-list 0 uses strings 0..2 => ["a", "bc"]
-list 1 uses strings 2..3 => ["def"]
-```
-
-This means vlen list nesting introduces one offsets buffer per variable-length level.
+Nesting is supported — each variable-length level introduces its own offsets buffer.
 
 ### Nullability
 
-Nullability is currently unsupported for all types.
-
-- validity bitmaps are not stored
-- null values cannot be represented in payloads
-- empty string/empty binary/empty list are valid values, but they are not null
-
-### Chunk interaction
-
-For chunked arrays, each chunk is encoded with the same dtype rules as above. Metadata maps chunk coordinates to chunk addresses; each addressed payload then contains the encoded bytes for that chunk.
+Not supported. Validity bitmaps are not stored. Empty strings, empty binaries, and empty lists are valid values but are not null.
 
 ## On-disk layout
-
-The high-level file structure looks like this:
 
 ```text
 +-------------------------------+ 0
 | Data Region                   |
-|                               |
 |  [block 0 bytes]              |
 |  [block 1 bytes]              |
-|  [block 2 bytes]              |
 |  ...                          |
 +-------------------------------+
-| Footer (index + metadata)     |
+| Footer (rkyv-serialized)      |
++-------------------------------+
+| footer_size (u64 LE)          |
+| magic b"ARRF" (4 bytes)      |
 +-------------------------------+ EOF
 ```
 
-Inside the data region, blocks may contain mixed content:
+Inside a block, payloads are packed with 8-byte alignment padding:
 
 ```text
-block 12 (example)
+block 5 (example, uncompressed view)
 
-+---------------------------------------------------------+
-| arrA chunk0 | arrB chunk9 | arrC flat data slice | ... |
-+---------------------------------------------------------+
-0             ^             ^                        ^
-              offsets tracked in footer addresses
++--[arrA flat]--+--[pad]--+--[arrB chunk 3]--+--[pad]--+--[arrC flat]--+
+0               ^         ^                   ^         ^               ^
+            8-aligned   8-aligned          8-aligned  8-aligned
 ```
 
 ## Flat vs chunked layout
 
-### Flat layout
+### Flat
 
-The array is stored as one logical payload (possibly split physically by block boundaries).
+A flat array is stored as one contiguous payload within a single block. The footer records a single `ChunkAddress`:
 
 ```text
 Array X (flat)
-  logical payload ------------------------------------------
-  address list: [ (b1,o0,s4MB), (b1,o4MB,s4MB), (b2,o0,s2MB) ]
+  address: (block_id=1, offset=0, size=40000)
 ```
 
-### Chunked layout
+### Chunked
 
-The array is divided into chunk coordinates, and each chunk has one or more addresses.
+A chunked array is divided into a coordinate grid. Each chunk has its own `ChunkAddress` and may reside in any block.
 
 ```text
-Array Y (chunked, 2D example)
-
-Logical chunk grid:
+Array Y (chunked, 2D, chunk_shape=[1000, 1000])
 
   +--------+--------+
   | (0,0)  | (0,1)  |
@@ -278,111 +199,140 @@ Logical chunk grid:
   | (1,0)  | (1,1)  |
   +--------+--------+
 
-Footer mapping (example):
-  (0,0) -> (b3,o0,1MB)
-  (0,1) -> (b7,o2MB,1MB)
-  (1,0) -> (b3,o1MB,1MB)
-  (1,1) -> (b9,o0,1MB)
+Footer mapping:
+  (0,0) -> (block=3, offset=0,    size=1MB)
+  (0,1) -> (block=7, offset=2MB,  size=1MB)
+  (1,0) -> (block=3, offset=1MB,  size=1MB)
+  (1,1) -> (block=9, offset=0,    size=1MB)
 ```
+
+## Storage
+
+All I/O goes through the `Storage` trait:
+
+```rust
+pub trait Storage: Send + Sync {
+    fn read_range(&self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>>;
+    fn write(&self, data: Bytes) -> BoxFuture<'_, Result<()>>;
+    fn size(&self) -> BoxFuture<'_, Result<u64>>;
+}
+```
+
+The trait is dyn-compatible (uses `BoxFuture`). Two implementations are provided:
+
+- **`ObjectStoreBackend`** — wraps any `object_store::ObjectStore` (local filesystem, S3, GCS, Azure)
+- **`InMemoryStorage`** — in-memory buffer for testing
 
 ## Read path
 
+Opening a reader parses the footer and builds O(1) lookup indexes for arrays (by name) and blocks (by id). The reader owns a shared `moka`-based block cache.
+
 To read an array:
 
-1. Read footer from the end of file.
-2. Resolve array metadata by array id/name.
-3. Collect its address list (flat or per-chunk).
-4. For each referenced block, check the reader-owned shared `moka` cache of decompressed blocks.
-5. On cache miss, read the entire block from storage using `object_store`.
-6. Decompress the entire block in memory based on block codec metadata.
-7. Store decompressed block bytes in the shared `moka` cache.
-8. Slice chunk bytes by `(block_id, offset, size)` from decompressed block memory.
-9. Decode and reconstruct requested array/chunks.
+1. Look up `ArrayMeta` by name (HashMap, O(1)).
+2. Determine `ChunkAddress`(es) from the layout.
+3. For each referenced block, consult the cache:
+   - **hit** → return cached `Bytes`
+   - **miss** → read the full compressed block from storage, decompress, insert into cache
+4. Slice the decompressed block bytes at `(offset, size)` — zero-copy via `Bytes::slice()`.
+5. Construct the typed array (`PrimitiveArray<T>`, `StringArray`, etc.) from the slice.
 
-Read behavior is block-granular:
+For uncompressed blocks (`CodecId::None`), the cache stores the raw bytes directly — no decompression copy. For `PrimitiveArray`, if the slice is already aligned, the typed view is constructed zero-copy from the `Bytes` buffer.
 
-- reads never perform partial block I/O from storage
-- a miss always reads one full block and decompresses one full block
-- cache capacity is configurable
-- cached blocks are shareable across threads using the same reader
-- the read path is parallel-safe via the `moka` cache
-
-### Shared reader and cache concurrency model
-
-Each reader instance owns a single shared `moka` cache that proxies block I/O requests.
-
-- all read calls through that reader consult the same cache instance
-- cache hit: return decompressed block bytes from cache memory
-- cache miss: perform full-block read via `object_store`, decompress, then insert into the same cache
-- many threads can call the same reader concurrently
-- threads may read arrays from the same block or different blocks at the same time
-- when threads converge on the same block, cache reuse prevents repeated full-block I/O/decompression after the block is cached
+Concurrent requests for the same block are coalesced — only one storage read + decompress happens, and all waiters share the result.
 
 ```text
 Thread A ----\
-Thread B -----+--> [Reader] --> [Single shared moka cache]
-Thread C ----/             |             |            |
-                           |           hit          miss
-                           |             |            v
-                           |             |   [object_store full-block read]
-                           |             |            |
-                           |             |   [full-block decompress]
-                           |             |            |
-                           +-------------+----> [cache insert]
-                                                 |
-                                                 v
-                                   [slice chunk bytes and decode]
+Thread B -----+--> [Reader] --> [moka BlockCache]
+Thread C ----/             |          |            |
+                           |        hit          miss
+                           |          |            v
+                           |          |   [full-block read via Storage]
+                           |          |            |
+                           |          |   [decompress (skipped if None)]
+                           |          |            |
+                           +----------+----> [cache insert]
+                                                |
+                                                v
+                                  [Bytes::slice(offset, size)]
+                                                |
+                                                v
+                                     [construct typed array]
 ```
 
-```text
-Reader Task
-  |
-  v
-[Read footer] --> [Resolve chunk addresses]
-                |
-                v
-          [For each referenced block]
-                |
-                v
-          [Lookup block in moka cache]
-              |                 |
-            hit|                 |miss
-              v                 v
-        [Use cached bytes]   [Read FULL block via object_store]
-              |                 |
-              |                 v
-              |         [Decompress FULL block in memory]
-              |                 |
-              |                 v
-              |         [Insert into shared moka cache]
-              |                 |
-              +--------+--------+
-                    |
-                    v
-         [Slice (offset,size) from decompressed block]
-                    |
-                    v
-            [Decode chunk(s) and reconstruct array]
+### Reader API
+
+```rust
+// Open
+Reader::open(storage, cache_capacity_bytes) -> Result<Reader>
+Reader::open_dyn(Arc<dyn Storage>, cache_capacity_bytes) -> Result<Reader>
+
+// Inspect
+reader.footer() -> &Footer
+reader.list_arrays() -> Vec<&ArrayMeta>  // non-deleted only
+
+// Typed reads
+reader.read_array::<T>(name) -> Result<PrimitiveArray<T>>
+reader.read_chunk::<T>(name, coord) -> Result<PrimitiveArray<T>>
+
+// Dynamic reads
+reader.read_array_dynamic(name) -> Result<Box<dyn ArrayData>>
+reader.read_chunk_dynamic(name, coord) -> Result<Box<dyn ArrayData>>
+
+// Raw bytes
+reader.read_raw_bytes(name) -> Result<Bytes>
+reader.read_chunk_raw(name, coord) -> Result<Bytes>
 ```
 
 ## Write path
 
-To write array data:
+```rust
+let config = WriterConfig {
+    block_target_size: 8 * 1024 * 1024,  // 8 MiB (default)
+    codec: Lz4Codec,                      // or NoCompression, ZstdCodec { level: 3 }
+};
+let mut writer = Writer::new(storage, config);
 
-1. Encode array bytes (flat payload or chunk payloads).
-2. Append bytes into one or more blocks in data region.
-3. Record new addresses for each payload/chunk.
-4. Append/update footer metadata with new array entry and block table state.
+// Flat array
+writer.write_array("temperatures", vec!["x".into()], &array)?;
 
-Because the index lives in the footer, data writes can remain append-oriented.
+// Chunked array
+let mut cw = writer.begin_chunked_array(
+    "grid", DType::Float32, vec!["x".into(), "y".into()], vec![1000, 1000],
+)?;
+cw.write_array(vec![0, 0], &chunk_00)?;
+cw.write_array(vec![0, 1], &chunk_01)?;
+drop(cw);
+
+// Finalize — compresses blocks, writes file
+writer.flush().await?;
+```
+
+The writer packs array payloads into blocks up to the target size. Each payload is padded to 8-byte alignment within the block. When the current block would exceed the target, it is finalized (compressed) and a new block is started. A flat array is never split — it always occupies a single `ChunkAddress` in one block.
+
+To append to an existing file, use `Writer::open(storage, config)` which reads the existing footer first.
+
+## Compression codecs
+
+Three built-in codecs:
+
+| Type | `CodecId` | Notes |
+|------|-----------|-------|
+| `NoCompression` | `None` | Pass-through, zero-copy in cache |
+| `Lz4Codec` | `Named("lz4")` | Fast compression via `lz4_flex` |
+| `ZstdCodec { level }` | `Named("zstd")` | Configurable level (1–22, default 3) |
+
+The codec is set per writer. Each block records its codec in the block table, so the reader infers the correct decompression at read time — no codec parameter is needed when opening a reader.
 
 ## Deletes and compaction
 
-Deletes are logical, not immediate physical removal.
+Deletes are logical — `Writer::delete(name)` sets the `deleted` flag in the footer. Deleted arrays are excluded from `list_arrays()` and all read operations.
 
-- delete operation: mark array/chunk metadata as deleted
-- read behavior: ignore logically deleted entries
-- compaction: rewrite live data + rebuild footer without deleted entries
+Compaction rewrites the file, keeping only live data:
+
+```rust
+compact(&storage, &codec, Some(block_target_size)).await?;
+```
 
 ```text
 Before compact:
@@ -394,28 +344,6 @@ After compact:
   footer: rewritten without deleted entries
 ```
 
-## Footer anatomy (conceptual)
-
-```text
-Footer
-+------------------------------------------------------+
-| Footer header                                        |
-|  - version                                           |
-|  - counts / offsets                                  |
-+------------------------------------------------------+
-| Block table                                          |
-|  - block_id -> file_position, compressed_size, ...   |
-|  - compression codec metadata                        |
-+------------------------------------------------------+
-| Array table                                          |
-|  - array_id/name                                     |
-|  - dtype, dims, dim_names                            |
-|  - layout mode (flat/chunked)                        |
-|  - chunk/address mapping                             |
-|  - deleted flag                                      |
-+------------------------------------------------------+
-```
-
 ## Summary
 
-`array-format` is a block-backed, footer-indexed container for n-dimensional arrays. It supports flat and chunked layouts, fixed-width and variable-width element encodings (including vlen lists), block compression codecs, tuple-based address lookup, shared configurable `moka` block caching for parallel-safe reads, logical deletes, and compaction-based physical cleanup.
+`array-format` is a block-backed, footer-indexed container for n-dimensional arrays. It supports flat and chunked layouts, fixed-width and variable-length encodings, per-block compression (LZ4, Zstd, or none), zero-copy reads via `Bytes` slicing, a shared `moka` block cache with coalesced concurrent loads, any `object_store`-compatible storage backend, logical deletes, and compaction.
