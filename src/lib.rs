@@ -50,7 +50,7 @@ pub use compact::compact;
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub use footer::{FOOTER_VERSION, Footer, MAGIC};
-pub use layout::{ArrayLayout, ArrayMeta};
+pub use layout::{ArrayLayout, ArrayMeta, FillValue, StorageLayout};
 pub use reader::Reader;
 pub use storage::{InMemoryStorage, ObjectStoreBackend, Storage};
 pub use writer::{ChunkedArrayWriter, DEFAULT_BLOCK_TARGET_SIZE, Writer, WriterConfig};

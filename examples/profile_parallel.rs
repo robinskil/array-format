@@ -22,7 +22,7 @@ use object_store::path::Path;
 use tokio::runtime::Runtime;
 
 use array_format::{
-    ArrayLayout, BlockId, InMemoryStorage, Lz4Codec, NoCompression, ObjectStoreBackend,
+    BlockId, InMemoryStorage, Lz4Codec, NoCompression, ObjectStoreBackend,
     PrimitiveArray, Reader, Writer, WriterConfig,
 };
 
@@ -36,9 +36,9 @@ const CONCURRENCY: usize = 8;
 fn group_by_block(reader: &Reader) -> Vec<Vec<String>> {
     let mut block_map: HashMap<BlockId, Vec<String>> = HashMap::new();
     for meta in reader.list_arrays() {
-        let block_id = match &meta.layout {
-            ArrayLayout::Flat { address } => address.block_id,
-            ArrayLayout::Chunked { chunks, .. } => chunks.first().unwrap().1.block_id,
+        let block_id = match &meta.layout.storage {
+            array_format::StorageLayout::Flat { address } => address.block_id,
+            array_format::StorageLayout::Chunked { chunks, .. } => chunks.first().unwrap().1.block_id,
         };
         block_map
             .entry(block_id)
@@ -96,7 +96,7 @@ fn write_arrays<C: array_format::CompressionCodec>(writer: &mut Writer<C>) {
         let name = format!("arr_{i:05}");
         let values: Vec<i32> = vec![1; ELEMENTS_PER_ARRAY];
         let array = PrimitiveArray::from_slice(&values);
-        writer.write_array(&name, vec!["x".into()], &array).unwrap();
+        writer.write_array(&name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY as u32], None, &array).unwrap();
     }
 }
 

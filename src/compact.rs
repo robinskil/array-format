@@ -10,7 +10,7 @@ use crate::block::BlockMeta;
 use crate::codec::{CompressionCodec, decompress_by_id};
 use crate::error::Result;
 use crate::footer::Footer;
-use crate::layout::{ArrayLayout, ArrayMeta};
+use crate::layout::{ArrayLayout, ArrayMeta, StorageLayout};
 use crate::storage::Storage;
 use crate::writer::DEFAULT_BLOCK_TARGET_SIZE;
 
@@ -53,15 +53,15 @@ pub async fn compact(
     let mut array_data_vec: Vec<ArrayData> = Vec::new();
 
     for array in &live_arrays {
-        let payload = match &array.layout {
-            ArrayLayout::Flat { address } => {
+        let payload = match &array.layout.storage {
+            StorageLayout::Flat { address } => {
                 let block_bytes =
                     read_and_decompress_block(storage, &old_footer, address.block_id).await?;
                 let start = address.offset as usize;
                 let end = start + address.size as usize;
                 ArrayPayload::Flat(block_bytes[start..end].to_vec())
             }
-            ArrayLayout::Chunked {
+            StorageLayout::Chunked {
                 chunk_shape,
                 chunks,
             } => {
@@ -84,14 +84,18 @@ pub async fn compact(
             meta: ArrayMeta {
                 name: array.name.clone(),
                 dtype: array.dtype.clone(),
-                dimensions: array.dimensions.clone(),
-                layout: ArrayLayout::Flat {
-                    address: ChunkAddress {
-                        block_id: BlockId(0),
-                        offset: 0,
-                        size: 0,
-                    },
-                }, // placeholder
+                layout: ArrayLayout {
+                    shape: array.layout.shape.clone(),
+                    dimension_names: array.layout.dimension_names.clone(),
+                    storage: StorageLayout::Flat {
+                        address: ChunkAddress {
+                            block_id: BlockId(0),
+                            offset: 0,
+                            size: 0,
+                        },
+                    }, // placeholder
+                },
+                fill_value: array.fill_value.clone(),
                 deleted: false,
             },
             payload,
@@ -138,7 +142,7 @@ pub async fn compact(
                     &mut next_block_id,
                     codec,
                 )?;
-                ad.meta.layout = ArrayLayout::Flat { address };
+                ad.meta.layout.storage = StorageLayout::Flat { address };
             }
             ArrayPayload::Chunked {
                 chunk_shape,
@@ -156,7 +160,7 @@ pub async fn compact(
                     )?;
                     chunk_entries.push((coord, addr));
                 }
-                ad.meta.layout = ArrayLayout::Chunked {
+                ad.meta.layout.storage = StorageLayout::Chunked {
                     chunk_shape,
                     chunks: chunk_entries,
                 };
@@ -266,13 +270,13 @@ mod tests {
         {
             let mut writer = Writer::new(storage.clone(), small_config());
             writer
-                .write_flat("a", DType::UInt8, vec![], &[1; 20])
+                .write_flat("a", DType::UInt8, vec![], vec![], None, &[1; 20])
                 .unwrap();
             writer
-                .write_flat("b", DType::UInt8, vec![], &[2; 20])
+                .write_flat("b", DType::UInt8, vec![], vec![], None, &[2; 20])
                 .unwrap();
             writer
-                .write_flat("c", DType::UInt8, vec![], &[3; 20])
+                .write_flat("c", DType::UInt8, vec![], vec![], None, &[3; 20])
                 .unwrap();
             writer.delete("b").unwrap();
             writer.flush().await.unwrap();
@@ -307,7 +311,7 @@ mod tests {
         {
             let mut writer = Writer::new(storage.clone(), small_config());
             writer
-                .write_flat("x", DType::Float64, vec!["t".into()], &[0xFF; 40])
+                .write_flat("x", DType::Float64, vec!["t".into()], vec![5], None, &[0xFF; 40])
                 .unwrap();
             writer.flush().await.unwrap();
         }

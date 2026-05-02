@@ -9,8 +9,23 @@ use crate::address::ChunkAddress;
 use crate::dtype::DType;
 
 /// Describes how an array's data is distributed across blocks.
+///
+/// Carries the array's global shape and dimension names so callers always
+/// know the full n-dimensional structure, independent of how the data is
+/// stored internally.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
-pub enum ArrayLayout {
+pub struct ArrayLayout {
+    /// Size of the array in each dimension (number of elements).
+    pub shape: Vec<u32>,
+    /// Name of each dimension (e.g. `["x", "y", "time"]`).
+    pub dimension_names: Vec<String>,
+    /// Storage strategy for the array data.
+    pub storage: StorageLayout,
+}
+
+/// Describes the physical storage strategy for array data.
+#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
+pub enum StorageLayout {
     /// The array is stored as a single contiguous payload within one block.
     Flat {
         /// Address of the payload within a block.
@@ -29,6 +44,34 @@ pub enum ArrayLayout {
     },
 }
 
+/// A scalar fill value for an array.
+///
+/// Represents the value used for unwritten or missing elements. Supports
+/// numeric types and strings; complex types (Binary, List, FixedSizeList)
+/// are not representable here.
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub enum FillValue {
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+}
+
+impl PartialEq for FillValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::UInt(a), Self::UInt(b)) => a == b,
+            // Compare by bit pattern so NaN == NaN.
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            (Self::String(a), Self::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// Metadata for a single array stored in the file.
 ///
 /// Stored in the footer's array table. Contains the schema, layout
@@ -39,10 +82,11 @@ pub struct ArrayMeta {
     pub name: String,
     /// Element data type.
     pub dtype: DType,
-    /// Dimension names (e.g. `["x", "y", "time"]`).
-    pub dimensions: Vec<String>,
-    /// How the array data is laid out across blocks.
+    /// How the array data is laid out across blocks (also carries shape and
+    /// dimension names).
     pub layout: ArrayLayout,
+    /// Fill value for unwritten or missing elements, if any.
+    pub fill_value: Option<FillValue>,
     /// Whether this array has been logically deleted.
     ///
     /// Deleted arrays are ignored during reads and removed during compaction.
@@ -54,19 +98,19 @@ impl ArrayLayout {
     /// in a chunked layout. Returns `None` for flat layouts or if
     /// the coordinate is not found.
     pub fn get_chunk(&self, coord: &[u32]) -> Option<&ChunkAddress> {
-        match self {
-            ArrayLayout::Chunked { chunks, .. } => {
+        match &self.storage {
+            StorageLayout::Chunked { chunks, .. } => {
                 chunks.iter().find(|(c, _)| c == coord).map(|(_, a)| a)
             }
-            ArrayLayout::Flat { .. } => None,
+            StorageLayout::Flat { .. } => None,
         }
     }
 
     /// Returns all [`ChunkAddress`]es for this layout.
     pub fn all_addresses(&self) -> Vec<&ChunkAddress> {
-        match self {
-            ArrayLayout::Flat { address } => vec![address],
-            ArrayLayout::Chunked { chunks, .. } => chunks.iter().map(|(_, a)| a).collect(),
+        match &self.storage {
+            StorageLayout::Flat { address } => vec![address],
+            StorageLayout::Chunked { chunks, .. } => chunks.iter().map(|(_, a)| a).collect(),
         }
     }
 }
@@ -86,8 +130,12 @@ mod tests {
 
     #[test]
     fn flat_layout_addresses() {
-        let layout = ArrayLayout::Flat {
-            address: sample_addr(0, 0, 100),
+        let layout = ArrayLayout {
+            shape: vec![100],
+            dimension_names: vec!["x".into()],
+            storage: StorageLayout::Flat {
+                address: sample_addr(0, 0, 100),
+            },
         };
         assert_eq!(layout.all_addresses().len(), 1);
         assert!(layout.get_chunk(&[0, 0]).is_none());
@@ -95,12 +143,16 @@ mod tests {
 
     #[test]
     fn chunked_layout_lookup() {
-        let layout = ArrayLayout::Chunked {
-            chunk_shape: vec![64, 64],
-            chunks: vec![
-                (vec![0, 0], sample_addr(3, 0, 1000)),
-                (vec![0, 1], sample_addr(7, 2000, 1000)),
-            ],
+        let layout = ArrayLayout {
+            shape: vec![128, 128],
+            dimension_names: vec!["x".into(), "y".into()],
+            storage: StorageLayout::Chunked {
+                chunk_shape: vec![64, 64],
+                chunks: vec![
+                    (vec![0, 0], sample_addr(3, 0, 1000)),
+                    (vec![0, 1], sample_addr(7, 2000, 1000)),
+                ],
+            },
         };
         let addr = layout.get_chunk(&[0, 1]).unwrap();
         assert_eq!(addr.block_id, BlockId(7));
@@ -111,13 +163,17 @@ mod tests {
 
     #[test]
     fn chunked_all_addresses() {
-        let layout = ArrayLayout::Chunked {
-            chunk_shape: vec![10],
-            chunks: vec![
-                (vec![0], sample_addr(0, 0, 500)),
-                (vec![1], sample_addr(0, 500, 500)),
-                (vec![2], sample_addr(1, 0, 500)),
-            ],
+        let layout = ArrayLayout {
+            shape: vec![30],
+            dimension_names: vec!["t".into()],
+            storage: StorageLayout::Chunked {
+                chunk_shape: vec![10],
+                chunks: vec![
+                    (vec![0], sample_addr(0, 0, 500)),
+                    (vec![1], sample_addr(0, 500, 500)),
+                    (vec![2], sample_addr(1, 0, 500)),
+                ],
+            },
         };
         assert_eq!(layout.all_addresses().len(), 3);
     }

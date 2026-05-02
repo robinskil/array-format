@@ -40,6 +40,8 @@ async fn prepare_file<C: array_format::CompressionCodec + Clone>(
             DType::Float32,
             vec!["x".into(), "y".into()],
             vec![NUM_CHUNKS, 1],
+            vec![1, 1],
+            None,
         )
         .unwrap();
     for i in 0..NUM_CHUNKS {

@@ -18,7 +18,7 @@ use crate::codec::CompressionCodec;
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::footer::Footer;
-use crate::layout::{ArrayLayout, ArrayMeta};
+use crate::layout::{ArrayLayout, ArrayMeta, FillValue, StorageLayout};
 use crate::storage::Storage;
 
 /// Default block target size: 8 MiB.
@@ -110,10 +110,12 @@ impl<C: CompressionCodec> Writer<C> {
     pub fn write_array(
         &mut self,
         name: &str,
-        dimensions: Vec<String>,
+        dimension_names: Vec<String>,
+        shape: Vec<u32>,
+        fill_value: Option<FillValue>,
         data: &dyn ArrayData,
     ) -> Result<()> {
-        self.write_flat(name, data.dtype().clone(), dimensions, data.as_bytes())
+        self.write_flat(name, data.dtype().clone(), dimension_names, shape, fill_value, data.as_bytes())
     }
 
     /// Writes a flat (non-chunked) array from raw bytes.
@@ -121,7 +123,9 @@ impl<C: CompressionCodec> Writer<C> {
         &mut self,
         name: &str,
         dtype: DType,
-        dimensions: Vec<String>,
+        dimension_names: Vec<String>,
+        shape: Vec<u32>,
+        fill_value: Option<FillValue>,
         data: &[u8],
     ) -> Result<()> {
         if self.array_index.contains_key(name) {
@@ -132,8 +136,12 @@ impl<C: CompressionCodec> Writer<C> {
         let meta = ArrayMeta {
             name: name.to_string(),
             dtype,
-            dimensions,
-            layout: ArrayLayout::Flat { address },
+            layout: ArrayLayout {
+                shape,
+                dimension_names,
+                storage: StorageLayout::Flat { address },
+            },
+            fill_value,
             deleted: false,
         };
         let idx = self.footer.arrays.len();
@@ -151,8 +159,10 @@ impl<C: CompressionCodec> Writer<C> {
         &mut self,
         name: &str,
         dtype: DType,
-        dimensions: Vec<String>,
+        dimension_names: Vec<String>,
+        shape: Vec<u32>,
         chunk_shape: Vec<u32>,
+        fill_value: Option<FillValue>,
     ) -> Result<ChunkedArrayWriter<'_, C>> {
         if self.array_index.contains_key(name) {
             return Err(Error::ArrayAlreadyExists { name: name.into() });
@@ -161,11 +171,15 @@ impl<C: CompressionCodec> Writer<C> {
         let meta = ArrayMeta {
             name: name.to_string(),
             dtype,
-            dimensions,
-            layout: ArrayLayout::Chunked {
-                chunk_shape,
-                chunks: Vec::new(),
+            layout: ArrayLayout {
+                shape,
+                dimension_names,
+                storage: StorageLayout::Chunked {
+                    chunk_shape,
+                    chunks: Vec::new(),
+                },
             },
+            fill_value,
             deleted: false,
         };
         let idx = self.footer.arrays.len();
@@ -221,11 +235,11 @@ impl<C: CompressionCodec> Writer<C> {
         let addr = self.pack_into_block(data);
 
         let array = &mut self.footer.arrays[idx];
-        match &mut array.layout {
-            ArrayLayout::Chunked { chunks, .. } => {
+        match &mut array.layout.storage {
+            StorageLayout::Chunked { chunks, .. } => {
                 chunks.push((coord, addr));
             }
-            ArrayLayout::Flat { .. } => {
+            StorageLayout::Flat { .. } => {
                 return Err(Error::InvalidFooter(
                     "cannot write chunk to a flat array".into(),
                 ));
@@ -336,8 +350,8 @@ impl<C: CompressionCodec> ChunkedArrayWriter<'_, C> {
 
     /// Returns how many chunks have been written so far.
     pub fn chunks_written(&self) -> usize {
-        match &self.writer.footer.arrays[self.idx].layout {
-            ArrayLayout::Chunked { chunks, .. } => chunks.len(),
+        match &self.writer.footer.arrays[self.idx].layout.storage {
+            StorageLayout::Chunked { chunks, .. } => chunks.len(),
             _ => 0,
         }
     }
@@ -374,7 +388,7 @@ mod tests {
 
         let data = vec![0x42u8; 100];
         writer
-            .write_flat("arr", DType::UInt8, vec!["x".into()], &data)
+            .write_flat("arr", DType::UInt8, vec!["x".into()], vec![100], None, &data)
             .unwrap();
         writer.flush().await.unwrap();
 
@@ -394,7 +408,7 @@ mod tests {
 
         let arr = PrimitiveArray::<f32>::from_slice(&[1.0, 2.0, 3.0]);
         writer
-            .write_array("floats", vec!["x".into()], &arr)
+            .write_array("floats", vec!["x".into()], vec![3], None, &arr)
             .unwrap();
         writer.flush().await.unwrap();
 
@@ -413,10 +427,10 @@ mod tests {
         let data_a = vec![0xAA; 100];
         let data_b = vec![0xBB; 120];
         writer
-            .write_flat("a", DType::UInt8, vec!["x".into()], &data_a)
+            .write_flat("a", DType::UInt8, vec!["x".into()], vec![100], None, &data_a)
             .unwrap();
         writer
-            .write_flat("b", DType::UInt8, vec!["x".into()], &data_b)
+            .write_flat("b", DType::UInt8, vec!["x".into()], vec![120], None, &data_b)
             .unwrap();
         writer.flush().await.unwrap();
 
@@ -428,12 +442,12 @@ mod tests {
         assert_eq!(footer.blocks.len(), 2);
 
         // Each array has a single address covering its full size.
-        if let ArrayLayout::Flat { address } = &footer.arrays[0].layout {
+        if let StorageLayout::Flat { address } = &footer.arrays[0].layout.storage {
             assert_eq!(address.size, 100);
         } else {
             panic!("expected flat layout");
         }
-        if let ArrayLayout::Flat { address } = &footer.arrays[1].layout {
+        if let StorageLayout::Flat { address } = &footer.arrays[1].layout.storage {
             assert_eq!(address.size, 120);
         } else {
             panic!("expected flat layout");
@@ -446,10 +460,10 @@ mod tests {
         let mut writer = Writer::new(storage, small_config());
 
         writer
-            .write_flat("arr", DType::UInt8, vec![], &[1, 2, 3])
+            .write_flat("arr", DType::UInt8, vec![], vec![3], None, &[1, 2, 3])
             .unwrap();
         let err = writer
-            .write_flat("arr", DType::UInt8, vec![], &[4, 5, 6])
+            .write_flat("arr", DType::UInt8, vec![], vec![3], None, &[4, 5, 6])
             .unwrap_err();
         assert!(matches!(err, Error::ArrayAlreadyExists { .. }));
     }
@@ -460,7 +474,7 @@ mod tests {
         let mut writer = Writer::new(storage.clone(), small_config());
 
         writer
-            .write_flat("a", DType::Int32, vec![], &[0; 16])
+            .write_flat("a", DType::Int32, vec![], vec![], None, &[0; 16])
             .unwrap();
         writer.delete("a").unwrap();
         writer.flush().await.unwrap();
@@ -482,7 +496,9 @@ mod tests {
                     "grid",
                     DType::Float32,
                     vec!["x".into(), "y".into()],
+                    vec![8, 8],
                     vec![4, 4],
+                    None,
                 )
                 .unwrap();
             chunked.write(vec![0, 0], &[0xAA; 16]).unwrap();
@@ -499,5 +515,46 @@ mod tests {
         assert_eq!(&chunk[..], &[0xAA; 16]);
         let chunk = reader.read_chunk_raw("grid", &[1, 0]).await.unwrap();
         assert_eq!(&chunk[..], &[0xCC; 16]);
+    }
+
+    #[tokio::test]
+    async fn fill_value_roundtrips() {
+        let storage = InMemoryStorage::new();
+        let mut writer = Writer::new(storage.clone(), small_config());
+
+        writer
+            .write_flat(
+                "temps",
+                DType::Float32,
+                vec!["x".into()],
+                vec![4],
+                Some(FillValue::Float(-9999.0)),
+                &[0u8; 16],
+            )
+            .unwrap();
+        writer
+            .write_flat(
+                "counts",
+                DType::Int32,
+                vec![],
+                vec![],
+                Some(FillValue::Int(-1)),
+                &[0u8; 4],
+            )
+            .unwrap();
+        writer
+            .write_flat("raw", DType::UInt8, vec![], vec![], None, &[0u8])
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let reader = crate::reader::Reader::open(storage, 4096).await.unwrap();
+
+        let fv = reader.get_array("temps").unwrap().fill_value.as_ref().unwrap();
+        assert_eq!(*fv, FillValue::Float(-9999.0));
+
+        let fv = reader.get_array("counts").unwrap().fill_value.as_ref().unwrap();
+        assert_eq!(*fv, FillValue::Int(-1));
+
+        assert!(reader.get_array("raw").unwrap().fill_value.is_none());
     }
 }

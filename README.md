@@ -24,8 +24,11 @@ Each stored array has a definition in the footer:
 
 - **name** — unique string identifier
 - **dtype** — data type (`Int32`, `Float64`, `String`, `List { child }`, …)
-- **dimensions** — ordered list of dimension names (e.g. `["x", "y", "time"]`)
-- **layout** — `Flat` (single address) or `Chunked` (coordinate → address map)
+- **layout** — carries the full dimensional description plus the storage strategy:
+  - **shape** — global size in each dimension (e.g. `[1000, 500]`)
+  - **dimension_names** — ordered list of dimension names (e.g. `["x", "y"]`)
+  - **storage** — `Flat` (single address) or `Chunked` (coordinate → address map)
+- **fill_value** — optional scalar sentinel for unwritten/missing elements: `Bool`, `Int(i64)`, `UInt(u64)`, `Float(f64)`, or `String`
 - **deleted** — logical delete flag
 
 Typed access is provided through concrete array types (`PrimitiveArray<T>`, `BinaryArray`, `StringArray`) that implement the `ArrayData` trait.
@@ -64,8 +67,9 @@ The footer contains:
   - `uncompressed_size: u64`
   - `codec: CodecId` — `None` or `Named("lz4")`, `Named("zstd")`, etc.
 - **array table** — `Vec<ArrayMeta>`, one entry per array:
-  - `name`, `dtype`, `dimensions`
-  - `layout: ArrayLayout` — flat or chunked with chunk coordinates
+  - `name`, `dtype`
+  - `layout: ArrayLayout` — carries `shape`, `dimension_names`, and `storage` (flat or chunked with chunk coordinates)
+  - `fill_value: Option<FillValue>` — optional scalar sentinel (`Bool`, `Int`, `UInt`, `Float`, or `String`)
   - `deleted: bool`
 
 Reading the footer is a two-pass operation: first read the 12-byte trailer to learn the footer size, then read the full footer payload.
@@ -183,7 +187,9 @@ A flat array is stored as one contiguous payload within a single block. The foot
 
 ```text
 Array X (flat)
-  address: (block_id=1, offset=0, size=40000)
+  shape:           [10000]
+  dimension_names: ["x"]
+  storage:         Flat { address: (block_id=1, offset=0, size=40000) }
 ```
 
 ### Chunked
@@ -191,7 +197,10 @@ Array X (flat)
 A chunked array is divided into a coordinate grid. Each chunk has its own `ChunkAddress` and may reside in any block.
 
 ```text
-Array Y (chunked, 2D, chunk_shape=[1000, 1000])
+Array Y (chunked, 2D)
+  shape:           [2000, 2000]
+  dimension_names: ["x", "y"]
+  storage:         Chunked { chunk_shape=[1000, 1000], chunks=[...] }
 
   +--------+--------+
   | (0,0)  | (0,1)  |
@@ -293,12 +302,14 @@ let config = WriterConfig {
 };
 let mut writer = Writer::new(storage, config);
 
-// Flat array
-writer.write_array("temperatures", vec!["x".into()], &array)?;
+// Flat array — dimension_names, shape, fill_value, data
+writer.write_array("temperatures", vec!["x".into()], vec![3600], Some(FillValue::Float(f64::NAN)), &array)?;
 
-// Chunked array
+// Chunked array — dimension_names, global shape, chunk shape, fill_value
 let mut cw = writer.begin_chunked_array(
-    "grid", DType::Float32, vec!["x".into(), "y".into()], vec![1000, 1000],
+    "grid", DType::Float32,
+    vec!["x".into(), "y".into()], vec![4000, 3000], vec![1000, 1000],
+    Some(FillValue::Float(-9999.0)),
 )?;
 cw.write_array(vec![0, 0], &chunk_00)?;
 cw.write_array(vec![0, 1], &chunk_01)?;
@@ -317,7 +328,7 @@ To append to an existing file, use `Writer::open(storage, config)` which reads t
 Three built-in codecs:
 
 | Type | `CodecId` | Notes |
-|------|-----------|-------|
+| ---- | --------- | ----- |
 | `NoCompression` | `None` | Pass-through, zero-copy in cache |
 | `Lz4Codec` | `Named("lz4")` | Fast compression via `lz4_flex` |
 | `ZstdCodec { level }` | `Named("zstd")` | Configurable level (1–22, default 3) |

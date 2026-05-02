@@ -16,8 +16,8 @@ use object_store::path::Path;
 use rand::Rng;
 
 use array_format::{
-    ArrayLayout, BlockId, InMemoryStorage, Lz4Codec, NoCompression, ObjectStoreBackend,
-    PrimitiveArray, Reader, Writer, WriterConfig,
+    BlockId, InMemoryStorage, Lz4Codec, NoCompression, ObjectStoreBackend, PrimitiveArray, Reader,
+    StorageLayout, Writer, WriterConfig,
 };
 
 const MANY_ARRAYS_COUNT: usize = 25_000;
@@ -52,7 +52,9 @@ async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone>(
             .map(|_| rng.random_range(0..10))
             .collect();
         let array = PrimitiveArray::from_slice(&values);
-        writer.write_array(&name, vec!["x".into()], &array).unwrap();
+        writer
+            .write_array(&name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY as u32], None, &array)
+            .unwrap();
         names.push(name);
     }
     writer.flush().await.unwrap();
@@ -80,7 +82,9 @@ async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone
             .map(|_| rng.random_range(0..10))
             .collect();
         let array = PrimitiveArray::from_slice(&values);
-        writer.write_array(&name, vec!["x".into()], &array).unwrap();
+        writer
+            .write_array(&name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY as u32], None, &array)
+            .unwrap();
         names.push(name);
     }
     writer.flush().await.unwrap();
@@ -100,9 +104,9 @@ async fn read_sequential(reader: &Reader, names: &[String]) {
 fn group_by_block(reader: &Reader) -> Vec<Vec<String>> {
     let mut block_map: HashMap<BlockId, Vec<String>> = HashMap::new();
     for meta in reader.list_arrays() {
-        let block_id = match &meta.layout {
-            ArrayLayout::Flat { address } => address.block_id,
-            ArrayLayout::Chunked { chunks, .. } => {
+        let block_id = match &meta.layout.storage {
+            StorageLayout::Flat { address } => address.block_id,
+            StorageLayout::Chunked { chunks, .. } => {
                 // Use the first chunk's block as representative.
                 chunks.first().unwrap().1.block_id
             }

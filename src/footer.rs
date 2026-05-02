@@ -137,7 +137,7 @@ mod tests {
     use crate::address::{BlockId, ChunkAddress};
     use crate::block::CodecId;
     use crate::dtype::DType;
-    use crate::layout::ArrayLayout;
+    use crate::layout::{ArrayLayout, StorageLayout};
 
     #[test]
     fn roundtrip_empty_footer() {
@@ -161,14 +161,18 @@ mod tests {
             arrays: vec![ArrayMeta {
                 name: "temperature".into(),
                 dtype: DType::Float32,
-                dimensions: vec!["x".into(), "y".into()],
-                layout: ArrayLayout::Flat {
-                    address: ChunkAddress {
-                        block_id: BlockId(0),
-                        offset: 0,
-                        size: 4000,
+                layout: ArrayLayout {
+                    shape: vec![1000, 1000],
+                    dimension_names: vec!["x".into(), "y".into()],
+                    storage: StorageLayout::Flat {
+                        address: ChunkAddress {
+                            block_id: BlockId(0),
+                            offset: 0,
+                            size: 4000,
+                        },
                     },
                 },
+                fill_value: Some(crate::layout::FillValue::Float(f64::NAN)),
                 deleted: false,
             }],
         };

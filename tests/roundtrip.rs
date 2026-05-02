@@ -19,9 +19,9 @@ async fn flat_array_roundtrip() {
     {
         let mut w = Writer::new(storage.clone(), small_config());
         let ints = PrimitiveArray::<u8>::from_slice(&[1u8; 80]);
-        w.write_array("ints", vec!["x".into()], &ints).unwrap();
+        w.write_array("ints", vec!["x".into()], vec![80], None, &ints).unwrap();
         let floats = PrimitiveArray::<f64>::from_slice(&[0.0f64; 5]);
-        w.write_array("floats", vec!["t".into()], &floats).unwrap();
+        w.write_array("floats", vec!["t".into()], vec![5], None, &floats).unwrap();
         w.flush().await.unwrap();
     }
 
@@ -42,11 +42,11 @@ async fn delete_and_compact() {
     {
         let mut w = Writer::new(storage.clone(), small_config());
         let a = PrimitiveArray::<u8>::from_slice(&[10; 20]);
-        w.write_array("a", vec![], &a).unwrap();
+        w.write_array("a", vec![], vec![], None, &a).unwrap();
         let b = PrimitiveArray::<u16>::from_slice(&[20; 10]);
-        w.write_array("b", vec![], &b).unwrap();
+        w.write_array("b", vec![], vec![], None, &b).unwrap();
         let c = PrimitiveArray::<i64>::from_slice(&[30i64; 2]);
-        w.write_array("c", vec![], &c).unwrap();
+        w.write_array("c", vec![], vec![], None, &c).unwrap();
         w.delete("b").unwrap();
         w.flush().await.unwrap();
     }
