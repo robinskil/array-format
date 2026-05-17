@@ -1,223 +1,214 @@
 # array-format
 
-`array-format` stores many n-dimensional arrays in one file.
-
-Data bytes are written first into blocks and a footer index is appended at the end of the file. The footer contains all metadata needed to reconstruct arrays and locate their bytes. All I/O goes through a `Storage` trait backed by the `object_store` crate, so any backend (local filesystem, S3, GCS, Azure) works out of the box.
+`array-format` stores many n-dimensional arrays in a single file. It uses a **delta/overlay architecture**: each flush produces a self-describing sidecar file that stacks on top of the base, recording only the chunks that changed. Reads fall through to older layers for unchanged chunks. Layers can be merged into a single file with `compact`.
 
 ## Why this format exists
 
-This format is designed for workloads where you want:
+- Store many arrays in one object or a small set of related files
+- Append new arrays and update individual chunks without rewriting the whole file
+- Block-level compression (LZ4, Zstd, or none) recorded per block so readers need no configuration
+- Chunked or single-chunk layouts with coordinate-addressed reads
+- Logical deletes with periodic compaction to reclaim space
+- Works with any `object_store`-compatible backend (local filesystem, S3, GCS, Azure)
 
-- multiple arrays in one object/file
-- either whole-array (`flat`) or chunked storage
-- append-friendly writes
-- efficient lookup via a single footer read
-- block-level compression with per-block codec metadata
-- parallel-safe, cache-backed reads with zero-copy slicing
-- logical deletes followed by periodic compaction
+## Quick start
 
-## Core concepts
+```rust
+use array_format::{File, FileConfig, Lz4Codec};
+use ndarray::Array;
 
-### Arrays
+// Create a new file
+let mut file = File::create(path, FileConfig::new(Lz4Codec)).await?;
 
-Each stored array has a definition in the footer:
+// Define and write a 1-D f32 array
+file.define_array::<f32>("signal", vec!["t".into()], vec![1024], None, None)?;
+let data = Array::from_vec(vec![0.0f32; 1024]).into_dyn();
+file.write_array("signal", vec![0], data.view()).await?;
 
-- **name** — unique string identifier
-- **dtype** — data type (`Int32`, `Float64`, `String`, `List { child }`, …)
-- **layout** — carries the full dimensional description plus the storage strategy:
-  - **shape** — global size in each dimension (e.g. `[1000, 500]`)
-  - **dimension_names** — ordered list of dimension names (e.g. `["x", "y"]`)
-  - **storage** — `Flat` (single address) or `Chunked` (coordinate → address map)
-- **fill_value** — optional scalar sentinel for unwritten/missing elements: `Bool`, `Int(i64)`, `UInt(u64)`, `Float(f64)`, or `String`
-- **deleted** — logical delete flag
+// Commit to a sidecar file ({stem}.1.af)
+file.flush().await?;
 
-Typed access is provided through concrete array types (`PrimitiveArray<T>`, `BinaryArray`, `StringArray`) that implement the `ArrayData` trait.
-
-### Blocks
-
-Array bytes are packed into blocks. A block has a configurable target size (default: 8 MiB).
-
-- one block can hold bytes from multiple arrays/chunks
-- a flat array is never split across blocks — it lives at a single address
-- data within a block is 8-byte aligned so typed slices can be constructed zero-copy
-- each block is compressed independently with the configured codec
-- the codec used is recorded per block in the block table, so the reader can decompress without knowing the writer's configuration
-
-### Addresses
-
-An array or chunk is located via a `ChunkAddress`:
-
-```text
-(block_id, offset, size)
+// Read back — any session after open
+let result = file.read_array::<f32>("signal", vec![], vec![]).await?;
 ```
 
-This means: find the decompressed block with id `block_id`, skip `offset` bytes, and read `size` bytes.
+Variable-length types like `String` and `Vec<u8>` use the same methods:
 
-### Footer
+```rust
+file.define_array::<String>("labels", vec!["i".into()], vec![100], None, None)?;
+let labels = ndarray::arr1(&["alpha".to_string(), "beta".to_string()]).into_dyn();
+file.write_array("labels", vec![0], labels.view()).await?;
+let out = file.read_array::<String>("labels", vec![], vec![]).await?;
+```
 
-The footer is serialized with `rkyv` and appended after the data region. A 12-byte trailer at the very end of the file stores the footer payload size (u64 LE) followed by a 4-byte magic number (`ARRF`).
+## Delta / overlay architecture
 
-The footer contains:
+Opening a file discovers the base file and all sidecars:
 
-- **version** — format version (currently `1`)
-- **block table** — `Vec<BlockMeta>`, one entry per block:
-  - `id: BlockId`
-  - `file_offset: u64` — byte position in the file
-  - `compressed_size: u64`
-  - `uncompressed_size: u64`
-  - `codec: CodecId` — `None` or `Named("lz4")`, `Named("zstd")`, etc.
-- **array table** — `Vec<ArrayMeta>`, one entry per array:
-  - `name`, `dtype`
-  - `layout: ArrayLayout` — carries `shape`, `dimension_names`, and `storage` (flat or chunked with chunk coordinates)
-  - `fill_value: Option<FillValue>` — optional scalar sentinel (`Bool`, `Int`, `UInt`, `Float`, or `String`)
-  - `deleted: bool`
+```text
+mydata.af        ← base (overlay_index 0, written by File::create)
+mydata.1.af      ← first flush
+mydata.2.af      ← second flush
+...
+```
 
-Reading the footer is a two-pass operation: first read the 12-byte trailer to learn the footer size, then read the full footer payload.
+Each sidecar is fully self-describing: it contains its own block table and array metadata. On read, layers are walked newest-first; the first layer that has a chunk wins. `compact()` merges all layers into a new base and deletes the sidecars.
+
+```text
+Before compact:
+  mydata.af   mydata.1.af   mydata.2.af
+
+After compact:
+  mydata.af   (single merged file)
+```
+
+## File API
+
+```rust
+// On-disk
+File::create(path, config).await?
+File::open(path, config).await?           // base + any sidecars
+
+// In-memory (for testing)
+File::create_memory(config).await?
+file.flush_memory(&storage).await?
+
+// Schema
+file.define_array::<T>(name, dim_names, shape, chunk_shape, fill_value)?
+file.delete(name)?                        // logical delete (hidden until compact)
+file.list_arrays()                        // Vec<MergedArrayMeta>, deleted excluded
+file.num_layers()
+
+// ndarray read / write — works for all ArrayElement types
+file.write_array(name, start, ndarray_view).await?
+file.read_array::<T>(name, start, shape).await?   // vec![], vec![] for full array
+
+// Attributes
+file.set_attribute(name, key, AttributeValue::String("m/s".into()))?
+file.get_attribute(name, key)?
+
+// Flush and compact
+file.flush().await?
+file.compact().await?
+```
+
+### `FileConfig`
+
+```rust
+FileConfig::new(Lz4Codec)                // convenience; block_target_size=4MiB, cache=128
+
+FileConfig {
+    codec: ZstdCodec { level: 3 },
+    block_target_size: 4 * 1024 * 1024,
+    cache_capacity: 128,
+}
+```
 
 ## Supported data types
 
-```text
-DType
-├── Bool            1 byte (0 or 1)
-├── Int8            1 byte
-├── Int16           2 bytes LE
-├── Int32           4 bytes LE
-├── Int64           8 bytes LE
-├── UInt8           1 byte
-├── UInt16          2 bytes LE
-├── UInt32          4 bytes LE
-├── UInt64          8 bytes LE
-├── Float32         4 bytes IEEE 754 LE
-├── Float64         8 bytes IEEE 754 LE
-├── String          variable-length UTF-8
-├── Binary          variable-length bytes
-├── FixedSizeList   { child: DType, size: u32 }
-└── List            { child: DType }
+All readable and writable types implement the `ArrayElement` trait:
+
+```rust
+pub trait ArrayElement: Clone + Send + Sync + 'static {
+    const DTYPE: DType;
+    fn encode_chunk(values: &[Self]) -> Vec<u8>;
+    fn decode_chunk(bytes: &[u8]) -> Vec<Self>;
+    fn fill_element(fill: Option<&FillValue>) -> Self;
+}
 ```
 
-### Fixed-width primitives
+### Fixed-width numeric types
 
-Values are stored contiguously with no per-element header. Integer and float values are little-endian. Element size is constant and determined by the dtype.
+Values stored contiguously, little-endian, no per-element headers. Safe zero-copy encode/decode via memcpy.
 
-Example (`Int16`, values `[1, 2, 300]`):
+| Rust type                   | `DType`              |
+| --------------------------- | -------------------- |
+| `u8`, `u16`, `u32`, `u64`   | `UInt8` … `UInt64`   |
+| `i8`, `i16`, `i32`, `i64`   | `Int8` … `Int64`     |
+| `f32`, `f64`                | `Float32`, `Float64` |
 
-```text
-01 00 02 00 2C 01
-```
+### Variable-length types
 
-### Variable-length values (String, Binary)
+Stored as an offset buffer: `N+1` u32 LE offsets followed by the concatenated payload.
 
-Stored as two logical buffers:
-
-- offsets buffer — `N + 1` u32 offsets (little-endian)
-- values buffer — concatenated payload bytes
+| Rust type | `DType`         |
+| --------- | --------------- |
+| `String`  | `DType::String` |
+| `Vec<u8>` | `DType::Binary` |
 
 Example (`String`, values `["cat", "", "elephant"]`):
 
 ```text
-offsets (u32): [0, 3, 3, 11]
-values bytes : [63 61 74 65 6C 65 70 68 61 6E 74]
-
-index 0 => bytes[0..3]  = "cat"
-index 1 => bytes[3..3]  = ""
-index 2 => bytes[3..11] = "elephant"
+offsets (u32 LE): [0, 3, 3, 11]
+payload bytes   : 63 61 74  65 6C 65 70 68 61 6E 74
+                  c  a  t   e  l  e  p  h  a  n  t
 ```
 
-### Fixed-size lists
+## Chunked layout
 
-`FixedSizeList { child, size }` — each element is a list of exactly `size` child values. No offsets buffer needed.
+Defining an array with a `chunk_shape` smaller than the full shape tiles the array into a coordinate grid. Each chunk is stored independently and can be updated without touching others.
 
-Example (`FixedSizeList { child: Int8, size: 3 }`, values `[[1,2,3], [4,5,6]]`):
+```rust
+file.define_array::<f32>(
+    "grid",
+    vec!["x".into(), "y".into()],
+    vec![4000, 3000],           // full shape
+    Some(vec![1000, 1000]),     // chunk shape → 4×3 grid of chunks
+    Some(FillValue::Float(0.0)),
+)?;
+```
 
 ```text
-child values: [01 02 03 04 05 06]
+  +--------+--------+--------+
+  | (0,0)  | (0,1)  | (0,2)  |
+  +--------+--------+--------+
+  | (1,0)  | (1,1)  | (1,2)  |
+  +--------+--------+--------+
+  | (2,0)  | (2,1)  | (2,2)  |
+  +--------+--------+--------+
+  | (3,0)  | (3,1)  | (3,2)  |
+  +--------+--------+--------+
 ```
 
-### Variable-length lists
+`write_array` performs read-modify-write automatically for partial chunk writes. Chunks that haven't been written are filled with the array's fill value on read.
 
-`List { child }` — each element can contain a different number of child values.
+When `chunk_shape` is `None`, the entire array is stored as a single chunk.
 
-- parent offsets buffer — `N + 1` u32 entries
-- child values buffer — all child elements concatenated
-
-Example (`List { child: Int16 }`, values `[[10, 20, 30], [], [40]]`):
-
-```text
-parent offsets (u32): [0, 3, 3, 4]
-child values (int16 LE): [0A 00 14 00 1E 00 28 00]
-```
-
-Nesting is supported — each variable-length level introduces its own offsets buffer.
-
-### Nullability
-
-Not supported. Validity bitmaps are not stored. Empty strings, empty binaries, and empty lists are valid values but are not null.
-
-## On-disk layout
+## On-disk layout (per delta file)
 
 ```text
 +-------------------------------+ 0
 | Data Region                   |
-|  [block 0 bytes]              |
-|  [block 1 bytes]              |
+|  [block 0: compressed bytes]  |
+|  [block 1: compressed bytes]  |
 |  ...                          |
 +-------------------------------+
 | Footer (rkyv-serialized)      |
 +-------------------------------+
-| footer_size (u64 LE)          |
-| magic b"ARRF" (4 bytes)      |
+| footer_size  (u64 LE)         |
+| magic b"ARRF" (4 bytes)       |
 +-------------------------------+ EOF
 ```
 
-Inside a block, payloads are packed with 8-byte alignment padding:
+**Footer contents:**
+
+- `version` — format version (currently `1`)
+- `overlay_index` — which layer this file represents (`0` = base)
+- `base_file_hint` — stem of the base file
+- `blocks` — `Vec<BlockMeta>`: id, file offset, compressed/uncompressed sizes, codec
+- `arrays` — `Vec<ArrayMeta>`: name, dtype, shape, chunk_shape, chunk coordinates → `ChunkAddress`, fill_value, deleted flag, attributes
+
+**`ChunkAddress`:**
 
 ```text
-block 5 (example, uncompressed view)
-
-+--[arrA flat]--+--[pad]--+--[arrB chunk 3]--+--[pad]--+--[arrC flat]--+
-0               ^         ^                   ^         ^               ^
-            8-aligned   8-aligned          8-aligned  8-aligned
+(block_id: u32, offset: u32, size: u32)
 ```
 
-## Flat vs chunked layout
+Find the block by id, decompress, slice `[offset..offset+size]`.
 
-### Flat
-
-A flat array is stored as one contiguous payload within a single block. The footer records a single `ChunkAddress`:
-
-```text
-Array X (flat)
-  shape:           [10000]
-  dimension_names: ["x"]
-  storage:         Flat { address: (block_id=1, offset=0, size=40000) }
-```
-
-### Chunked
-
-A chunked array is divided into a coordinate grid. Each chunk has its own `ChunkAddress` and may reside in any block.
-
-```text
-Array Y (chunked, 2D)
-  shape:           [2000, 2000]
-  dimension_names: ["x", "y"]
-  storage:         Chunked { chunk_shape=[1000, 1000], chunks=[...] }
-
-  +--------+--------+
-  | (0,0)  | (0,1)  |
-  +--------+--------+
-  | (1,0)  | (1,1)  |
-  +--------+--------+
-
-Footer mapping:
-  (0,0) -> (block=3, offset=0,    size=1MB)
-  (0,1) -> (block=7, offset=2MB,  size=1MB)
-  (1,0) -> (block=3, offset=1MB,  size=1MB)
-  (1,1) -> (block=9, offset=0,    size=1MB)
-```
+The footer is serialized with `rkyv`. Reading it is a two-pass operation: first read the 12-byte trailer to get `footer_size`, then read the footer payload.
 
 ## Storage
-
-All I/O goes through the `Storage` trait:
 
 ```rust
 pub trait Storage: Send + Sync {
@@ -227,134 +218,43 @@ pub trait Storage: Send + Sync {
 }
 ```
 
-The trait is dyn-compatible (uses `BoxFuture`). Two implementations are provided:
+Two built-in implementations:
 
-- **`ObjectStoreBackend`** — wraps any `object_store::ObjectStore` (local filesystem, S3, GCS, Azure)
-- **`InMemoryStorage`** — in-memory buffer for testing
-
-## Read path
-
-Opening a reader parses the footer and builds O(1) lookup indexes for arrays (by name) and blocks (by id). The reader owns a shared `moka`-based block cache.
-
-To read an array:
-
-1. Look up `ArrayMeta` by name (HashMap, O(1)).
-2. Determine `ChunkAddress`(es) from the layout.
-3. For each referenced block, consult the cache:
-   - **hit** → return cached `Bytes`
-   - **miss** → read the full compressed block from storage, decompress, insert into cache
-4. Slice the decompressed block bytes at `(offset, size)` — zero-copy via `Bytes::slice()`.
-5. Construct the typed array (`PrimitiveArray<T>`, `StringArray`, etc.) from the slice.
-
-For uncompressed blocks (`CodecId::None`), the cache stores the raw bytes directly — no decompression copy. For `PrimitiveArray`, if the slice is already aligned, the typed view is constructed zero-copy from the `Bytes` buffer.
-
-Concurrent requests for the same block are coalesced — only one storage read + decompress happens, and all waiters share the result.
-
-```text
-Thread A ----\
-Thread B -----+--> [Reader] --> [moka BlockCache]
-Thread C ----/             |          |            |
-                           |        hit          miss
-                           |          |            v
-                           |          |   [full-block read via Storage]
-                           |          |            |
-                           |          |   [decompress (skipped if None)]
-                           |          |            |
-                           +----------+----> [cache insert]
-                                                |
-                                                v
-                                  [Bytes::slice(offset, size)]
-                                                |
-                                                v
-                                     [construct typed array]
-```
-
-### Reader API
-
-```rust
-// Open
-Reader::open(storage, cache_capacity_bytes) -> Result<Reader>
-Reader::open_dyn(Arc<dyn Storage>, cache_capacity_bytes) -> Result<Reader>
-
-// Inspect
-reader.footer() -> &Footer
-reader.list_arrays() -> Vec<&ArrayMeta>  // non-deleted only
-
-// Typed reads
-reader.read_array::<T>(name) -> Result<PrimitiveArray<T>>
-reader.read_chunk::<T>(name, coord) -> Result<PrimitiveArray<T>>
-
-// Dynamic reads
-reader.read_array_dynamic(name) -> Result<Box<dyn ArrayData>>
-reader.read_chunk_dynamic(name, coord) -> Result<Box<dyn ArrayData>>
-
-// Raw bytes
-reader.read_raw_bytes(name) -> Result<Bytes>
-reader.read_chunk_raw(name, coord) -> Result<Bytes>
-```
-
-## Write path
-
-```rust
-let config = WriterConfig {
-    block_target_size: 8 * 1024 * 1024,  // 8 MiB (default)
-    codec: Lz4Codec,                      // or NoCompression, ZstdCodec { level: 3 }
-};
-let mut writer = Writer::new(storage, config);
-
-// Flat array — dimension_names, shape, fill_value, data
-writer.write_array("temperatures", vec!["x".into()], vec![3600], Some(FillValue::Float(f64::NAN)), &array)?;
-
-// Chunked array — dimension_names, global shape, chunk shape, fill_value
-let mut cw = writer.begin_chunked_array(
-    "grid", DType::Float32,
-    vec!["x".into(), "y".into()], vec![4000, 3000], vec![1000, 1000],
-    Some(FillValue::Float(-9999.0)),
-)?;
-cw.write_array(vec![0, 0], &chunk_00)?;
-cw.write_array(vec![0, 1], &chunk_01)?;
-drop(cw);
-
-// Finalize — compresses blocks, writes file
-writer.flush().await?;
-```
-
-The writer packs array payloads into blocks up to the target size. Each payload is padded to 8-byte alignment within the block. When the current block would exceed the target, it is finalized (compressed) and a new block is started. A flat array is never split — it always occupies a single `ChunkAddress` in one block.
-
-To append to an existing file, use `Writer::open(storage, config)` which reads the existing footer first.
+- `ObjectStoreBackend` — wraps any `object_store::ObjectStore`
+- `InMemoryStorage` — shared in-memory buffer, useful for testing
 
 ## Compression codecs
 
-Three built-in codecs:
+| Type                  | Notes                 |
+| --------------------- | --------------------- |
+| `NoCompression`       | Pass-through          |
+| `Lz4Codec`            | Fast, via `lz4_flex`  |
+| `ZstdCodec { level }` | Level 1–22, default 3 |
 
-| Type | `CodecId` | Notes |
-| ---- | --------- | ----- |
-| `NoCompression` | `None` | Pass-through, zero-copy in cache |
-| `Lz4Codec` | `Named("lz4")` | Fast compression via `lz4_flex` |
-| `ZstdCodec { level }` | `Named("zstd")` | Configurable level (1–22, default 3) |
-
-The codec is set per writer. Each block records its codec in the block table, so the reader infers the correct decompression at read time — no codec parameter is needed when opening a reader.
+The codec is set once in `FileConfig`. Each block records its own codec in the block table, so files can be opened without specifying the codec that was used to write them.
 
 ## Deletes and compaction
 
-Deletes are logical — `Writer::delete(name)` sets the `deleted` flag in the footer. Deleted arrays are excluded from `list_arrays()` and all read operations.
-
-Compaction rewrites the file, keeping only live data:
+`file.delete(name)` writes a tombstone to the pending layer. Deleted arrays are excluded from `list_arrays()` and all reads immediately, but their bytes remain on disk until `compact()`.
 
 ```rust
-compact(&storage, &codec, Some(block_target_size)).await?;
+file.delete("old_array")?;
+file.flush().await?;
+
+// Later: merge all layers into a new base, delete sidecars, reclaim space
+file.compact().await?;
+assert_eq!(file.num_layers(), 1);
 ```
 
-```text
-Before compact:
-  data blocks: [live][deleted][live][deleted]
-  footer: marks deleted entries
+## In-memory usage
 
-After compact:
-  data blocks: [live][live]
-  footer: rewritten without deleted entries
+```rust
+use array_format::{File, FileConfig, InMemoryStorage, NoCompression};
+
+let mut file = File::create_memory(FileConfig::new(NoCompression)).await?;
+file.define_array::<i32>("data", vec!["x".into()], vec![10], None, None)?;
+// ... write ...
+
+let storage = InMemoryStorage::new();
+file.flush_memory(&storage).await?;
 ```
-
-## Summary
-
-`array-format` is a block-backed, footer-indexed container for n-dimensional arrays. It supports flat and chunked layouts, fixed-width and variable-length encodings, per-block compression (LZ4, Zstd, or none), zero-copy reads via `Bytes` slicing, a shared `moka` block cache with coalesced concurrent loads, any `object_store`-compatible storage backend, logical deletes, and compaction.

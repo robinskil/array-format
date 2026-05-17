@@ -19,7 +19,7 @@ use crate::storage::Storage;
 pub const MAGIC: [u8; 4] = *b"ARRF";
 
 /// Current footer format version.
-pub const FOOTER_VERSION: u32 = 1;
+pub const FOOTER_VERSION: u32 = 4;
 
 /// Size of the trailer in bytes (`u64` footer size + 4-byte magic).
 pub const TRAILER_SIZE: usize = 12;
@@ -35,16 +35,59 @@ pub struct Footer {
     pub blocks: Vec<BlockMeta>,
     /// Array table: metadata for every array stored in the file.
     pub arrays: Vec<ArrayMeta>,
+    /// Global dictionary of attribute key strings.
+    ///
+    /// Array attributes reference keys by index into this vec, so each
+    /// unique key string is stored exactly once regardless of how many
+    /// arrays carry that attribute.
+    pub attr_keys: Vec<String>,
+    /// Global dictionary of attribute values.
+    ///
+    /// Array attributes reference values by index into this vec, so each
+    /// distinct value is stored exactly once across all arrays. Together with
+    /// `attr_keys` this means each `ArrayMeta::attributes` entry is just 4
+    /// bytes (two `u16` indices).
+    pub attr_values: Vec<crate::layout::AttributeValue>,
+    /// Position of this file in the overlay stack.
+    ///
+    /// `0` = base file. `N > 0` = the Nth sidecar (`{stem}.N.arrf`).
+    /// A sidecar footer's `arrays` list contains only the delta — arrays
+    /// and chunks that changed relative to lower layers.
+    pub overlay_index: u32,
+    /// Stem of the base `.af` file this sidecar belongs to.
+    ///
+    /// Empty for base files. Used to validate that a sidecar was created
+    /// for the correct base file when opening a layered file.
+    pub base_file_hint: String,
 }
 
 impl Footer {
-    /// Creates a new empty footer.
+    /// Creates a new empty base-file footer.
     pub fn new() -> Self {
         Self {
             version: FOOTER_VERSION,
             blocks: Vec::new(),
             arrays: Vec::new(),
+            attr_keys: Vec::new(),
+            attr_values: Vec::new(),
+            overlay_index: 0,
+            base_file_hint: String::new(),
         }
+    }
+
+    /// Creates a new empty overlay (sidecar) footer.
+    pub fn new_overlay(overlay_index: u32, base_file_hint: impl Into<String>) -> Self {
+        Self {
+            version: FOOTER_VERSION,
+            overlay_index,
+            base_file_hint: base_file_hint.into(),
+            ..Self::new()
+        }
+    }
+
+    /// Returns `true` if this footer belongs to a sidecar file.
+    pub fn is_overlay(&self) -> bool {
+        self.overlay_index > 0
     }
 
     /// Serializes the footer to bytes, appending the trailer.
@@ -93,8 +136,17 @@ impl Footer {
         let mut aligned: rkyv::util::AlignedVec = rkyv::util::AlignedVec::new();
         aligned.extend_from_slice(rkyv_bytes);
 
-        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
-            .map_err(|e| Error::Serialization(e.to_string()))
+        let footer = rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
+            .map_err(|e| Error::Serialization(e.to_string()))?;
+
+        if footer.version != FOOTER_VERSION {
+            return Err(Error::InvalidFooter(format!(
+                "unsupported footer version {}, expected {}",
+                footer.version, FOOTER_VERSION
+            )));
+        }
+
+        Ok(footer)
     }
 }
 
@@ -137,7 +189,7 @@ mod tests {
     use crate::address::{BlockId, ChunkAddress};
     use crate::block::CodecId;
     use crate::dtype::DType;
-    use crate::layout::{ArrayLayout, StorageLayout};
+    use crate::layout::{ArrayLayout, ChunkEntry, StorageLayout};
 
     #[test]
     fn roundtrip_empty_footer() {
@@ -164,17 +216,22 @@ mod tests {
                 layout: ArrayLayout {
                     shape: vec![1000, 1000],
                     dimension_names: vec!["x".into(), "y".into()],
-                    storage: StorageLayout::Flat {
-                        address: ChunkAddress {
-                            block_id: BlockId(0),
-                            offset: 0,
-                            size: 4000,
-                        },
+                    storage: StorageLayout {
+                        chunk_shape: vec![1000, 1000],
+                        chunks: vec![ChunkEntry {
+                            coord: vec![0, 0],
+                            address: ChunkAddress { block_id: BlockId(0), offset: 0, size: 4000 },
+                        }],
                     },
                 },
                 fill_value: Some(crate::layout::FillValue::Float(f64::NAN)),
                 deleted: false,
+                attributes: crate::layout::Attributes::U16(vec![]),
             }],
+            attr_keys: vec![],
+            attr_values: vec![],
+            overlay_index: 0,
+            base_file_hint: String::new(),
         };
         let bytes = footer.serialize().unwrap();
         let restored = Footer::deserialize(&bytes).unwrap();

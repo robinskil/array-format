@@ -1,16 +1,10 @@
 //! Benchmarks for reading chunked arrays from real files on disk.
 
-use std::sync::Arc;
-
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use object_store::local::LocalFileSystem;
-use object_store::path::Path;
 use rand::Rng;
 use tokio::runtime::Runtime;
 
-use array_format::{
-    DType, Lz4Codec, NoCompression, ObjectStoreBackend, Reader, Writer, WriterConfig, ZstdCodec,
-};
+use array_format::{File, FileConfig, Lz4Codec, NoCompression, ZstdCodec};
 
 const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB per chunk
 const NUM_CHUNKS: u32 = 64;
@@ -25,39 +19,35 @@ fn patterned_chunk() -> Vec<u8> {
     (0..CHUNK_SIZE).map(|i| (i % 256) as u8).collect()
 }
 
-async fn prepare_file_on_disk<C: array_format::CompressionCodec + Clone>(
+async fn prepare_file_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
     dir: &std::path::Path,
     filename: &str,
     codec: C,
     chunk_data: &[u8],
-) -> ObjectStoreBackend {
-    let store = Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
-    let path = Path::from(filename);
-    let backend = ObjectStoreBackend::new(store, path);
-
-    let config = WriterConfig {
+) -> std::path::PathBuf {
+    let path = dir.join(filename);
+    let config = FileConfig {
         block_target_size: BLOCK_TARGET,
-        codec,
+        ..FileConfig::new(codec)
     };
-    let mut writer = Writer::new(backend, config);
-    let mut chunk_writer = writer
-        .begin_chunked_array(
-            "data",
-            DType::Float32,
-            vec!["x".into(), "y".into()],
-            vec![NUM_CHUNKS, 1],
-            vec![1, 1],
-            None,
-        )
-        .unwrap();
-    for i in 0..NUM_CHUNKS {
-        chunk_writer.write(vec![i, 0], chunk_data).unwrap();
+    let mut file = File::create(&path, config).await.unwrap();
+    file.define_array::<u8>(
+        "data",
+        vec!["x".into(), "y".into()],
+        vec![NUM_CHUNKS as usize, CHUNK_SIZE],
+        Some(vec![1, CHUNK_SIZE]),
+        None,
+    )
+    .unwrap();
+    for i in 0..NUM_CHUNKS as usize {
+        let chunk = ndarray::Array::from_vec(chunk_data.to_vec()).into_dyn();
+        file.write_array("data", vec![i, 0], chunk.view())
+            .await
+            .unwrap();
     }
-    writer.flush().await.unwrap();
-
-    let store = Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
-    let path = Path::from(filename);
-    ObjectStoreBackend::new(store, path)
+    file.flush().await.unwrap();
+    file.compact().await.unwrap();
+    path
 }
 
 fn bench_file_read_all_chunks(c: &mut Criterion) {
@@ -71,52 +61,33 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     let patterned = patterned_chunk();
     let random = random_chunk();
 
-    let storage = rt.block_on(prepare_file_on_disk(
-        tmp_dir.path(),
-        "none_pat.af",
-        NoCompression,
-        &patterned,
-    ));
-    group.bench_function(BenchmarkId::new("none", "patterned"), |b| {
-        b.to_async(&rt).iter(|| async {
-            let reader = Reader::open(storage.clone(), 0).await.unwrap();
-            for i in 0..NUM_CHUNKS {
-                reader.read_chunk_raw("data", &[i, 0]).await.unwrap();
-            }
-        })
-    });
+    macro_rules! bench_codec {
+        ($codec:expr, $name:literal, $data:expr, $filename:literal) => {{
+            let path = rt.block_on(prepare_file_on_disk(
+                tmp_dir.path(),
+                $filename,
+                $codec,
+                $data,
+            ));
+            group.bench_function(BenchmarkId::new($name, "patterned"), |b| {
+                b.to_async(&rt).iter(|| async {
+                    let cfg = FileConfig::new(NoCompression);
+                    let file = File::open(&path, cfg).await.unwrap();
+                    for i in 0..NUM_CHUNKS as usize {
+                        file.read_array::<u8>("data", vec![i, 0], vec![1, CHUNK_SIZE])
+                            .await
+                            .unwrap();
+                    }
+                })
+            });
+        }};
+    }
 
-    let storage = rt.block_on(prepare_file_on_disk(
-        tmp_dir.path(),
-        "zstd_pat.af",
-        ZstdCodec::default(),
-        &patterned,
-    ));
-    group.bench_function(BenchmarkId::new("zstd", "patterned"), |b| {
-        b.to_async(&rt).iter(|| async {
-            let reader = Reader::open(storage.clone(), 0).await.unwrap();
-            for i in 0..NUM_CHUNKS {
-                reader.read_chunk_raw("data", &[i, 0]).await.unwrap();
-            }
-        })
-    });
+    bench_codec!(NoCompression, "none", &patterned, "none_pat.af");
+    bench_codec!(ZstdCodec::default(), "zstd", &patterned, "zstd_pat.af");
+    bench_codec!(Lz4Codec, "lz4", &patterned, "lz4_pat.af");
 
-    let storage = rt.block_on(prepare_file_on_disk(
-        tmp_dir.path(),
-        "lz4_pat.af",
-        Lz4Codec,
-        &patterned,
-    ));
-    group.bench_function(BenchmarkId::new("lz4", "patterned"), |b| {
-        b.to_async(&rt).iter(|| async {
-            let reader = Reader::open(storage.clone(), 0).await.unwrap();
-            for i in 0..NUM_CHUNKS {
-                reader.read_chunk_raw("data", &[i, 0]).await.unwrap();
-            }
-        })
-    });
-
-    let storage = rt.block_on(prepare_file_on_disk(
+    let path_no_rnd = rt.block_on(prepare_file_on_disk(
         tmp_dir.path(),
         "none_rnd.af",
         NoCompression,
@@ -124,14 +95,18 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     ));
     group.bench_function(BenchmarkId::new("none", "random"), |b| {
         b.to_async(&rt).iter(|| async {
-            let reader = Reader::open(storage.clone(), 0).await.unwrap();
-            for i in 0..NUM_CHUNKS {
-                reader.read_chunk_raw("data", &[i, 0]).await.unwrap();
+            let file = File::open(&path_no_rnd, FileConfig::new(NoCompression))
+                .await
+                .unwrap();
+            for i in 0..NUM_CHUNKS as usize {
+                file.read_array::<u8>("data", vec![i, 0], vec![1, CHUNK_SIZE])
+                    .await
+                    .unwrap();
             }
         })
     });
 
-    let storage = rt.block_on(prepare_file_on_disk(
+    let path_zstd_rnd = rt.block_on(prepare_file_on_disk(
         tmp_dir.path(),
         "zstd_rnd.af",
         ZstdCodec::default(),
@@ -139,14 +114,18 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     ));
     group.bench_function(BenchmarkId::new("zstd", "random"), |b| {
         b.to_async(&rt).iter(|| async {
-            let reader = Reader::open(storage.clone(), 0).await.unwrap();
-            for i in 0..NUM_CHUNKS {
-                reader.read_chunk_raw("data", &[i, 0]).await.unwrap();
+            let file = File::open(&path_zstd_rnd, FileConfig::new(NoCompression))
+                .await
+                .unwrap();
+            for i in 0..NUM_CHUNKS as usize {
+                file.read_array::<u8>("data", vec![i, 0], vec![1, CHUNK_SIZE])
+                    .await
+                    .unwrap();
             }
         })
     });
 
-    let storage = rt.block_on(prepare_file_on_disk(
+    let path_lz4_rnd = rt.block_on(prepare_file_on_disk(
         tmp_dir.path(),
         "lz4_rnd.af",
         Lz4Codec,
@@ -154,9 +133,13 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     ));
     group.bench_function(BenchmarkId::new("lz4", "random"), |b| {
         b.to_async(&rt).iter(|| async {
-            let reader = Reader::open(storage.clone(), 0).await.unwrap();
-            for i in 0..NUM_CHUNKS {
-                reader.read_chunk_raw("data", &[i, 0]).await.unwrap();
+            let file = File::open(&path_lz4_rnd, FileConfig::new(NoCompression))
+                .await
+                .unwrap();
+            for i in 0..NUM_CHUNKS as usize {
+                file.read_array::<u8>("data", vec![i, 0], vec![1, CHUNK_SIZE])
+                    .await
+                    .unwrap();
             }
         })
     });
@@ -173,100 +156,58 @@ fn bench_file_single_chunk_read(c: &mut Criterion) {
 
     let patterned = patterned_chunk();
 
-    let storage = rt.block_on(prepare_file_on_disk(
+    let path_no = rt.block_on(prepare_file_on_disk(
         tmp_dir.path(),
         "single_none.af",
         NoCompression,
         &patterned,
     ));
-    let reader_no = rt.block_on(async { Reader::open(storage, 0).await.unwrap() });
     group.bench_function("none/uncached", |b| {
         b.to_async(&rt).iter(|| async {
-            reader_no.read_chunk_raw("data", &[0, 0]).await.unwrap();
+            let cfg = FileConfig {
+                cache_capacity: 0,
+                ..FileConfig::new(NoCompression)
+            };
+            let file = File::open(&path_no, cfg).await.unwrap();
+            file.read_array::<u8>("data", vec![0, 0], vec![1, CHUNK_SIZE])
+                .await
+                .unwrap();
         })
     });
 
-    let storage = rt.block_on(prepare_file_on_disk(
+    let path_zstd = rt.block_on(prepare_file_on_disk(
         tmp_dir.path(),
         "single_zstd.af",
         ZstdCodec::default(),
         &patterned,
     ));
-    let reader_zstd = rt.block_on(async { Reader::open(storage, 0).await.unwrap() });
     group.bench_function("zstd/uncached", |b| {
         b.to_async(&rt).iter(|| async {
-            reader_zstd.read_chunk_raw("data", &[0, 0]).await.unwrap();
+            let cfg = FileConfig {
+                cache_capacity: 0,
+                ..FileConfig::new(NoCompression)
+            };
+            let file = File::open(&path_zstd, cfg).await.unwrap();
+            file.read_array::<u8>("data", vec![0, 0], vec![1, CHUNK_SIZE])
+                .await
+                .unwrap();
         })
     });
 
-    let storage = rt.block_on(prepare_file_on_disk(
+    let path_lz4 = rt.block_on(prepare_file_on_disk(
         tmp_dir.path(),
         "single_lz4.af",
         Lz4Codec,
         &patterned,
     ));
-    let reader_lz4 = rt.block_on(async { Reader::open(storage, 0).await.unwrap() });
     group.bench_function("lz4/uncached", |b| {
         b.to_async(&rt).iter(|| async {
-            reader_lz4.read_chunk_raw("data", &[0, 0]).await.unwrap();
-        })
-    });
-
-    let storage = rt.block_on(prepare_file_on_disk(
-        tmp_dir.path(),
-        "single_cached_none.af",
-        NoCompression,
-        &patterned,
-    ));
-    let reader_no_cached = rt.block_on(async {
-        let r = Reader::open(storage, 64 * 1024 * 1024).await.unwrap();
-        r.read_chunk_raw("data", &[0, 0]).await.unwrap();
-        r
-    });
-    group.bench_function("none/cached", |b| {
-        b.to_async(&rt).iter(|| async {
-            reader_no_cached
-                .read_chunk_raw("data", &[0, 0])
-                .await
-                .unwrap();
-        })
-    });
-
-    let storage = rt.block_on(prepare_file_on_disk(
-        tmp_dir.path(),
-        "single_cached_zstd.af",
-        ZstdCodec::default(),
-        &patterned,
-    ));
-    let reader_zstd_cached = rt.block_on(async {
-        let r = Reader::open(storage, 64 * 1024 * 1024).await.unwrap();
-        r.read_chunk_raw("data", &[0, 0]).await.unwrap();
-        r
-    });
-    group.bench_function("zstd/cached", |b| {
-        b.to_async(&rt).iter(|| async {
-            reader_zstd_cached
-                .read_chunk_raw("data", &[0, 0])
-                .await
-                .unwrap();
-        })
-    });
-
-    let storage = rt.block_on(prepare_file_on_disk(
-        tmp_dir.path(),
-        "single_cached_lz4.af",
-        Lz4Codec,
-        &patterned,
-    ));
-    let reader_lz4_cached = rt.block_on(async {
-        let r = Reader::open(storage, 64 * 1024 * 1024).await.unwrap();
-        r.read_chunk_raw("data", &[0, 0]).await.unwrap();
-        r
-    });
-    group.bench_function("lz4/cached", |b| {
-        b.to_async(&rt).iter(|| async {
-            reader_lz4_cached
-                .read_chunk_raw("data", &[0, 0])
+            let cfg = FileConfig {
+                cache_capacity: 0,
+                ..FileConfig::new(NoCompression)
+            };
+            let file = File::open(&path_lz4, cfg).await.unwrap();
+            file.read_array::<u8>("data", vec![0, 0], vec![1, CHUNK_SIZE])
                 .await
                 .unwrap();
         })

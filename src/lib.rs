@@ -10,15 +10,16 @@
 //! | Layer | Purpose | Key types |
 //! |-------|---------|-----------|
 //! | 0 — Core | Primitives | [`DType`], [`ChunkAddress`], [`BlockId`], [`Error`] |
-//! | 1 — Metadata | Footer model | [`BlockMeta`], [`ArrayMeta`], [`ArrayLayout`], [`Footer`] |
+//! | 1 — Metadata | Footer model | [`BlockMeta`], [`Footer`] |
 //! | 2 — Traits | Extension points | [`CompressionCodec`], [`Storage`] |
-//! | 3 — Runtime | Read / write / compact | [`Reader`], [`Writer`], [`compact()`] |
+//! | 3 — Runtime | Read / write / compact | [`File`] |
 //!
 //! The [`CompressionCodec`] and [`Storage`] traits allow plugging in
 //! custom compression algorithms and storage backends.
 
 // ── Layer 0: Core types ─────────────────────────────────────────────
 pub mod address;
+pub mod delta;
 pub mod dtype;
 pub mod error;
 
@@ -34,23 +35,17 @@ pub mod storage;
 // ── Layer 3: Runtime ────────────────────────────────────────────────
 pub mod array;
 pub mod cache;
-pub mod compact;
-pub mod reader;
-pub mod writer;
+pub mod file;
+
+pub mod ndarray_ext;
 
 // ── Public re-exports ───────────────────────────────────────────────
-pub use address::{BlockId, ChunkAddress};
-pub use array::{
-    ArrayData, BinaryArray, NativeType, PrimitiveArray, StringArray, from_bytes_dynamic,
-};
-pub use block::{BlockMeta, CodecId};
-pub use cache::BlockCache;
-pub use codec::{CompressionCodec, Lz4Codec, NoCompression, ZstdCodec, decompress_by_id};
-pub use compact::compact;
+pub use array::ArrayElement;
+pub use codec::{CompressionCodec, Lz4Codec, NoCompression, ZstdCodec};
 pub use dtype::DType;
 pub use error::{Error, Result};
-pub use footer::{FOOTER_VERSION, Footer, MAGIC};
-pub use layout::{ArrayLayout, ArrayMeta, FillValue, StorageLayout};
-pub use reader::Reader;
-pub use storage::{InMemoryStorage, ObjectStoreBackend, Storage};
-pub use writer::{ChunkedArrayWriter, DEFAULT_BLOCK_TARGET_SIZE, Writer, WriterConfig};
+pub use file::{
+    DEFAULT_BLOCK_TARGET_SIZE, DEFAULT_CACHE_CAPACITY, File, FileConfig, MergedArrayMeta,
+};
+pub use layout::{AttributeValue, FillValue};
+pub use storage::InMemoryStorage;

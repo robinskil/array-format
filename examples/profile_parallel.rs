@@ -12,78 +12,45 @@
 //! cargo run --release --example profile_parallel -- memory lz4
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use crossbeam_queue::SegQueue;
 use futures::stream::{self, StreamExt};
-use object_store::local::LocalFileSystem;
-use object_store::path::Path;
 use tokio::runtime::Runtime;
 
-use array_format::{
-    BlockId, InMemoryStorage, Lz4Codec, NoCompression, ObjectStoreBackend,
-    PrimitiveArray, Reader, Writer, WriterConfig,
-};
+use array_format::{File, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
 
 const ARRAY_COUNT: usize = 25_000;
 const ELEMENTS_PER_ARRAY: usize = 10_000;
 const BLOCK_TARGET: usize = 4 * 1024 * 1024;
-const CACHE_SIZE: u64 = 256 * 1024 * 1024;
+const CACHE_SIZE: usize = 256 * 1024 * 1024;
 const PARALLELISM: usize = 24;
 const CONCURRENCY: usize = 8;
 
-fn group_by_block(reader: &Reader) -> Vec<Vec<String>> {
-    let mut block_map: HashMap<BlockId, Vec<String>> = HashMap::new();
-    for meta in reader.list_arrays() {
-        let block_id = match &meta.layout.storage {
-            array_format::StorageLayout::Flat { address } => address.block_id,
-            array_format::StorageLayout::Chunked { chunks, .. } => chunks.first().unwrap().1.block_id,
-        };
-        block_map
-            .entry(block_id)
-            .or_default()
-            .push(meta.name.clone());
+async fn read_parallel_concurrent(
+    file: Arc<File>,
+    names: Vec<String>,
+    parallelism: usize,
+    concurrency: usize,
+) {
+    let mut partitions: Vec<Vec<String>> = (0..parallelism).map(|_| Vec::new()).collect();
+    for (i, name) in names.into_iter().enumerate() {
+        partitions[i % parallelism].push(name);
     }
-    block_map.into_values().collect()
-}
-
-async fn read_parallel_concurrent(reader: Arc<Reader>, parallelism: usize, concurrency: usize) {
-    let block_groups = group_by_block(&reader);
-
-    let queues: Vec<Arc<SegQueue<Vec<String>>>> = (0..parallelism)
-        .map(|_| Arc::new(SegQueue::new()))
-        .collect();
-    for (i, group) in block_groups.into_iter().enumerate() {
-        queues[i % parallelism].push(group);
-    }
-    let queues = Arc::new(queues);
 
     let mut handles = Vec::with_capacity(parallelism);
-    for task_id in 0..parallelism {
-        let reader = Arc::clone(&reader);
-        let queues = Arc::clone(&queues);
+    for partition in partitions {
+        let file = Arc::clone(&file);
         handles.push(tokio::spawn(async move {
-            loop {
-                let own = &queues[task_id];
-                let batch = own.pop().or_else(|| {
-                    (1..queues.len())
-                        .map(|off| (task_id + off) % queues.len())
-                        .find_map(|v| queues[v].pop())
-                });
-                let Some(names) = batch else { break };
-
-                stream::iter(names)
-                    .map(|name| {
-                        let reader = Arc::clone(&reader);
-                        async move {
-                            reader.read_array::<i32>(&name).await.unwrap();
-                        }
-                    })
-                    .buffered(concurrency)
-                    .for_each(|_| async {})
-                    .await;
-            }
+            stream::iter(partition)
+                .map(|name| {
+                    let file = Arc::clone(&file);
+                    async move {
+                        file.read_array::<i32>(&name, vec![], vec![]).await.unwrap();
+                    }
+                })
+                .buffered(concurrency)
+                .for_each(|_| async {})
+                .await;
         }));
     }
     for h in handles {
@@ -91,100 +58,118 @@ async fn read_parallel_concurrent(reader: Arc<Reader>, parallelism: usize, concu
     }
 }
 
-fn write_arrays<C: array_format::CompressionCodec>(writer: &mut Writer<C>) {
+async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
+    codec: C,
+) -> (File, Vec<String>, InMemoryStorage) {
+    let config = FileConfig {
+        block_target_size: BLOCK_TARGET,
+        cache_capacity: CACHE_SIZE,
+        ..FileConfig::new(codec)
+    };
+    let mut file = File::create_memory(config).await.unwrap();
+    let mut names = Vec::with_capacity(ARRAY_COUNT);
     for i in 0..ARRAY_COUNT {
         let name = format!("arr_{i:05}");
         let values: Vec<i32> = vec![1; ELEMENTS_PER_ARRAY];
-        let array = PrimitiveArray::from_slice(&values);
-        writer.write_array(&name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY as u32], None, &array).unwrap();
+        let nd = ndarray::Array::from_vec(values).into_dyn();
+        file.define_array::<i32>(
+            &name,
+            vec!["x".into()],
+            vec![ELEMENTS_PER_ARRAY],
+            None,
+            None,
+        )
+        .unwrap();
+        file.write_array(&name, vec![0], nd.view()).await.unwrap();
+        names.push(name);
     }
+    let overlay = InMemoryStorage::new();
+    file.flush_memory(&overlay).await.unwrap();
+    (file, names, overlay)
+}
+
+async fn prepare_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
+    path: &std::path::Path,
+    codec: C,
+) -> Vec<String> {
+    let config = FileConfig {
+        block_target_size: BLOCK_TARGET,
+        cache_capacity: CACHE_SIZE,
+        ..FileConfig::new(codec)
+    };
+    let mut file = File::create(path, config).await.unwrap();
+    let mut names = Vec::with_capacity(ARRAY_COUNT);
+    for i in 0..ARRAY_COUNT {
+        let name = format!("arr_{i:05}");
+        let values: Vec<i32> = vec![1; ELEMENTS_PER_ARRAY];
+        let nd = ndarray::Array::from_vec(values).into_dyn();
+        file.define_array::<i32>(
+            &name,
+            vec!["x".into()],
+            vec![ELEMENTS_PER_ARRAY],
+            None,
+            None,
+        )
+        .unwrap();
+        file.write_array(&name, vec![0], nd.view()).await.unwrap();
+        names.push(name);
+    }
+    file.flush().await.unwrap();
+    file.compact().await.unwrap();
+    names
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let backend = args.get(1).map(|s| s.as_str()).unwrap_or("memory");
-    let codec = args.get(2).map(|s| s.as_str()).unwrap_or("lz4");
-    let use_lz4 = codec != "none";
+    let codec_arg = args.get(2).map(|s| s.as_str()).unwrap_or("lz4");
+    let use_lz4 = codec_arg != "none";
 
     let rt = Runtime::new().unwrap();
 
     eprintln!(
-        "Preparing {ARRAY_COUNT} arrays ({} each, {backend}, {codec})...",
+        "Preparing {ARRAY_COUNT} arrays ({} each, {backend}, {codec_arg})...",
         humanize(ELEMENTS_PER_ARRAY * 4)
     );
 
     match backend {
         "memory" => {
-            let storage = rt.block_on(async {
-                let s = InMemoryStorage::new();
-                if use_lz4 {
-                    let mut w = Writer::new(
-                        s.clone(),
-                        WriterConfig {
-                            block_target_size: BLOCK_TARGET,
-                            codec: Lz4Codec,
-                        },
-                    );
-                    write_arrays(&mut w);
-                    w.flush().await.unwrap();
-                } else {
-                    let mut w = Writer::new(
-                        s.clone(),
-                        WriterConfig {
-                            block_target_size: BLOCK_TARGET,
-                            codec: NoCompression,
-                        },
-                    );
-                    write_arrays(&mut w);
-                    w.flush().await.unwrap();
-                }
-                s
-            });
-
             eprintln!("Reading with par={PARALLELISM}, conc={CONCURRENCY}...");
             rt.block_on(async {
-                let reader = Arc::new(Reader::open(storage, CACHE_SIZE).await.unwrap());
-                read_parallel_concurrent(reader, PARALLELISM, CONCURRENCY).await;
+                if use_lz4 {
+                    let (file, names, _ov) = prepare_in_memory(Lz4Codec).await;
+                    let file = Arc::new(file);
+                    read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
+                } else {
+                    let (file, names, _ov) = prepare_in_memory(NoCompression).await;
+                    let file = Arc::new(file);
+                    read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
+                }
             });
         }
         "disk" => {
             let tmp = tempfile::tempdir().unwrap();
-            let filename = "profile.af";
-
-            rt.block_on(async {
-                let store = Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
-                let path = Path::from(filename);
-                let backend = ObjectStoreBackend::new(store, path);
-                if use_lz4 {
-                    let mut w = Writer::new(
-                        backend,
-                        WriterConfig {
-                            block_target_size: BLOCK_TARGET,
-                            codec: Lz4Codec,
-                        },
-                    );
-                    write_arrays(&mut w);
-                    w.flush().await.unwrap();
-                } else {
-                    let mut w = Writer::new(
-                        backend,
-                        WriterConfig {
-                            block_target_size: BLOCK_TARGET,
-                            codec: NoCompression,
-                        },
-                    );
-                    write_arrays(&mut w);
-                    w.flush().await.unwrap();
-                }
-            });
+            let path = tmp.path().join("profile.af");
 
             eprintln!("Reading with par={PARALLELISM}, conc={CONCURRENCY}...");
             rt.block_on(async {
-                let store = Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
-                let path = Path::from(filename);
-                let storage = ObjectStoreBackend::new(store, path);
-                let reader = Arc::new(Reader::open(storage, CACHE_SIZE).await.unwrap());
-                read_parallel_concurrent(reader, PARALLELISM, CONCURRENCY).await;
+                if use_lz4 {
+                    let names = prepare_on_disk(&path, Lz4Codec).await;
+                    let cfg = FileConfig {
+                        cache_capacity: CACHE_SIZE,
+                        ..FileConfig::new(NoCompression)
+                    };
+                    let file = Arc::new(File::open(&path, cfg).await.unwrap());
+                    read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
+                } else {
+                    let names = prepare_on_disk(&path, NoCompression).await;
+                    let cfg = FileConfig {
+                        cache_capacity: CACHE_SIZE,
+                        ..FileConfig::new(NoCompression)
+                    };
+                    let file = Arc::new(File::open(&path, cfg).await.unwrap());
+                    read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
+                }
             });
         }
         other => {

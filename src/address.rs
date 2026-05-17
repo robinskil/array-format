@@ -5,10 +5,15 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Archive, Serialize, Deserialize)]
+pub struct BlockAllocAddress {
+    id: BlockId,
+    offset: u64,
+    size: u64,
+}
+
 /// A block identifier within the file.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
 
 /// Locates a contiguous slice of bytes within a block.
@@ -24,6 +29,34 @@ pub struct ChunkAddress {
     pub offset: u32,
     /// Number of bytes to read from the block.
     pub size: u32,
+}
+
+impl BlockAllocAddress {
+    pub fn new(id: BlockId, offset: u64, size: u64) -> Self {
+        Self { id, offset, size }
+    }
+
+    pub fn id(&self) -> BlockId {
+        self.id
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl From<BlockAllocAddress> for ChunkAddress {
+    fn from(a: BlockAllocAddress) -> Self {
+        ChunkAddress {
+            block_id: a.id,
+            offset: a.offset as u32,
+            size: a.size as u32,
+        }
+    }
 }
 
 #[cfg(test)]

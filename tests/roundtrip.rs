@@ -1,74 +1,429 @@
 //! End-to-end roundtrip tests: write → read → delete → compact → re-read.
 
-use array_format::{
-    InMemoryStorage, NoCompression, PrimitiveArray, Reader, Writer, WriterConfig, compact,
-};
+use array_format::{AttributeValue, File, FileConfig, InMemoryStorage, NoCompression};
+use ndarray::{Array, IxDyn};
 
-fn small_config() -> WriterConfig<NoCompression> {
-    WriterConfig {
+fn small_config() -> FileConfig<NoCompression> {
+    FileConfig {
         block_target_size: 64,
-        codec: NoCompression,
+        ..FileConfig::new(NoCompression)
     }
 }
 
 #[tokio::test]
 async fn flat_array_roundtrip() {
-    let storage = InMemoryStorage::new();
+    let mut file = File::create_memory(small_config()).await.unwrap();
 
-    // Write two flat arrays with different dtypes.
-    {
-        let mut w = Writer::new(storage.clone(), small_config());
-        let ints = PrimitiveArray::<u8>::from_slice(&[1u8; 80]);
-        w.write_array("ints", vec!["x".into()], vec![80], None, &ints).unwrap();
-        let floats = PrimitiveArray::<f64>::from_slice(&[0.0f64; 5]);
-        w.write_array("floats", vec!["t".into()], vec![5], None, &floats).unwrap();
-        w.flush().await.unwrap();
-    }
+    file.define_array::<u8>("ints", vec!["x".into()], vec![80], None, None).unwrap();
+    let ints = Array::from_vec(vec![1u8; 80]).into_dyn();
+    file.write_array("ints", vec![0], ints.view()).await.unwrap();
 
-    // Read them back.
-    let reader = Reader::open(storage, 4096).await.unwrap();
-    assert_eq!(reader.list_arrays().len(), 2);
-    let ints = reader.read_array::<u8>("ints").await.unwrap();
-    assert_eq!(ints.values(), &[1u8; 80]);
-    let floats = reader.read_array::<f64>("floats").await.unwrap();
-    assert_eq!(floats.values(), &[0.0f64; 5]);
+    file.define_array::<f64>("floats", vec!["t".into()], vec![5], None, None).unwrap();
+    let floats = Array::from_vec(vec![0.0f64; 5]).into_dyn();
+    file.write_array("floats", vec![0], floats.view()).await.unwrap();
+
+    let overlay = InMemoryStorage::new();
+    file.flush_memory(&overlay).await.unwrap();
+
+    assert_eq!(file.list_arrays().len(), 2);
+    let ints_back = file.read_array::<u8>("ints", vec![], vec![]).await.unwrap();
+    assert!(ints_back.iter().all(|&v| v == 1u8));
+    let floats_back = file.read_array::<f64>("floats", vec![], vec![]).await.unwrap();
+    assert!(floats_back.iter().all(|&v| v == 0.0f64));
 }
 
 #[tokio::test]
 async fn delete_and_compact() {
-    let storage = InMemoryStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.af");
 
-    // Write 3 arrays.
     {
-        let mut w = Writer::new(storage.clone(), small_config());
-        let a = PrimitiveArray::<u8>::from_slice(&[10; 20]);
-        w.write_array("a", vec![], vec![], None, &a).unwrap();
-        let b = PrimitiveArray::<u16>::from_slice(&[20; 10]);
-        w.write_array("b", vec![], vec![], None, &b).unwrap();
-        let c = PrimitiveArray::<i64>::from_slice(&[30i64; 2]);
-        w.write_array("c", vec![], vec![], None, &c).unwrap();
-        w.delete("b").unwrap();
-        w.flush().await.unwrap();
+        let mut file = File::create(&path, small_config()).await.unwrap();
+        file.define_array::<u8>("a", vec![], vec![20], None, None).unwrap();
+        file.write_array("a", vec![0], Array::from_vec(vec![10u8; 20]).into_dyn().view()).await.unwrap();
+        file.define_array::<u16>("b", vec![], vec![10], None, None).unwrap();
+        file.write_array("b", vec![0], Array::from_vec(vec![20u16; 10]).into_dyn().view()).await.unwrap();
+        file.define_array::<i64>("c", vec![], vec![2], None, None).unwrap();
+        file.write_array("c", vec![0], Array::from_vec(vec![30i64; 2]).into_dyn().view()).await.unwrap();
+        file.flush().await.unwrap();
     }
 
-    // Before compact: b is deleted but still in footer.
     {
-        let r = Reader::open(storage.clone(), 1024).await.unwrap();
-        assert_eq!(r.list_arrays().len(), 2);
-        assert_eq!(r.footer().arrays.len(), 3); // all 3 in raw footer
+        let mut file = File::open(&path, small_config()).await.unwrap();
+        assert_eq!(file.list_arrays().len(), 3);
+        file.delete("b").unwrap();
+        file.flush().await.unwrap();
+        assert_eq!(file.list_arrays().len(), 2);
     }
 
-    // Compact.
-    compact(&storage, &NoCompression, Some(64)).await.unwrap();
+    {
+        let mut file = File::open(&path, small_config()).await.unwrap();
+        assert_eq!(file.list_arrays().len(), 2);
+        file.compact().await.unwrap();
+        assert_eq!(file.num_layers(), 1);
 
-    // After compact: only a and c remain in footer.
-    let r = Reader::open(storage, 1024).await.unwrap();
-    assert_eq!(r.footer().arrays.len(), 2);
-    let mut names: Vec<_> = r.list_arrays().iter().map(|a| a.name.clone()).collect();
-    names.sort();
-    assert_eq!(names, vec!["a", "c"]);
-    let a = r.read_array::<u8>("a").await.unwrap();
-    assert_eq!(a.values(), &[10u8; 20]);
-    let c = r.read_array::<i64>("c").await.unwrap();
-    assert_eq!(c.values(), &[30i64; 2]);
+        let mut names: Vec<_> = file.list_arrays().iter().map(|a| a.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "c"]);
+        let a = file.read_array::<u8>("a", vec![], vec![]).await.unwrap();
+        assert!(a.iter().all(|&v| v == 10u8));
+        let c = file.read_array::<i64>("c", vec![], vec![]).await.unwrap();
+        assert!(c.iter().all(|&v| v == 30i64));
+    }
+}
+
+#[tokio::test]
+async fn local_file_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.af");
+
+    {
+        let mut file = File::create(&path, small_config()).await.unwrap();
+        file.define_array::<f32>("floats", vec!["x".into()], vec![3], None, None).unwrap();
+        let arr = Array::from_vec(vec![1.0f32, 2.0, 3.0]).into_dyn();
+        file.write_array("floats", vec![0], arr.view()).await.unwrap();
+        file.set_attribute("floats", "units", AttributeValue::String("m/s".into())).unwrap();
+        file.flush().await.unwrap();
+    }
+
+    {
+        let file = File::open(&path, small_config()).await.unwrap();
+        let arr = file.read_array::<f32>("floats", vec![], vec![]).await.unwrap();
+        let flat: Vec<f32> = arr.iter().cloned().collect();
+        assert_eq!(flat, &[1.0f32, 2.0, 3.0]);
+        let v = file.get_attribute("floats", "units").unwrap();
+        assert_eq!(v, Some(&AttributeValue::String("m/s".into())));
+    }
+
+    {
+        let mut file = File::open(&path, small_config()).await.unwrap();
+        file.define_array::<u8>("extra", vec![], vec![4], None, None).unwrap();
+        let extra = Array::from_vec(vec![7u8; 4]).into_dyn();
+        file.write_array("extra", vec![0], extra.view()).await.unwrap();
+        file.flush().await.unwrap();
+    }
+
+    {
+        let file = File::open(&path, small_config()).await.unwrap();
+        assert_eq!(file.list_arrays().len(), 2);
+        let extra = file.read_array::<u8>("extra", vec![], vec![]).await.unwrap();
+        assert!(extra.iter().all(|&v| v == 7u8));
+    }
+}
+
+#[tokio::test]
+async fn layered_flat_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("layered.af");
+
+    {
+        let mut file = File::create(&path, small_config()).await.unwrap();
+        file.define_array::<u8>("a", vec!["x".into()], vec![3], None, None).unwrap();
+        file.write_array("a", vec![0], Array::from_vec(vec![1u8, 2, 3]).into_dyn().view()).await.unwrap();
+        file.flush().await.unwrap();
+    }
+
+    {
+        let mut file = File::open(&path, small_config()).await.unwrap();
+        file.define_array::<u8>("b", vec!["x".into()], vec![3], None, None).unwrap();
+        file.write_array("b", vec![0], Array::from_vec(vec![4u8, 5, 6]).into_dyn().view()).await.unwrap();
+        file.flush().await.unwrap();
+    }
+
+    let file = File::open(&path, small_config()).await.unwrap();
+    assert_eq!(file.num_layers(), 3);
+    let a = file.read_array::<u8>("a", vec![], vec![]).await.unwrap();
+    let a_flat: Vec<u8> = a.iter().cloned().collect();
+    assert_eq!(a_flat, &[1, 2, 3]);
+    let b = file.read_array::<u8>("b", vec![], vec![]).await.unwrap();
+    let b_flat: Vec<u8> = b.iter().cloned().collect();
+    assert_eq!(b_flat, &[4, 5, 6]);
+}
+
+#[tokio::test]
+async fn layered_chunk_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chunks.af");
+
+    {
+        let mut file = File::create(&path, small_config()).await.unwrap();
+        file.define_array::<f32>(
+            "grid",
+            vec!["x".into(), "y".into()],
+            vec![4, 4],
+            Some(vec![2, 2]),
+            None,
+        )
+        .unwrap();
+        let chunk = Array::from_shape_vec(IxDyn(&[2, 2]), vec![1.0f32; 4]).unwrap();
+        for cr in 0..2usize {
+            for cc in 0..2usize {
+                file.write_array("grid", vec![cr * 2, cc * 2], chunk.view()).await.unwrap();
+            }
+        }
+        file.flush().await.unwrap();
+    }
+
+    {
+        let mut file = File::open(&path, small_config()).await.unwrap();
+        let new_chunk = Array::from_shape_vec(IxDyn(&[2, 2]), vec![9.0f32; 4]).unwrap();
+        file.write_array("grid", vec![2, 2], new_chunk.view()).await.unwrap();
+        file.flush().await.unwrap();
+    }
+
+    let file = File::open(&path, small_config()).await.unwrap();
+    let c00 = file.read_array::<f32>("grid", vec![0, 0], vec![2, 2]).await.unwrap();
+    assert!(c00.iter().all(|&v| v == 1.0f32));
+    let c11 = file.read_array::<f32>("grid", vec![2, 2], vec![2, 2]).await.unwrap();
+    assert!(c11.iter().all(|&v| v == 9.0f32));
+}
+
+#[tokio::test]
+async fn compact_merges_layers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compact.af");
+
+    {
+        let mut file = File::create(&path, small_config()).await.unwrap();
+        file.define_array::<u8>("a", vec![], vec![3], None, None).unwrap();
+        file.write_array("a", vec![0], Array::from_vec(vec![1u8, 2, 3]).into_dyn().view()).await.unwrap();
+        file.flush().await.unwrap();
+        file.define_array::<u8>("b", vec![], vec![3], None, None).unwrap();
+        file.write_array("b", vec![0], Array::from_vec(vec![4u8, 5, 6]).into_dyn().view()).await.unwrap();
+        file.flush().await.unwrap();
+        assert_eq!(file.num_layers(), 3);
+    }
+
+    {
+        let mut file = File::open(&path, small_config()).await.unwrap();
+        assert_eq!(file.num_layers(), 3);
+        file.compact().await.unwrap();
+        assert_eq!(file.num_layers(), 1);
+        assert_eq!(file.list_arrays().len(), 2);
+        let a = file.read_array::<u8>("a", vec![], vec![]).await.unwrap();
+        let a_flat: Vec<u8> = a.iter().cloned().collect();
+        assert_eq!(a_flat, &[1, 2, 3]);
+        let b = file.read_array::<u8>("b", vec![], vec![]).await.unwrap();
+        let b_flat: Vec<u8> = b.iter().cloned().collect();
+        assert_eq!(b_flat, &[4, 5, 6]);
+    }
+}
+
+#[tokio::test]
+async fn delete_in_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("del.af");
+
+    {
+        let mut file = File::create(&path, small_config()).await.unwrap();
+        file.define_array::<u8>("arr", vec![], vec![1], None, None).unwrap();
+        file.write_array("arr", vec![0], Array::from_vec(vec![1u8]).into_dyn().view()).await.unwrap();
+        file.flush().await.unwrap();
+    }
+
+    {
+        let mut file = File::open(&path, small_config()).await.unwrap();
+        file.delete("arr").unwrap();
+        file.flush().await.unwrap();
+    }
+
+    let file = File::open(&path, small_config()).await.unwrap();
+    assert!(file.get_array("arr").is_err());
+    assert_eq!(file.list_arrays().len(), 0);
+}
+
+// ── write_array / read_array nd tests ───────────────────────────────
+
+#[tokio::test]
+async fn write_nd_full_chunks() {
+    let mut file = File::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>(
+        "grid",
+        vec!["x".into(), "y".into()],
+        vec![4, 6],
+        Some(vec![2, 3]),
+        None,
+    )
+    .unwrap();
+
+    let data = Array::from_shape_vec(IxDyn(&[4, 6]), (0..24i32).collect::<Vec<_>>()).unwrap();
+    file.write_array("grid", vec![0, 0], data.view()).await.unwrap();
+
+    let overlay = InMemoryStorage::new();
+    file.flush_memory(&overlay).await.unwrap();
+
+    let result = file.read_array::<i32>("grid", vec![], vec![]).await.unwrap();
+    assert_eq!(result, data.into_shared());
+}
+
+#[tokio::test]
+async fn write_nd_partial_chunk() {
+    let mut file = File::create_memory(small_config()).await.unwrap();
+    file.define_array::<f32>("g", vec!["x".into(), "y".into()], vec![4, 4], Some(vec![2, 2]), None).unwrap();
+    let zeros = Array::from_shape_vec(IxDyn(&[4, 4]), vec![0.0f32; 16]).unwrap();
+    file.write_array("g", vec![0, 0], zeros.view()).await.unwrap();
+    let ov1 = InMemoryStorage::new();
+    file.flush_memory(&ov1).await.unwrap();
+
+    let patch = Array::from_shape_vec(IxDyn(&[1, 1]), vec![7.0f32]).unwrap();
+    file.write_array("g", vec![1, 1], patch.view()).await.unwrap();
+    let ov2 = InMemoryStorage::new();
+    file.flush_memory(&ov2).await.unwrap();
+
+    let result = file.read_array::<f32>("g", vec![], vec![]).await.unwrap();
+    for row in 0..4usize {
+        for col in 0..4usize {
+            let val = result[[row, col]];
+            if row == 1 && col == 1 {
+                assert_eq!(val, 7.0);
+            } else {
+                assert_eq!(val, 0.0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn write_nd_multi_chunk_span() {
+    let mut file = File::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>("g", vec!["x".into(), "y".into()], vec![6, 6], Some(vec![3, 3]), None).unwrap();
+    let ones = Array::from_shape_vec(IxDyn(&[6, 6]), vec![1i32; 36]).unwrap();
+    file.write_array("g", vec![0, 0], ones.view()).await.unwrap();
+    let ov1 = InMemoryStorage::new();
+    file.flush_memory(&ov1).await.unwrap();
+
+    let patch = Array::from_shape_vec(IxDyn(&[2, 2]), vec![9i32; 4]).unwrap();
+    file.write_array("g", vec![2, 2], patch.view()).await.unwrap();
+    let ov2 = InMemoryStorage::new();
+    file.flush_memory(&ov2).await.unwrap();
+
+    let result = file.read_array::<i32>("g", vec![], vec![]).await.unwrap();
+    for row in 0..6usize {
+        for col in 0..6usize {
+            let val = result[[row, col]];
+            let in_patch = (2..4).contains(&row) && (2..4).contains(&col);
+            if in_patch {
+                assert_eq!(val, 9);
+            } else {
+                assert_eq!(val, 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn write_nd_pending_array() {
+    let mut file = File::create_memory(small_config()).await.unwrap();
+    file.define_array::<f32>("data", vec!["x".into()], vec![4], Some(vec![2]), None).unwrap();
+
+    let a = Array::from_vec(vec![1.0f32, 2.0]).into_dyn();
+    file.write_array("data", vec![0], a.view()).await.unwrap();
+    let b = Array::from_vec(vec![3.0f32, 4.0]).into_dyn();
+    file.write_array("data", vec![2], b.view()).await.unwrap();
+
+    let overlay = InMemoryStorage::new();
+    file.flush_memory(&overlay).await.unwrap();
+
+    let result = file.read_array::<f32>("data", vec![], vec![]).await.unwrap();
+    let flat: Vec<f32> = result.iter().cloned().collect();
+    assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+// ── fill value behaviour ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn fill_value_used_for_unwritten_chunks() {
+    use array_format::FillValue;
+
+    let mut file = File::create_memory(small_config()).await.unwrap();
+
+    // i32 array with fill value 42, chunked so not every chunk needs to be written.
+    file.define_array::<i32>(
+        "sparse",
+        vec!["x".into()],
+        vec![6],
+        Some(vec![3]),
+        Some(FillValue::Int(42)),
+    )
+    .unwrap();
+
+    // Write only the first chunk; second chunk [3..6] stays unwritten.
+    let first = Array::from_vec(vec![1i32, 2, 3]).into_dyn();
+    file.write_array("sparse", vec![0], first.view()).await.unwrap();
+
+    let ov = InMemoryStorage::new();
+    file.flush_memory(&ov).await.unwrap();
+
+    let result = file.read_array::<i32>("sparse", vec![], vec![]).await.unwrap();
+    let flat: Vec<i32> = result.iter().cloned().collect();
+    // First chunk as written; second chunk filled with 42.
+    assert_eq!(flat, vec![1, 2, 3, 42, 42, 42]);
+}
+
+#[tokio::test]
+async fn fill_value_default_zero_when_none() {
+    let mut file = File::create_memory(small_config()).await.unwrap();
+
+    // f64 array with no explicit fill value — should read as 0.0.
+    file.define_array::<f64>(
+        "empty",
+        vec!["x".into()],
+        vec![4],
+        Some(vec![4]),
+        None,
+    )
+    .unwrap();
+
+    let ov = InMemoryStorage::new();
+    file.flush_memory(&ov).await.unwrap();
+
+    let result = file.read_array::<f64>("empty", vec![], vec![]).await.unwrap();
+    let flat: Vec<f64> = result.iter().cloned().collect();
+    assert_eq!(flat, vec![0.0; 4]);
+}
+
+// ── read_array with explicit starts/shape ────────────────────────────
+
+#[tokio::test]
+async fn read_array_sub_region() {
+    let mut file = File::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>("arr", vec!["x".into()], vec![6], None, None).unwrap();
+    let data = Array::from_vec(vec![10i32, 20, 30, 40, 50, 60]).into_dyn();
+    file.write_array("arr", vec![0], data.view()).await.unwrap();
+    let ov = InMemoryStorage::new();
+    file.flush_memory(&ov).await.unwrap();
+
+    // Read elements [2..5]
+    let sub = file.read_array::<i32>("arr", vec![2], vec![3]).await.unwrap();
+    let flat: Vec<i32> = sub.iter().cloned().collect();
+    assert_eq!(flat, vec![30, 40, 50]);
+}
+
+#[tokio::test]
+async fn write_partial_offset_leaves_other_chunks_untouched() {
+    // Shape=[8], chunk_shape=[4], fill_value=0.
+    // Write chunk 0 fully (indices 0-3), then partially update chunk 1 (indices 5-6).
+    // After flush+read the untouched index 4 and 7 must remain 0.
+    let mut file = File::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>(
+        "arr",
+        vec!["x".into()],
+        vec![8],
+        Some(vec![4]),
+        Some(array_format::FillValue::Int(0)),
+    )
+    .unwrap();
+
+    let chunk0 = Array::from_vec(vec![1i32, 2, 3, 4]).into_dyn();
+    file.write_array("arr", vec![0], chunk0.view()).await.unwrap();
+
+    let patch = Array::from_vec(vec![10i32, 20]).into_dyn();
+    file.write_array("arr", vec![5], patch.view()).await.unwrap();
+
+    let ov = InMemoryStorage::new();
+    file.flush_memory(&ov).await.unwrap();
+
+    let result = file.read_array::<i32>("arr", vec![], vec![]).await.unwrap();
+    let flat: Vec<i32> = result.iter().cloned().collect();
+    assert_eq!(flat, vec![1, 2, 3, 4, 0, 10, 20, 0]);
 }
