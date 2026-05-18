@@ -1,22 +1,31 @@
 //! Profiling harness for the parallel read path.
 //!
-//! Run with flamegraph:
+//! The file is created on the first run and **reused on subsequent runs**, so
+//! flamegraph captures only the read hot-path without write noise.
+//!
+//! # Usage
 //!
 //! ```sh
-//! cargo flamegraph --example profile_parallel -- [memory|disk] [lz4|none]
-//! ```
+//! # First run: writes profile_data.af then reads it
+//! cargo run --release --example profile_parallel -- disk lz4
 //!
-//! Or plain:
+//! # Subsequent runs: skips writing, reads immediately
+//! cargo run --release --example profile_parallel -- disk lz4
 //!
-//! ```sh
-//! cargo run --release --example profile_parallel -- memory lz4
+//! # Flamegraph (Linux – requires cargo-flamegraph + perf)
+//! cargo flamegraph --example profile_parallel -- disk lz4
+//!
+//! # Custom path and iteration count
+//! cargo run --release --example profile_parallel -- disk lz4 --path /tmp/my.af --iters 20
+//!
+//! # In-memory (recreated every run, useful for CPU-only profiling)
+//! cargo flamegraph --example profile_parallel -- memory lz4
 //! ```
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
-use tokio::runtime::Runtime;
-
 use array_format::{ArrayFile, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
 use object_store::{ObjectStore, local::LocalFileSystem};
 
@@ -73,14 +82,8 @@ async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
         let name = format!("arr_{i:05}");
         let values: Vec<i32> = vec![1; ELEMENTS_PER_ARRAY];
         let nd = ndarray::Array::from_vec(values).into_dyn();
-        file.define_array::<i32>(
-            &name,
-            vec!["x".into()],
-            vec![ELEMENTS_PER_ARRAY],
-            None,
-            None,
-        )
-        .unwrap();
+        file.define_array::<i32>(&name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY], None, None)
+            .unwrap();
         file.write_array(&name, vec![0], nd.view()).await.unwrap();
         names.push(name);
     }
@@ -89,101 +92,150 @@ async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
     (file, names, overlay)
 }
 
-async fn prepare_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
+/// Creates the file at `disk_path / obj_name` if it doesn't already exist.
+/// Returns the list of array names.
+async fn ensure_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
     store: Arc<dyn ObjectStore>,
-    path: object_store::path::Path,
+    obj_path: object_store::path::Path,
+    disk_path: &std::path::Path,
     codec: C,
 ) -> Vec<String> {
+    let names: Vec<String> = (0..ARRAY_COUNT).map(|i| format!("arr_{i:05}")).collect();
+
+    if disk_path.exists() {
+        eprintln!("File exists — skipping write phase.");
+        return names;
+    }
+
+    eprintln!(
+        "Creating {} with {ARRAY_COUNT} arrays × {} …",
+        disk_path.display(),
+        humanize(ELEMENTS_PER_ARRAY * 4),
+    );
+
     let config = FileConfig {
         block_target_size: BLOCK_TARGET,
         cache_capacity: CACHE_SIZE,
         ..FileConfig::new(codec)
     };
-    let mut file = ArrayFile::create(Arc::clone(&store), path, config).await.unwrap();
-    let mut names = Vec::with_capacity(ARRAY_COUNT);
-    for i in 0..ARRAY_COUNT {
-        let name = format!("arr_{i:05}");
+    let mut file = ArrayFile::create(Arc::clone(&store), obj_path, config)
+        .await
+        .unwrap();
+
+    for name in &names {
         let values: Vec<i32> = vec![1; ELEMENTS_PER_ARRAY];
         let nd = ndarray::Array::from_vec(values).into_dyn();
-        file.define_array::<i32>(
-            &name,
-            vec!["x".into()],
-            vec![ELEMENTS_PER_ARRAY],
-            None,
-            None,
-        )
-        .unwrap();
-        file.write_array(&name, vec![0], nd.view()).await.unwrap();
-        names.push(name);
+        file.define_array::<i32>(name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY], None, None)
+            .unwrap();
+        file.write_array(name, vec![0], nd.view()).await.unwrap();
     }
     file.flush().await.unwrap();
     file.compact().await.unwrap();
+
+    eprintln!("Write complete ({}).", humanize(ARRAY_COUNT * ELEMENTS_PER_ARRAY * 4));
     names
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let backend = args.get(1).map(|s| s.as_str()).unwrap_or("memory");
+    let backend = args.get(1).map(|s| s.as_str()).unwrap_or("disk");
     let codec_arg = args.get(2).map(|s| s.as_str()).unwrap_or("lz4");
     let use_lz4 = codec_arg != "none";
 
-    let rt = Runtime::new().unwrap();
+    // Parse --path and --iters from remaining args
+    let mut custom_path: Option<PathBuf> = None;
+    let mut iters: usize = 5;
+    let mut idx = 3;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--path" => {
+                idx += 1;
+                custom_path = args.get(idx).map(PathBuf::from);
+            }
+            "--iters" => {
+                idx += 1;
+                if let Some(v) = args.get(idx) {
+                    iters = v.parse().expect("--iters must be a number");
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
 
-    eprintln!(
-        "Preparing {ARRAY_COUNT} arrays ({} each, {backend}, {codec_arg})...",
-        humanize(ELEMENTS_PER_ARRAY * 4)
-    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(32)
+        .build()
+        .unwrap();
+
+    eprintln!("backend={backend}  codec={codec_arg}  iters={iters}  par={PARALLELISM}  conc={CONCURRENCY}");
 
     match backend {
         "memory" => {
-            eprintln!("Reading with par={PARALLELISM}, conc={CONCURRENCY}...");
             rt.block_on(async {
-                if use_lz4 {
-                    let (file, names, _ov) = prepare_in_memory(Lz4Codec).await;
-                    let file = Arc::new(file);
-                    read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
+                eprintln!("Preparing in-memory file…");
+                let (file, names, _ov) = if use_lz4 {
+                    prepare_in_memory(Lz4Codec).await
                 } else {
-                    let (file, names, _ov) = prepare_in_memory(NoCompression).await;
-                    let file = Arc::new(file);
-                    read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
+                    prepare_in_memory(NoCompression).await
+                };
+                let file = Arc::new(file);
+                eprintln!("Starting {iters} read iteration(s)…");
+                for i in 1..=iters {
+                    eprintln!("  iter {i}/{iters}");
+                    read_parallel_concurrent(Arc::clone(&file), names.clone(), PARALLELISM, CONCURRENCY).await;
                 }
             });
         }
-        "disk" => {
-            let tmp = tempfile::tempdir().unwrap();
-            let store = Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap())
-                as Arc<dyn ObjectStore>;
-            let path = object_store::path::Path::from("profile.af");
 
-            eprintln!("Reading with par={PARALLELISM}, conc={CONCURRENCY}...");
+        "disk" => {
+            let disk_path = custom_path.unwrap_or_else(|| PathBuf::from("profile_data.af"));
+            let filename = disk_path.file_name().unwrap().to_str().unwrap().to_owned();
+            let raw_parent = disk_path.parent().unwrap_or(std::path::Path::new("."));
+            let raw_parent = if raw_parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                raw_parent
+            };
+            let parent = raw_parent.canonicalize().unwrap();
+            let full_path = parent.join(&filename);
+            let obj_path = object_store::path::Path::from(filename.as_str());
+
+            let store = Arc::new(
+                LocalFileSystem::new_with_prefix(&parent).unwrap(),
+            ) as Arc<dyn ObjectStore>;
+
             rt.block_on(async {
-                if use_lz4 {
-                    let names = prepare_on_disk(Arc::clone(&store), path.clone(), Lz4Codec).await;
-                    let cfg = FileConfig {
-                        cache_capacity: CACHE_SIZE,
-                        ..FileConfig::new(NoCompression)
-                    };
-                    let file = Arc::new(ArrayFile::open(Arc::clone(&store), path, cfg).await.unwrap());
-                    read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
+                let names = if use_lz4 {
+                    ensure_on_disk(Arc::clone(&store), obj_path.clone(), &full_path, Lz4Codec).await
                 } else {
-                    let names = prepare_on_disk(Arc::clone(&store), path.clone(), NoCompression).await;
-                    let cfg = FileConfig {
-                        cache_capacity: CACHE_SIZE,
-                        ..FileConfig::new(NoCompression)
-                    };
-                    let file = Arc::new(ArrayFile::open(Arc::clone(&store), path, cfg).await.unwrap());
-                    read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
+                    ensure_on_disk(Arc::clone(&store), obj_path.clone(), &full_path, NoCompression).await
+                };
+
+                let cfg = FileConfig {
+                    cache_capacity: CACHE_SIZE,
+                    ..FileConfig::new(NoCompression)
+                };
+                let file = Arc::new(
+                    ArrayFile::open(Arc::clone(&store), obj_path, cfg).await.unwrap(),
+                );
+
+                eprintln!("Starting {iters} read iteration(s)…");
+                for i in 1..=iters {
+                    eprintln!("  iter {i}/{iters}");
+                    read_parallel_concurrent(Arc::clone(&file), names.clone(), PARALLELISM, CONCURRENCY).await;
                 }
             });
+
+            let total = iters * ARRAY_COUNT * ELEMENTS_PER_ARRAY * 4;
+            eprintln!("Done. Read {} total.", humanize(total));
         }
+
         other => {
             eprintln!("Unknown backend: {other}. Use 'memory' or 'disk'.");
             std::process::exit(1);
         }
     }
-
-    let total = ARRAY_COUNT * ELEMENTS_PER_ARRAY * 4;
-    eprintln!("Done. Read {} total.", humanize(total));
 }
 
 fn humanize(bytes: usize) -> String {
