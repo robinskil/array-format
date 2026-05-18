@@ -149,7 +149,12 @@ impl DeltaCache {
                 let decompressed = if codec_id == CodecId::None {
                     raw
                 } else {
-                    Bytes::from(decompress_by_id(&codec_id, &raw, uncompressed_size)?)
+                    let vec = tokio::task::spawn_blocking(move || {
+                        decompress_by_id(&codec_id, &raw, uncompressed_size)
+                    })
+                    .await
+                    .map_err(|e| Error::Storage(format!("decompression task failed: {e}")))??;
+                    Bytes::from(vec)
                 };
                 Ok::<Bytes, Error>(decompressed)
             })
