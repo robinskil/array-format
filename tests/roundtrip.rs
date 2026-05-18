@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use array_format::{ArrayFile, AttributeValue, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{
+    ArrayFile, AttributeValue, FileConfig, FillValue, InMemoryStorage, NoCompression, StatValue,
+};
 use ndarray::{Array, IxDyn};
 use object_store::{ObjectStore, local::LocalFileSystem};
 
@@ -943,4 +945,193 @@ async fn sub_region_read_after_partial_update() {
         second.iter().cloned().collect::<Vec<_>>(),
         vec![99, 99, 7, 8, 9]
     );
+}
+
+// ── Statistics tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stats_flush_computes_correct_min_max_null_row_count() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>(
+        "data",
+        vec!["x".into()],
+        vec![6],
+        None,
+        Some(FillValue::Int(1)),
+    )
+    .unwrap();
+    // values: [3, 1, 4, 1, 5, 9] — fill=1 → 2 nulls
+    file.write_array(
+        "data",
+        vec![0],
+        Array::from_vec(vec![3i32, 1, 4, 1, 5, 9]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    let mem = InMemoryStorage::new();
+    file.flush_memory(&mem).await.unwrap();
+
+    let stats = file.array_stats("data").expect("stats missing after flush");
+    assert_eq!(stats.min, Some(StatValue::Int(3))); // fill value 1 excluded from range
+    assert_eq!(stats.max, Some(StatValue::Int(9)));
+    assert_eq!(stats.null_count, 2);
+    assert_eq!(stats.row_count, 6);
+}
+
+#[tokio::test]
+async fn stats_second_chunk_aggregates_globally() {
+    // Two flushes, each adding one chunk. Stats should cover both.
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>("a", vec!["x".into()], vec![10], Some(vec![5]), None)
+        .unwrap();
+
+    // Chunk [0]: values 1..=5
+    file.write_array(
+        "a",
+        vec![0],
+        Array::from_vec(vec![1i32, 2, 3, 4, 5]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+
+    // Chunk [1]: values 6..=10
+    file.write_array(
+        "a",
+        vec![5],
+        Array::from_vec(vec![6i32, 7, 8, 9, 10]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+
+    let stats = file.array_stats("a").expect("stats missing");
+    assert_eq!(stats.min, Some(StatValue::Int(1)));
+    assert_eq!(stats.max, Some(StatValue::Int(10)));
+    assert_eq!(stats.row_count, 10);
+    assert_eq!(stats.null_count, 0);
+}
+
+#[tokio::test]
+async fn stats_update_after_chunk_overwrite() {
+    // Write chunk, flush. Overwrite same chunk with higher values, flush.
+    // Stats must reflect the new data only.
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>("x", vec!["i".into()], vec![4], None, None)
+        .unwrap();
+
+    file.write_array(
+        "x",
+        vec![0],
+        Array::from_vec(vec![1i32, 2, 3, 4]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+
+    // Overwrite with larger values
+    file.write_array(
+        "x",
+        vec![0],
+        Array::from_vec(vec![10i32, 20, 30, 40]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+
+    let stats = file.array_stats("x").expect("stats missing");
+    assert_eq!(stats.min, Some(StatValue::Int(10)));
+    assert_eq!(stats.max, Some(StatValue::Int(40)));
+    assert_eq!(stats.row_count, 4);
+}
+
+#[tokio::test]
+async fn stats_survive_compact() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>("v", vec!["i".into()], vec![4], None, None)
+        .unwrap();
+    file.write_array(
+        "v",
+        vec![0],
+        Array::from_vec(vec![5i32, 3, 8, 1]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.compact().await.unwrap();
+
+    let stats = file.array_stats("v").expect("stats missing after compact");
+    assert_eq!(stats.min, Some(StatValue::Int(1)));
+    assert_eq!(stats.max, Some(StatValue::Int(8)));
+    assert_eq!(stats.row_count, 4);
+}
+
+#[tokio::test]
+async fn stats_loaded_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = object_store::path::Path::from(
+        dir.path().to_string_lossy().as_ref(),
+    )
+    .join("data.af");
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    {
+        let mut file =
+            ArrayFile::create(store.clone(), path.clone(), small_config()).await.unwrap();
+        file.define_array::<i32>("nums", vec!["i".into()], vec![3], None, None)
+            .unwrap();
+        file.write_array(
+            "nums",
+            vec![0],
+            Array::from_vec(vec![7i32, 2, 5]).into_dyn().view(),
+        )
+        .await
+        .unwrap();
+        file.flush().await.unwrap();
+    }
+
+    // Re-open and verify stats are loaded from .stats file.
+    let file = ArrayFile::open(store.clone(), path.clone(), small_config()).await.unwrap();
+    let stats = file.array_stats("nums").expect("stats not loaded on open");
+    assert_eq!(stats.min, Some(StatValue::Int(2)));
+    assert_eq!(stats.max, Some(StatValue::Int(7)));
+    assert_eq!(stats.row_count, 3);
+}
+
+#[tokio::test]
+async fn stats_none_before_first_flush() {
+    let file = ArrayFile::create_memory(small_config()).await.unwrap();
+    assert!(file.array_stats("anything").is_none());
+}
+
+#[tokio::test]
+async fn stats_unwritten_chunks_count_as_nulls() {
+    // Shape [10], chunk_shape [5] → 2 possible chunks.
+    // Write only chunk [0]; chunk [1] is never written.
+    // row_count must equal total shape product; unwritten elements count as nulls.
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>(
+        "partial",
+        vec!["x".into()],
+        vec![10],
+        Some(vec![5]),
+        Some(FillValue::Int(0)),
+    )
+    .unwrap();
+
+    // Write only the first chunk; leave the second unwritten.
+    file.write_array(
+        "partial",
+        vec![0],
+        Array::from_vec(vec![1i32, 2, 3, 4, 5]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+
+    let stats = file.array_stats("partial").expect("stats missing");
+    assert_eq!(stats.row_count, 10);       // full array capacity
+    assert_eq!(stats.null_count, 5);       // 5 unwritten elements
+    assert_eq!(stats.min, Some(StatValue::Int(1)));
+    assert_eq!(stats.max, Some(StatValue::Int(5)));
 }

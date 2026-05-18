@@ -36,6 +36,7 @@ pub mod storage;
 pub mod array;
 pub mod cache;
 pub mod file;
+pub mod stats;
 
 pub mod ndarray_ext;
 
@@ -50,4 +51,5 @@ pub use file::{
     FileConfig, MergedArrayMeta,
 };
 pub use layout::{AttributeValue, FillValue};
+pub use stats::{ArrayStats, StatValue, StatsFile};
 pub use storage::InMemoryStorage;

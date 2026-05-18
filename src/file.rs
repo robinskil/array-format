@@ -15,6 +15,7 @@ use crate::{
         ArrayLayout, ArrayMeta, AttrIndexKind, AttributeValue, Attributes, ChunkEntry, FillValue,
         StorageLayout,
     },
+    stats::{ArrayStats, StatsFile, compute_chunk_partial, merge_partial, read_stats_file},
     storage::{InMemoryStorage, ObjectStoreBackend, Storage},
 };
 
@@ -105,6 +106,8 @@ pub struct ArrayFile {
     cache: Option<Arc<DeltaCache>>,
     /// Object store and stem for on-disk files; `None` for in-memory files.
     store_dir: Option<StoreDir>,
+    /// Per-array aggregate statistics; `None` until first flush or open.
+    stats: Option<StatsFile>,
 }
 
 // ── Constructors ────────────────────────────────────────────────────
@@ -132,6 +135,7 @@ impl ArrayFile {
                 store,
                 base_path: path,
             }),
+            stats: None,
         })
     }
 
@@ -158,6 +162,11 @@ impl ArrayFile {
             );
         }
 
+        let stats = {
+            let s_storage = ObjectStoreBackend::new(Arc::clone(&store), stats_path(&path));
+            read_stats_file(&s_storage).await.ok()
+        };
+
         Ok(ArrayFile {
             deltas,
             pending: PendingState::default(),
@@ -168,6 +177,7 @@ impl ArrayFile {
                 store,
                 base_path: path,
             }),
+            stats,
         })
     }
 
@@ -188,6 +198,7 @@ impl ArrayFile {
             block_target_size: config.block_target_size,
             cache,
             store_dir: None,
+            stats: None,
         })
     }
 }
@@ -292,6 +303,11 @@ impl ArrayFile {
             }
         }
         seen.into_values().collect()
+    }
+
+    /// Returns aggregate statistics for `name`, or `None` if no stats exist yet.
+    pub fn array_stats(&self, name: &str) -> Option<&ArrayStats> {
+        self.stats.as_ref()?.get_array(name)
     }
 
     /// Number of committed (immutable) delta layers.
@@ -535,18 +551,28 @@ impl ArrayFile {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let sd = self
-            .store_dir
-            .as_ref()
-            .ok_or_else(|| Error::Storage("in-memory file: use flush_memory instead".into()))?;
+        let (store, base_path) = match &self.store_dir {
+            Some(sd) => (Arc::clone(&sd.store), sd.base_path.clone()),
+            None => {
+                return Err(Error::Storage(
+                    "in-memory file: use flush_memory instead".into(),
+                ))
+            }
+        };
+        let dirty_names: Vec<String> = self.pending.dirty_chunks.keys().cloned().collect();
         let overlay_index = self.deltas.len() as u32;
-        let scar_path = sidecar_path(&sd.base_path, overlay_index);
+        let scar_path = sidecar_path(&base_path, overlay_index);
         let delta_path = Arc::<str>::from(scar_path.as_ref());
         let storage =
-            Arc::new(ObjectStoreBackend::new(Arc::clone(&sd.store), scar_path)) as Arc<dyn Storage>;
-        let hint = sd.base_path.as_ref().to_string();
-        self.flush_to(storage, delta_path, overlay_index, hint)
-            .await
+            Arc::new(ObjectStoreBackend::new(Arc::clone(&store), scar_path)) as Arc<dyn Storage>;
+        let hint = base_path.as_ref().to_string();
+        self.flush_to(storage, delta_path, overlay_index, hint).await?;
+
+        let merged = self.compute_stats_for(&dirty_names).await?;
+        let s_storage = ObjectStoreBackend::new(Arc::clone(&store), stats_path(&base_path));
+        s_storage.write(bytes::Bytes::from(merged.serialize()?)).await?;
+        self.stats = Some(merged);
+        Ok(())
     }
 
     /// Commits pending writes to `storage` (for in-memory testing).
@@ -554,11 +580,41 @@ impl ArrayFile {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let dirty_names: Vec<String> = self.pending.dirty_chunks.keys().cloned().collect();
         let overlay_index = self.deltas.len() as u32;
         let delta_path = Arc::<str>::from(format!("__memory_{overlay_index}__").as_str());
         let arc: Arc<dyn Storage> = Arc::new(storage.clone());
-        self.flush_to(arc, delta_path, overlay_index, String::new())
-            .await
+        self.flush_to(arc, delta_path, overlay_index, String::new()).await?;
+
+        let merged = self.compute_stats_for(&dirty_names).await?;
+        self.stats = Some(merged);
+        Ok(())
+    }
+
+    async fn compute_stats_for(&self, dirty_names: &[String]) -> Result<StatsFile> {
+        let mut merged = self.stats.clone().unwrap_or_default();
+        for name in dirty_names {
+            let schema = match self.get_chunked_schema(name) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let fill_value = self.resolve_array_meta(name).and_then(|m| m.fill_value.clone());
+            let shape_product: u64 = schema.full_shape.iter().map(|&s| s as u64).product();
+            let mut stats = ArrayStats::new(name.clone());
+            let mut written_non_null: u64 = 0;
+            for coord in &schema.all_coords {
+                if let Some(bytes) = self.resolve_raw_chunk(name, coord).await? {
+                    let (min, max, nc, rc) =
+                        compute_chunk_partial(&bytes, &schema.dtype, fill_value.as_ref());
+                    written_non_null += rc - nc;
+                    merge_partial(&mut stats, min, max, nc, rc);
+                }
+            }
+            stats.row_count = shape_product;
+            stats.null_count = shape_product - written_non_null;
+            merged.upsert(stats);
+        }
+        Ok(merged)
     }
 
     async fn flush_to(
@@ -658,6 +714,7 @@ impl ArrayFile {
         // Allocate all chunks for merged arrays.
         let mut allocator = DeltaAllocator::new(Arc::clone(&self.codec), self.block_target_size);
         let mut arrays: Vec<ArrayMeta> = Vec::new();
+        let mut per_array_stats: Vec<ArrayStats> = Vec::new();
 
         for name in &merged_names {
             let meta = self
@@ -675,10 +732,17 @@ impl ArrayFile {
                 }
             }
 
+            let shape_product: u64 = meta.layout.shape.iter().map(|&s| s as u64).product();
             let mut new_chunks: Vec<ChunkEntry> = Vec::new();
+            let mut array_stats = ArrayStats::new(name.clone());
+            let mut written_non_null: u64 = 0;
             for coord in &all_coords {
                 // Read from newest layer that has this chunk.
                 if let Some(raw) = self.resolve_raw_chunk(name, coord).await? {
+                    let (min, max, nc, rc) =
+                        compute_chunk_partial(&raw, &meta.dtype, meta.fill_value.as_ref());
+                    written_non_null += rc - nc;
+                    merge_partial(&mut array_stats, min, max, nc, rc);
                     let alloc = allocator.allocate(&raw);
                     new_chunks.push(ChunkEntry {
                         coord: coord.clone(),
@@ -686,6 +750,9 @@ impl ArrayFile {
                     });
                 }
             }
+            array_stats.row_count = shape_product;
+            array_stats.null_count = shape_product - written_non_null;
+            per_array_stats.push(array_stats);
 
             let mut new_meta = meta;
             new_meta.layout.storage.chunks = new_chunks;
@@ -754,6 +821,17 @@ impl ArrayFile {
             Delta::<DeltaImmutable>::open(base_storage, base_delta_path, self.cache.clone())
                 .await?;
         self.deltas = vec![new_base];
+
+        let mut new_stats = StatsFile::default();
+        for s in per_array_stats {
+            new_stats.upsert(s);
+        }
+        if let Some(sd) = &self.store_dir {
+            let s_storage =
+                ObjectStoreBackend::new(Arc::clone(&sd.store), stats_path(&sd.base_path));
+            s_storage.write(bytes::Bytes::from(new_stats.serialize()?)).await?;
+        }
+        self.stats = Some(new_stats);
         Ok(())
     }
 }
@@ -775,6 +853,12 @@ fn sidecar_path(base: &object_store::path::Path, n: u32) -> object_store::path::
     let s = base.as_ref();
     let without_af = s.strip_suffix(".af").unwrap_or(s);
     object_store::path::Path::from(format!("{without_af}.{n}.af").as_str())
+}
+
+fn stats_path(base: &object_store::path::Path) -> object_store::path::Path {
+    let s = base.as_ref();
+    let without_af = s.strip_suffix(".af").unwrap_or(s);
+    object_store::path::Path::from(format!("{without_af}.stats").as_str())
 }
 
 async fn discover_sidecars_store(
