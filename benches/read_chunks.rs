@@ -4,7 +4,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rand::Rng;
 use tokio::runtime::Runtime;
 
-use array_format::{File, FileConfig, InMemoryStorage, Lz4Codec, NoCompression, ZstdCodec};
+use array_format::{ArrayFile, FileConfig, InMemoryStorage, Lz4Codec, NoCompression, ZstdCodec};
 
 const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB per chunk
 const NUM_CHUNKS: u32 = 64;
@@ -22,12 +22,12 @@ fn patterned_chunk() -> Vec<u8> {
 async fn prepare_file<C: array_format::CompressionCodec + Clone + 'static>(
     codec: C,
     chunk_data: &[u8],
-) -> (File, InMemoryStorage) {
+) -> (ArrayFile, InMemoryStorage) {
     let config = FileConfig {
         block_target_size: BLOCK_TARGET,
         ..FileConfig::new(codec)
     };
-    let mut file = File::create_memory(config).await.unwrap();
+    let mut file = ArrayFile::create_memory(config).await.unwrap();
     file.define_array::<u8>(
         "data",
         vec!["x".into(), "y".into()],
@@ -37,7 +37,7 @@ async fn prepare_file<C: array_format::CompressionCodec + Clone + 'static>(
     )
     .unwrap();
     for i in 0..NUM_CHUNKS as usize {
-        let chunk = ndarray::Array::from_vec(chunk_data.to_vec()).into_dyn();
+        let chunk = ndarray::Array::from_shape_vec(ndarray::IxDyn(&[1, CHUNK_SIZE]), chunk_data.to_vec()).unwrap();
         file.write_array("data", vec![i, 0], chunk.view())
             .await
             .unwrap();

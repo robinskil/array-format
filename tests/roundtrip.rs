@@ -1,7 +1,10 @@
 //! End-to-end roundtrip tests: write → read → delete → compact → re-read.
 
-use array_format::{AttributeValue, File, FileConfig, InMemoryStorage, NoCompression};
+use std::sync::Arc;
+
+use array_format::{AttributeValue, ArrayFile, FileConfig, InMemoryStorage, NoCompression};
 use ndarray::{Array, IxDyn};
+use object_store::{ObjectStore, local::LocalFileSystem};
 
 fn small_config() -> FileConfig<NoCompression> {
     FileConfig {
@@ -12,7 +15,7 @@ fn small_config() -> FileConfig<NoCompression> {
 
 #[tokio::test]
 async fn flat_array_roundtrip() {
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
 
     file.define_array::<u8>("ints", vec!["x".into()], vec![80], None, None).unwrap();
     let ints = Array::from_vec(vec![1u8; 80]).into_dyn();
@@ -35,10 +38,11 @@ async fn flat_array_roundtrip() {
 #[tokio::test]
 async fn delete_and_compact() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.af");
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()) as Arc<dyn ObjectStore>;
+    let path = object_store::path::Path::from("test.af");
 
     {
-        let mut file = File::create(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.define_array::<u8>("a", vec![], vec![20], None, None).unwrap();
         file.write_array("a", vec![0], Array::from_vec(vec![10u8; 20]).into_dyn().view()).await.unwrap();
         file.define_array::<u16>("b", vec![], vec![10], None, None).unwrap();
@@ -49,7 +53,7 @@ async fn delete_and_compact() {
     }
 
     {
-        let mut file = File::open(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         assert_eq!(file.list_arrays().len(), 3);
         file.delete("b").unwrap();
         file.flush().await.unwrap();
@@ -57,7 +61,7 @@ async fn delete_and_compact() {
     }
 
     {
-        let mut file = File::open(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         assert_eq!(file.list_arrays().len(), 2);
         file.compact().await.unwrap();
         assert_eq!(file.num_layers(), 1);
@@ -75,10 +79,11 @@ async fn delete_and_compact() {
 #[tokio::test]
 async fn local_file_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.af");
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()) as Arc<dyn ObjectStore>;
+    let path = object_store::path::Path::from("test.af");
 
     {
-        let mut file = File::create(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.define_array::<f32>("floats", vec!["x".into()], vec![3], None, None).unwrap();
         let arr = Array::from_vec(vec![1.0f32, 2.0, 3.0]).into_dyn();
         file.write_array("floats", vec![0], arr.view()).await.unwrap();
@@ -87,7 +92,7 @@ async fn local_file_roundtrip() {
     }
 
     {
-        let file = File::open(&path, small_config()).await.unwrap();
+        let file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         let arr = file.read_array::<f32>("floats", vec![], vec![]).await.unwrap();
         let flat: Vec<f32> = arr.iter().cloned().collect();
         assert_eq!(flat, &[1.0f32, 2.0, 3.0]);
@@ -96,7 +101,7 @@ async fn local_file_roundtrip() {
     }
 
     {
-        let mut file = File::open(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.define_array::<u8>("extra", vec![], vec![4], None, None).unwrap();
         let extra = Array::from_vec(vec![7u8; 4]).into_dyn();
         file.write_array("extra", vec![0], extra.view()).await.unwrap();
@@ -104,7 +109,7 @@ async fn local_file_roundtrip() {
     }
 
     {
-        let file = File::open(&path, small_config()).await.unwrap();
+        let file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         assert_eq!(file.list_arrays().len(), 2);
         let extra = file.read_array::<u8>("extra", vec![], vec![]).await.unwrap();
         assert!(extra.iter().all(|&v| v == 7u8));
@@ -114,23 +119,24 @@ async fn local_file_roundtrip() {
 #[tokio::test]
 async fn layered_flat_write() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("layered.af");
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()) as Arc<dyn ObjectStore>;
+    let path = object_store::path::Path::from("layered.af");
 
     {
-        let mut file = File::create(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.define_array::<u8>("a", vec!["x".into()], vec![3], None, None).unwrap();
         file.write_array("a", vec![0], Array::from_vec(vec![1u8, 2, 3]).into_dyn().view()).await.unwrap();
         file.flush().await.unwrap();
     }
 
     {
-        let mut file = File::open(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.define_array::<u8>("b", vec!["x".into()], vec![3], None, None).unwrap();
         file.write_array("b", vec![0], Array::from_vec(vec![4u8, 5, 6]).into_dyn().view()).await.unwrap();
         file.flush().await.unwrap();
     }
 
-    let file = File::open(&path, small_config()).await.unwrap();
+    let file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
     assert_eq!(file.num_layers(), 3);
     let a = file.read_array::<u8>("a", vec![], vec![]).await.unwrap();
     let a_flat: Vec<u8> = a.iter().cloned().collect();
@@ -143,10 +149,11 @@ async fn layered_flat_write() {
 #[tokio::test]
 async fn layered_chunk_update() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("chunks.af");
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()) as Arc<dyn ObjectStore>;
+    let path = object_store::path::Path::from("chunks.af");
 
     {
-        let mut file = File::create(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.define_array::<f32>(
             "grid",
             vec!["x".into(), "y".into()],
@@ -165,13 +172,13 @@ async fn layered_chunk_update() {
     }
 
     {
-        let mut file = File::open(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         let new_chunk = Array::from_shape_vec(IxDyn(&[2, 2]), vec![9.0f32; 4]).unwrap();
         file.write_array("grid", vec![2, 2], new_chunk.view()).await.unwrap();
         file.flush().await.unwrap();
     }
 
-    let file = File::open(&path, small_config()).await.unwrap();
+    let file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
     let c00 = file.read_array::<f32>("grid", vec![0, 0], vec![2, 2]).await.unwrap();
     assert!(c00.iter().all(|&v| v == 1.0f32));
     let c11 = file.read_array::<f32>("grid", vec![2, 2], vec![2, 2]).await.unwrap();
@@ -181,10 +188,11 @@ async fn layered_chunk_update() {
 #[tokio::test]
 async fn compact_merges_layers() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("compact.af");
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()) as Arc<dyn ObjectStore>;
+    let path = object_store::path::Path::from("compact.af");
 
     {
-        let mut file = File::create(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.define_array::<u8>("a", vec![], vec![3], None, None).unwrap();
         file.write_array("a", vec![0], Array::from_vec(vec![1u8, 2, 3]).into_dyn().view()).await.unwrap();
         file.flush().await.unwrap();
@@ -195,7 +203,7 @@ async fn compact_merges_layers() {
     }
 
     {
-        let mut file = File::open(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         assert_eq!(file.num_layers(), 3);
         file.compact().await.unwrap();
         assert_eq!(file.num_layers(), 1);
@@ -212,22 +220,23 @@ async fn compact_merges_layers() {
 #[tokio::test]
 async fn delete_in_overlay() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("del.af");
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()) as Arc<dyn ObjectStore>;
+    let path = object_store::path::Path::from("del.af");
 
     {
-        let mut file = File::create(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.define_array::<u8>("arr", vec![], vec![1], None, None).unwrap();
         file.write_array("arr", vec![0], Array::from_vec(vec![1u8]).into_dyn().view()).await.unwrap();
         file.flush().await.unwrap();
     }
 
     {
-        let mut file = File::open(&path, small_config()).await.unwrap();
+        let mut file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
         file.delete("arr").unwrap();
         file.flush().await.unwrap();
     }
 
-    let file = File::open(&path, small_config()).await.unwrap();
+    let file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config()).await.unwrap();
     assert!(file.get_array("arr").is_err());
     assert_eq!(file.list_arrays().len(), 0);
 }
@@ -236,7 +245,7 @@ async fn delete_in_overlay() {
 
 #[tokio::test]
 async fn write_nd_full_chunks() {
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
     file.define_array::<i32>(
         "grid",
         vec!["x".into(), "y".into()],
@@ -258,7 +267,7 @@ async fn write_nd_full_chunks() {
 
 #[tokio::test]
 async fn write_nd_partial_chunk() {
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
     file.define_array::<f32>("g", vec!["x".into(), "y".into()], vec![4, 4], Some(vec![2, 2]), None).unwrap();
     let zeros = Array::from_shape_vec(IxDyn(&[4, 4]), vec![0.0f32; 16]).unwrap();
     file.write_array("g", vec![0, 0], zeros.view()).await.unwrap();
@@ -285,7 +294,7 @@ async fn write_nd_partial_chunk() {
 
 #[tokio::test]
 async fn write_nd_multi_chunk_span() {
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
     file.define_array::<i32>("g", vec!["x".into(), "y".into()], vec![6, 6], Some(vec![3, 3]), None).unwrap();
     let ones = Array::from_shape_vec(IxDyn(&[6, 6]), vec![1i32; 36]).unwrap();
     file.write_array("g", vec![0, 0], ones.view()).await.unwrap();
@@ -313,7 +322,7 @@ async fn write_nd_multi_chunk_span() {
 
 #[tokio::test]
 async fn write_nd_pending_array() {
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
     file.define_array::<f32>("data", vec!["x".into()], vec![4], Some(vec![2]), None).unwrap();
 
     let a = Array::from_vec(vec![1.0f32, 2.0]).into_dyn();
@@ -335,7 +344,7 @@ async fn write_nd_pending_array() {
 async fn fill_value_used_for_unwritten_chunks() {
     use array_format::FillValue;
 
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
 
     // i32 array with fill value 42, chunked so not every chunk needs to be written.
     file.define_array::<i32>(
@@ -362,7 +371,7 @@ async fn fill_value_used_for_unwritten_chunks() {
 
 #[tokio::test]
 async fn fill_value_default_zero_when_none() {
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
 
     // f64 array with no explicit fill value — should read as 0.0.
     file.define_array::<f64>(
@@ -386,7 +395,7 @@ async fn fill_value_default_zero_when_none() {
 
 #[tokio::test]
 async fn read_array_sub_region() {
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
     file.define_array::<i32>("arr", vec!["x".into()], vec![6], None, None).unwrap();
     let data = Array::from_vec(vec![10i32, 20, 30, 40, 50, 60]).into_dyn();
     file.write_array("arr", vec![0], data.view()).await.unwrap();
@@ -404,7 +413,7 @@ async fn write_partial_offset_leaves_other_chunks_untouched() {
     // Shape=[8], chunk_shape=[4], fill_value=0.
     // Write chunk 0 fully (indices 0-3), then partially update chunk 1 (indices 5-6).
     // After flush+read the untouched index 4 and 7 must remain 0.
-    let mut file = File::create_memory(small_config()).await.unwrap();
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
     file.define_array::<i32>(
         "arr",
         vec!["x".into()],

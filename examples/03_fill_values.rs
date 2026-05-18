@@ -5,11 +5,11 @@
 //! ```
 
 use ndarray::Array;
-use array_format::{File, FileConfig, FillValue, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, FillValue, InMemoryStorage, NoCompression};
 
 #[tokio::main]
 async fn main() {
-    let mut file = File::create_memory(FileConfig::new(NoCompression)).await.unwrap();
+    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression)).await.unwrap();
 
     // Sensor array: -999 signals "no data"
     file.define_array::<i32>(

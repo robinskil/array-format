@@ -6,12 +6,13 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use futures::stream::{self, StreamExt};
 use rand::Rng;
 
-use array_format::{File, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
+use array_format::{ArrayFile, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
+use object_store::{ObjectStore, local::LocalFileSystem};
 
 const MANY_ARRAYS_COUNT: usize = 25_000;
 const ELEMENTS_PER_ARRAY: usize = 10_000;
-const BLOCK_TARGET: usize = 4 * 1024 * 1024;
-const CACHE_SIZE: usize = 256 * 1024 * 1024;
+const BLOCK_TARGET: usize = 8 * 1024 * 1024;
+const CACHE_SIZE: usize = 512 * 1024 * 1024;
 
 fn total_bytes() -> u64 {
     (MANY_ARRAYS_COUNT * ELEMENTS_PER_ARRAY * std::mem::size_of::<i32>()) as u64
@@ -19,13 +20,13 @@ fn total_bytes() -> u64 {
 
 async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
     codec: C,
-) -> (File, Vec<String>, InMemoryStorage) {
+) -> (ArrayFile, Vec<String>, InMemoryStorage) {
     let config = FileConfig {
         block_target_size: BLOCK_TARGET,
         cache_capacity: CACHE_SIZE,
         ..FileConfig::new(codec)
     };
-    let mut file = File::create_memory(config).await.unwrap();
+    let mut file = ArrayFile::create_memory(config).await.unwrap();
 
     let mut rng = rand::rng();
     let mut names = Vec::with_capacity(MANY_ARRAYS_COUNT);
@@ -52,17 +53,18 @@ async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone
 }
 
 async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
-    dir: &std::path::Path,
-    filename: &str,
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
     codec: C,
-) -> (std::path::PathBuf, Vec<String>) {
-    let path = dir.join(filename);
+) -> Vec<String> {
     let config = FileConfig {
         block_target_size: BLOCK_TARGET,
         cache_capacity: CACHE_SIZE,
         ..FileConfig::new(codec)
     };
-    let mut file = File::create(&path, config).await.unwrap();
+    let mut file = ArrayFile::create(Arc::clone(&store), path, config)
+        .await
+        .unwrap();
 
     let mut rng = rand::rng();
     let mut names = Vec::with_capacity(MANY_ARRAYS_COUNT);
@@ -85,17 +87,17 @@ async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone +
     }
     file.flush().await.unwrap();
     file.compact().await.unwrap();
-    (path, names)
+    names
 }
 
-async fn read_sequential(file: &File, names: &[String]) {
+async fn read_sequential(file: &ArrayFile, names: &[String]) {
     for name in names {
         file.read_array::<i32>(name, vec![], vec![]).await.unwrap();
     }
 }
 
 async fn read_parallel_concurrent(
-    file: Arc<File>,
+    file: Arc<ArrayFile>,
     names: Vec<String>,
     parallelism: usize,
     concurrency: usize,
@@ -211,20 +213,24 @@ fn bench_many_arrays_file(c: &mut Criterion) {
         .build()
         .unwrap();
     let tmp_dir = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap()) as Arc<dyn ObjectStore>;
 
     let mut group = c.benchmark_group("many_arrays_file");
     group.throughput(Throughput::Bytes(total_bytes()));
     group.sample_size(10);
 
-    let (path_lz4, names_lz4) = rt.block_on(prepare_many_arrays_on_disk(
-        tmp_dir.path(),
-        "many_lz4.af",
+    let path_lz4 = object_store::path::Path::from("many_lz4.af");
+    let names_lz4 = rt.block_on(prepare_many_arrays_on_disk(
+        Arc::clone(&store),
+        path_lz4.clone(),
         Lz4Codec,
     ));
     let file_lz4 = rt.block_on(async {
         Arc::new(
-            File::open(
-                &path_lz4,
+            ArrayFile::open(
+                Arc::clone(&store),
+                path_lz4,
                 FileConfig {
                     cache_capacity: CACHE_SIZE,
                     ..FileConfig::new(NoCompression)
@@ -253,15 +259,17 @@ fn bench_many_arrays_file(c: &mut Criterion) {
         );
     }
 
-    let (path_none, names_none) = rt.block_on(prepare_many_arrays_on_disk(
-        tmp_dir.path(),
-        "many_none.af",
+    let path_none = object_store::path::Path::from("many_none.af");
+    let names_none = rt.block_on(prepare_many_arrays_on_disk(
+        Arc::clone(&store),
+        path_none.clone(),
         NoCompression,
     ));
     let file_none = rt.block_on(async {
         Arc::new(
-            File::open(
-                &path_none,
+            ArrayFile::open(
+                Arc::clone(&store),
+                path_none,
                 FileConfig {
                     cache_capacity: CACHE_SIZE,
                     ..FileConfig::new(NoCompression)

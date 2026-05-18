@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use crate::array::ArrayElement;
 use crate::error::{Error, Result};
-use crate::file::{ChunkedSchema, File};
+use crate::file::{ArrayFile, ChunkedSchema};
 
 pub(crate) fn make_si(
     ranges: &[Range<usize>],
@@ -39,17 +39,24 @@ pub(crate) fn iter_nd_coords(ranges: &[Range<u32>]) -> impl Iterator<Item = Vec<
 /// Assembles an array from `file`, reading only chunks that overlap `slice`
 /// (or the full array when `slice` is `None`).
 pub(crate) async fn assemble_nd<T>(
-    file: &File,
+    file: &ArrayFile,
     name: &str,
     slice: Option<&[Range<usize>]>,
 ) -> Result<ndarray::ArcArray<T, ndarray::IxDyn>>
 where
     T: ArrayElement,
 {
-    let ChunkedSchema { full_shape: full_shape_u32, chunk_shape: chunk_shape_u32, dtype, all_coords } =
-        file.get_chunked_schema(name)?;
+    let ChunkedSchema {
+        full_shape: full_shape_u32,
+        chunk_shape: chunk_shape_u32,
+        dtype,
+        all_coords,
+    } = file.get_chunked_schema(name)?;
     if dtype != T::DTYPE {
-        return Err(Error::DTypeMismatch { expected: dtype, actual: T::DTYPE });
+        return Err(Error::DTypeMismatch {
+            expected: dtype,
+            actual: T::DTYPE,
+        });
     }
     let fill = T::fill_element(file.get_array(name)?.fill_value.as_ref());
     let full_shape: Vec<usize> = full_shape_u32.iter().map(|&x| x as usize).collect();
@@ -114,8 +121,7 @@ where
         let out_si = make_si(
             &(0..ndim)
                 .map(|i| {
-                    (overlap[i].start - effective[i].start)
-                        ..(overlap[i].end - effective[i].start)
+                    (overlap[i].start - effective[i].start)..(overlap[i].end - effective[i].start)
                 })
                 .collect::<Vec<_>>(),
         );
@@ -129,7 +135,7 @@ where
 /// Writes `data` into a chunked array at `offset`, performing
 /// read-modify-write for partial chunks.
 pub(crate) async fn write_nd<T>(
-    file: &mut File,
+    file: &mut ArrayFile,
     name: &str,
     data: ndarray::ArrayView<'_, T, ndarray::IxDyn>,
     offset: &[usize],
@@ -137,11 +143,18 @@ pub(crate) async fn write_nd<T>(
 where
     T: ArrayElement,
 {
-    let ChunkedSchema { full_shape: full_shape_u32, chunk_shape: chunk_shape_u32, dtype, .. } =
-        file.get_chunked_schema(name)?;
+    let ChunkedSchema {
+        full_shape: full_shape_u32,
+        chunk_shape: chunk_shape_u32,
+        dtype,
+        ..
+    } = file.get_chunked_schema(name)?;
 
     if dtype != T::DTYPE {
-        return Err(Error::DTypeMismatch { expected: dtype, actual: T::DTYPE });
+        return Err(Error::DTypeMismatch {
+            expected: dtype,
+            actual: T::DTYPE,
+        });
     }
     let ndim = full_shape_u32.len();
     if offset.len() != ndim || data.ndim() != ndim {
@@ -191,8 +204,7 @@ where
             })
             .collect();
 
-        let chunk_actual_shape: Vec<usize> =
-            chunk_global.iter().map(|r| r.end - r.start).collect();
+        let chunk_actual_shape: Vec<usize> = chunk_global.iter().map(|r| r.end - r.start).collect();
 
         let overlap: Vec<Range<usize>> = (0..ndim)
             .map(|i| offset[i].max(chunk_global[i].start)..write_end[i].min(chunk_global[i].end))

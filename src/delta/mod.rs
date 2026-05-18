@@ -1,8 +1,10 @@
+pub mod cache;
 mod allocator;
 mod immutable;
 mod mutable;
 
 pub use allocator::{AllocatorOutput, DeltaAllocator};
+pub use cache::DeltaCache;
 pub use immutable::DeltaImmutable;
 pub use mutable::DeltaMutable;
 

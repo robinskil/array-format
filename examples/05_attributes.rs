@@ -4,11 +4,11 @@
 //! cargo run --example 05_attributes
 //! ```
 
-use array_format::{AttributeValue, File, FileConfig, NoCompression};
+use array_format::{AttributeValue, ArrayFile, FileConfig, NoCompression};
 
 #[tokio::main]
 async fn main() {
-    let mut file = File::create_memory(FileConfig::new(NoCompression)).await.unwrap();
+    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression)).await.unwrap();
 
     file.define_array::<f32>("pressure", vec!["z".into()], vec![10], None, None).unwrap();
     file.set_attribute("pressure", "units", AttributeValue::String("hPa".into())).unwrap();

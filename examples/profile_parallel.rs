@@ -17,7 +17,8 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt};
 use tokio::runtime::Runtime;
 
-use array_format::{File, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
+use array_format::{ArrayFile, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
+use object_store::{ObjectStore, local::LocalFileSystem};
 
 const ARRAY_COUNT: usize = 25_000;
 const ELEMENTS_PER_ARRAY: usize = 10_000;
@@ -27,7 +28,7 @@ const PARALLELISM: usize = 24;
 const CONCURRENCY: usize = 8;
 
 async fn read_parallel_concurrent(
-    file: Arc<File>,
+    file: Arc<ArrayFile>,
     names: Vec<String>,
     parallelism: usize,
     concurrency: usize,
@@ -60,13 +61,13 @@ async fn read_parallel_concurrent(
 
 async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
     codec: C,
-) -> (File, Vec<String>, InMemoryStorage) {
+) -> (ArrayFile, Vec<String>, InMemoryStorage) {
     let config = FileConfig {
         block_target_size: BLOCK_TARGET,
         cache_capacity: CACHE_SIZE,
         ..FileConfig::new(codec)
     };
-    let mut file = File::create_memory(config).await.unwrap();
+    let mut file = ArrayFile::create_memory(config).await.unwrap();
     let mut names = Vec::with_capacity(ARRAY_COUNT);
     for i in 0..ARRAY_COUNT {
         let name = format!("arr_{i:05}");
@@ -89,7 +90,8 @@ async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
 }
 
 async fn prepare_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
-    path: &std::path::Path,
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
     codec: C,
 ) -> Vec<String> {
     let config = FileConfig {
@@ -97,7 +99,7 @@ async fn prepare_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
         cache_capacity: CACHE_SIZE,
         ..FileConfig::new(codec)
     };
-    let mut file = File::create(path, config).await.unwrap();
+    let mut file = ArrayFile::create(Arc::clone(&store), path, config).await.unwrap();
     let mut names = Vec::with_capacity(ARRAY_COUNT);
     for i in 0..ARRAY_COUNT {
         let name = format!("arr_{i:05}");
@@ -149,25 +151,27 @@ fn main() {
         }
         "disk" => {
             let tmp = tempfile::tempdir().unwrap();
-            let path = tmp.path().join("profile.af");
+            let store = Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap())
+                as Arc<dyn ObjectStore>;
+            let path = object_store::path::Path::from("profile.af");
 
             eprintln!("Reading with par={PARALLELISM}, conc={CONCURRENCY}...");
             rt.block_on(async {
                 if use_lz4 {
-                    let names = prepare_on_disk(&path, Lz4Codec).await;
+                    let names = prepare_on_disk(Arc::clone(&store), path.clone(), Lz4Codec).await;
                     let cfg = FileConfig {
                         cache_capacity: CACHE_SIZE,
                         ..FileConfig::new(NoCompression)
                     };
-                    let file = Arc::new(File::open(&path, cfg).await.unwrap());
+                    let file = Arc::new(ArrayFile::open(Arc::clone(&store), path, cfg).await.unwrap());
                     read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
                 } else {
-                    let names = prepare_on_disk(&path, NoCompression).await;
+                    let names = prepare_on_disk(Arc::clone(&store), path.clone(), NoCompression).await;
                     let cfg = FileConfig {
                         cache_capacity: CACHE_SIZE,
                         ..FileConfig::new(NoCompression)
                     };
-                    let file = Arc::new(File::open(&path, cfg).await.unwrap());
+                    let file = Arc::new(ArrayFile::open(Arc::clone(&store), path, cfg).await.unwrap());
                     read_parallel_concurrent(file, names, PARALLELISM, CONCURRENCY).await;
                 }
             });

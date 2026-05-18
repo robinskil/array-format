@@ -9,19 +9,20 @@ use crate::{
     address::ChunkAddress,
     array::ArrayElement,
     codec::CompressionCodec,
-    delta::{Delta, DeltaAllocator, DeltaImmutable, write_file_then_bytes},
+    delta::{Delta, DeltaAllocator, DeltaCache, DeltaImmutable, write_file_then_bytes},
     footer::{FOOTER_VERSION, Footer},
     layout::{
         ArrayLayout, ArrayMeta, AttrIndexKind, AttributeValue, Attributes, ChunkEntry, FillValue,
         StorageLayout,
     },
-    storage::{InMemoryStorage, ObjectStoreBackend, Storage, discover_sidecars},
+    storage::{InMemoryStorage, ObjectStoreBackend, Storage},
 };
 
 // ── Constants ───────────────────────────────────────────────────────
 
-pub const DEFAULT_BLOCK_TARGET_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
-pub const DEFAULT_CACHE_CAPACITY: usize = 128;
+pub const DEFAULT_BLOCK_TARGET_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+pub const DEFAULT_CACHE_CAPACITY: usize = 256 * 1024 * 1024; // 256 MiB
+pub const DEFAULT_IO_CACHE_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB; enable for object-store workloads
 
 // ── FileConfig ──────────────────────────────────────────────────────
 
@@ -29,6 +30,7 @@ pub struct FileConfig<C: CompressionCodec> {
     pub codec: C,
     pub block_target_size: usize,
     pub cache_capacity: usize,
+    pub io_cache_capacity: usize,
 }
 
 impl<C: CompressionCodec> FileConfig<C> {
@@ -37,6 +39,7 @@ impl<C: CompressionCodec> FileConfig<C> {
             codec,
             block_target_size: DEFAULT_BLOCK_TARGET_SIZE,
             cache_capacity: DEFAULT_CACHE_CAPACITY,
+            io_cache_capacity: DEFAULT_IO_CACHE_CAPACITY,
         }
     }
 }
@@ -76,10 +79,10 @@ impl PendingState {
 
 // ── File ────────────────────────────────────────────────────────────
 
-/// Object store and base-file stem for an on-disk file.
+/// Object store and base-file path for an on-disk file.
 struct StoreDir {
     store: Arc<dyn ObjectStore>,
-    stem: String,
+    base_path: object_store::path::Path,
 }
 
 /// Schema information returned by [`File::get_chunked_schema`].
@@ -94,64 +97,77 @@ pub(crate) struct ChunkedSchema {
 ///
 /// Layers are stacked oldest → newest in `deltas`. Uncommitted writes
 /// accumulate in `pending` and are flushed by [`flush`](File::flush).
-pub struct File {
+pub struct ArrayFile {
     deltas: Vec<Delta<DeltaImmutable>>,
     pending: PendingState,
     codec: Arc<dyn CompressionCodec>,
     block_target_size: usize,
+    cache: Option<Arc<DeltaCache>>,
     /// Object store and stem for on-disk files; `None` for in-memory files.
     store_dir: Option<StoreDir>,
 }
 
 // ── Constructors ────────────────────────────────────────────────────
 
-impl File {
-    /// Creates a new empty file at `path` on the local filesystem.
+impl ArrayFile {
+    /// Creates a new empty file at `path` within `store`.
     pub async fn create<C: CompressionCodec + 'static>(
-        path: &std::path::Path,
+        store: Arc<dyn ObjectStore>,
+        path: object_store::path::Path,
         config: FileConfig<C>,
     ) -> Result<Self> {
-        let ctx = local_dir_and_storage(path)?;
-        write_empty_base(&*ctx.storage).await?;
-        let base_delta = Delta::<DeltaImmutable>::open(ctx.storage).await?;
-        Ok(File {
+        let cache = make_cache(config.cache_capacity, config.io_cache_capacity);
+        let delta_path = Arc::<str>::from(path.as_ref());
+        let storage =
+            Arc::new(ObjectStoreBackend::new(Arc::clone(&store), path.clone())) as Arc<dyn Storage>;
+        write_empty_base(&*storage).await?;
+        let base_delta = Delta::<DeltaImmutable>::open(storage, delta_path, cache.clone()).await?;
+        Ok(ArrayFile {
             deltas: vec![base_delta],
             pending: PendingState::default(),
             codec: Arc::new(config.codec),
             block_target_size: config.block_target_size,
-            store_dir: Some(StoreDir { store: ctx.store, stem: ctx.stem }),
+            cache,
+            store_dir: Some(StoreDir {
+                store,
+                base_path: path,
+            }),
         })
     }
 
-    /// Opens an existing file (base + any sidecars) from the local filesystem.
+    /// Opens an existing file (base + any sidecars) from `store`.
     pub async fn open<C: CompressionCodec + 'static>(
-        path: &std::path::Path,
+        store: Arc<dyn ObjectStore>,
+        path: object_store::path::Path,
         config: FileConfig<C>,
     ) -> Result<Self> {
-        let ctx = local_dir_and_storage(path)?;
-        let base_delta = Delta::<DeltaImmutable>::open(ctx.storage).await?;
+        let cache = make_cache(config.cache_capacity, config.io_cache_capacity);
+        let delta_path = Arc::<str>::from(path.as_ref());
+        let storage =
+            Arc::new(ObjectStoreBackend::new(Arc::clone(&store), path.clone())) as Arc<dyn Storage>;
+        let base_delta = Delta::<DeltaImmutable>::open(storage, delta_path, cache.clone()).await?;
         let mut deltas = vec![base_delta];
 
-        let sidecar_paths = discover_sidecars(path)?;
-        for scar in sidecar_paths {
-            let filename = scar
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| Error::Storage("sidecar filename is invalid UTF-8".into()))?
-                .to_owned();
-            let scar_storage = Arc::new(ObjectStoreBackend::new(
-                Arc::clone(&ctx.store),
-                object_store::path::Path::from(filename.as_str()),
-            )) as Arc<dyn Storage>;
-            deltas.push(Delta::<DeltaImmutable>::open(scar_storage).await?);
+        let sidecars = discover_sidecars_store(&*store, &path).await?;
+        for (_, scar_path) in sidecars {
+            let scar_delta_path = Arc::<str>::from(scar_path.as_ref());
+            let scar_storage = Arc::new(ObjectStoreBackend::new(Arc::clone(&store), scar_path))
+                as Arc<dyn Storage>;
+            deltas.push(
+                Delta::<DeltaImmutable>::open(scar_storage, scar_delta_path, cache.clone()).await?,
+            );
         }
 
-        Ok(File {
+        Ok(ArrayFile {
             deltas,
             pending: PendingState::default(),
             codec: Arc::new(config.codec),
             block_target_size: config.block_target_size,
-            store_dir: Some(StoreDir { store: ctx.store, stem: ctx.stem }),
+            cache,
+            store_dir: Some(StoreDir {
+                store,
+                base_path: path,
+            }),
         })
     }
 
@@ -159,14 +175,18 @@ impl File {
     pub async fn create_memory<C: CompressionCodec + 'static>(
         config: FileConfig<C>,
     ) -> Result<Self> {
+        let cache = make_cache(config.cache_capacity, config.io_cache_capacity);
         let storage = Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>;
         write_empty_base(&*storage).await?;
-        let base_delta = Delta::<DeltaImmutable>::open(storage).await?;
-        Ok(File {
+        let base_delta =
+            Delta::<DeltaImmutable>::open(storage, Arc::from("__memory_0__"), cache.clone())
+                .await?;
+        Ok(ArrayFile {
             deltas: vec![base_delta],
             pending: PendingState::default(),
             codec: Arc::new(config.codec),
             block_target_size: config.block_target_size,
+            cache,
             store_dir: None,
         })
     }
@@ -174,7 +194,7 @@ impl File {
 
 // ── Schema & attribute access ────────────────────────────────────────
 
-impl File {
+impl ArrayFile {
     /// Returns a reference to the merged array metadata for `name`,
     /// searching from the newest layer towards the oldest.
     pub fn get_array(&self, name: &str) -> Result<&ArrayMeta> {
@@ -189,7 +209,8 @@ impl File {
             return if m.deleted { None } else { Some(m) };
         }
         for delta in self.deltas.iter().rev() {
-            if let Some(m) = delta.inner.footer.arrays.iter().find(|a| a.name == name) {
+            if let Some(&i) = delta.inner.array_index.get(name) {
+                let m = &delta.inner.footer.arrays[i];
                 return if m.deleted { None } else { Some(m) };
             }
         }
@@ -205,8 +226,8 @@ impl File {
         // Collect existing chunk coords from all layers (newest wins, so just union).
         let mut existing: IndexMap<Vec<u32>, ()> = IndexMap::new();
         for delta in &self.deltas {
-            if let Some(m) = delta.inner.footer.arrays.iter().find(|a| a.name == name) {
-                for e in &m.layout.storage.chunks {
+            if let Some(&i) = delta.inner.array_index.get(name) {
+                for e in &delta.inner.footer.arrays[i].layout.storage.chunks {
                     existing.entry(e.coord.clone()).or_default();
                 }
             }
@@ -346,7 +367,7 @@ impl File {
 
 // ── Array definition / deletion ──────────────────────────────────────
 
-impl File {
+impl ArrayFile {
     /// Defines a new array. `chunk_shape = None` means one chunk per array.
     pub fn define_array<T: ArrayElement>(
         &mut self,
@@ -405,7 +426,7 @@ impl File {
 
 // ── Chunk-level read/write (pub(crate) for ndarray_ext) ──────────────
 
-impl File {
+impl ArrayFile {
     pub(crate) async fn read_chunk<T: ArrayElement>(
         &self,
         name: &str,
@@ -462,7 +483,7 @@ impl File {
 
 // ── ndarray read/write ───────────────────────────────────────────────
 
-impl File {
+impl ArrayFile {
     pub async fn write_array<T: ArrayElement>(
         &mut self,
         name: &str,
@@ -484,8 +505,11 @@ impl File {
         } else {
             let meta = self.get_array(name)?;
             let ndim = meta.layout.shape.len();
-            let effective_start =
-                if start.len() == ndim { start.clone() } else { vec![0; ndim] };
+            let effective_start = if start.len() == ndim {
+                start.clone()
+            } else {
+                vec![0; ndim]
+            };
             let effective_shape: Vec<usize> = if shape.len() == ndim {
                 shape.clone()
             } else {
@@ -505,7 +529,7 @@ impl File {
 
 // ── Flush ────────────────────────────────────────────────────────────
 
-impl File {
+impl ArrayFile {
     /// Commits pending writes to a new sidecar file on disk.
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending.is_empty() {
@@ -516,12 +540,13 @@ impl File {
             .as_ref()
             .ok_or_else(|| Error::Storage("in-memory file: use flush_memory instead".into()))?;
         let overlay_index = self.deltas.len() as u32;
-        let sidecar_name = format!("{}.{overlay_index}.af", sd.stem);
-        let storage = Arc::new(ObjectStoreBackend::new(
-            Arc::clone(&sd.store),
-            object_store::path::Path::from(sidecar_name.as_str()),
-        )) as Arc<dyn Storage>;
-        self.flush_to(storage, overlay_index, sd.stem.clone()).await
+        let scar_path = sidecar_path(&sd.base_path, overlay_index);
+        let delta_path = Arc::<str>::from(scar_path.as_ref());
+        let storage =
+            Arc::new(ObjectStoreBackend::new(Arc::clone(&sd.store), scar_path)) as Arc<dyn Storage>;
+        let hint = sd.base_path.as_ref().to_string();
+        self.flush_to(storage, delta_path, overlay_index, hint)
+            .await
     }
 
     /// Commits pending writes to `storage` (for in-memory testing).
@@ -530,20 +555,26 @@ impl File {
             return Ok(());
         }
         let overlay_index = self.deltas.len() as u32;
+        let delta_path = Arc::<str>::from(format!("__memory_{overlay_index}__").as_str());
         let arc: Arc<dyn Storage> = Arc::new(storage.clone());
-        self.flush_to(arc, overlay_index, String::new()).await
+        self.flush_to(arc, delta_path, overlay_index, String::new())
+            .await
     }
 
     async fn flush_to(
         &mut self,
         storage: Arc<dyn Storage>,
+        delta_path: Arc<str>,
         overlay_index: u32,
         base_file_hint: String,
     ) -> Result<()> {
-        let (mut file, output_size, footer_bytes) =
-            self.build_pending_output(overlay_index, &base_file_hint).await?;
+        let (mut file, output_size, footer_bytes) = self
+            .build_pending_output(overlay_index, &base_file_hint)
+            .await?;
         write_file_then_bytes(&mut file, output_size, &footer_bytes, &*storage).await?;
-        let immutable = Delta::<DeltaImmutable>::open(Arc::clone(&storage)).await?;
+        let immutable =
+            Delta::<DeltaImmutable>::open(Arc::clone(&storage), delta_path, self.cache.clone())
+                .await?;
         self.deltas.push(immutable);
         self.pending = PendingState::default();
         Ok(())
@@ -589,8 +620,11 @@ impl File {
             arrays.push(meta);
         }
 
-        let crate::delta::AllocatorOutput { mut file, output_size, blocks } =
-            allocator.commit().await;
+        let crate::delta::AllocatorOutput {
+            mut file,
+            output_size,
+            blocks,
+        } = allocator.commit().await;
 
         let footer = Footer {
             version: FOOTER_VERSION,
@@ -605,7 +639,9 @@ impl File {
 
         // Re-seek so the caller can stream from position 0.
         use tokio::io::AsyncSeekExt;
-        file.seek(std::io::SeekFrom::Start(0)).await.map_err(Error::Io)?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(Error::Io)?;
 
         Ok((file, output_size, footer_bytes))
     }
@@ -613,7 +649,7 @@ impl File {
 
 // ── Compact ──────────────────────────────────────────────────────────
 
-impl File {
+impl ArrayFile {
     /// Merges all committed layers into a single base file.
     pub async fn compact(&mut self) -> Result<()> {
         // Build the merged view.
@@ -632,8 +668,8 @@ impl File {
             // Collect all chunk coords across all layers for this array.
             let mut all_coords: indexmap::IndexSet<Vec<u32>> = indexmap::IndexSet::new();
             for delta in &self.deltas {
-                if let Some(m) = delta.inner.footer.arrays.iter().find(|a| a.name == *name) {
-                    for e in &m.layout.storage.chunks {
+                if let Some(&i) = delta.inner.array_index.get(name.as_str()) {
+                    for e in &delta.inner.footer.arrays[i].layout.storage.chunks {
                         all_coords.insert(e.coord.clone());
                     }
                 }
@@ -656,8 +692,11 @@ impl File {
             arrays.push(new_meta);
         }
 
-        let crate::delta::AllocatorOutput { mut file, output_size, blocks } =
-            allocator.commit().await;
+        let crate::delta::AllocatorOutput {
+            mut file,
+            output_size,
+            blocks,
+        } = allocator.commit().await;
 
         // Build attr dictionaries from all layers (simple union).
         let mut attr_keys: Vec<String> = Vec::new();
@@ -690,17 +729,15 @@ impl File {
         let base_storage: Arc<dyn Storage> = if let Some(sd) = &self.store_dir {
             // Delete old sidecars first.
             for i in 1..self.deltas.len() {
-                let scar_name = format!("{}.{i}.af", sd.stem);
                 let _ = sd
                     .store
-                    .delete(&object_store::path::Path::from(scar_name.as_str()))
+                    .delete(&sidecar_path(&sd.base_path, i as u32))
                     .await;
             }
             // Write new base.
-            let filename = format!("{}.af", sd.stem);
             Arc::new(ObjectStoreBackend::new(
                 Arc::clone(&sd.store),
-                object_store::path::Path::from(filename.as_str()),
+                sd.base_path.clone(),
             ))
         } else {
             // In-memory: reuse the first layer's storage.
@@ -708,7 +745,14 @@ impl File {
         };
 
         write_file_then_bytes(&mut file, output_size, &footer_bytes, &*base_storage).await?;
-        let new_base = Delta::<DeltaImmutable>::open(base_storage).await?;
+        let base_delta_path: Arc<str> = if let Some(sd) = &self.store_dir {
+            Arc::from(sd.base_path.as_ref())
+        } else {
+            Arc::from("__memory_0__")
+        };
+        let new_base =
+            Delta::<DeltaImmutable>::open(base_storage, base_delta_path, self.cache.clone())
+                .await?;
         self.deltas = vec![new_base];
         Ok(())
     }
@@ -716,46 +760,58 @@ impl File {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Parsed context for a local on-disk file path.
-struct LocalFileContext {
-    store: Arc<dyn ObjectStore>,
-    stem: String,
-    storage: Arc<dyn Storage>,
+fn make_cache(block_capacity: usize, io_capacity: usize) -> Option<Arc<DeltaCache>> {
+    if block_capacity == 0 && io_capacity == 0 {
+        None
+    } else {
+        Some(Arc::new(DeltaCache::new(
+            block_capacity as u64,
+            io_capacity as u64,
+        )))
+    }
 }
 
-fn local_dir_and_storage(path: &std::path::Path) -> Result<LocalFileContext> {
-    use object_store::local::LocalFileSystem;
+fn sidecar_path(base: &object_store::path::Path, n: u32) -> object_store::path::Path {
+    let s = base.as_ref();
+    let without_af = s.strip_suffix(".af").unwrap_or(s);
+    object_store::path::Path::from(format!("{without_af}.{n}.af").as_str())
+}
 
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_err(Error::Io)?.join(path)
-    };
-
-    let dir = abs
-        .parent()
-        .ok_or_else(|| Error::Storage("path has no parent directory".into()))?;
-    let filename = abs
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| Error::Storage("invalid filename".into()))?
-        .to_owned();
-    let stem = abs
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| Error::Storage("invalid filename stem".into()))?
-        .to_owned();
-
-    let store =
-        Arc::new(LocalFileSystem::new_with_prefix(dir).map_err(|e| Error::Storage(e.to_string()))?)
-            as Arc<dyn ObjectStore>;
-
-    let storage = Arc::new(ObjectStoreBackend::new(
-        Arc::clone(&store),
-        object_store::path::Path::from(filename.as_str()),
-    )) as Arc<dyn Storage>;
-
-    Ok(LocalFileContext { store, stem, storage })
+async fn discover_sidecars_store(
+    store: &dyn ObjectStore,
+    base_path: &object_store::path::Path,
+) -> Result<Vec<(u32, object_store::path::Path)>> {
+    use futures::TryStreamExt;
+    let base_str = base_path.as_ref();
+    let stem_prefix = base_str
+        .strip_suffix(".af")
+        .ok_or_else(|| Error::Storage("path must end with .af".into()))?;
+    let list_prefix = base_str
+        .rfind('/')
+        .map(|pos| object_store::path::Path::from(&base_str[..pos]));
+    let objects: Vec<_> = store
+        .list(list_prefix.as_ref())
+        .try_collect()
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let mut sidecars: Vec<(u32, object_store::path::Path)> = objects
+        .into_iter()
+        .filter_map(|meta| {
+            let s = meta.location.as_ref();
+            let rest = s.strip_prefix(stem_prefix)?.strip_prefix('.')?;
+            let (num_str, ext) = rest.rsplit_once('.')?;
+            if ext != "af" {
+                return None;
+            }
+            let n: u32 = num_str.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            Some((n, meta.location))
+        })
+        .collect();
+    sidecars.sort_by_key(|(n, _)| *n);
+    Ok(sidecars)
 }
 
 async fn write_empty_base(storage: &dyn Storage) -> Result<()> {
@@ -763,4 +819,3 @@ async fn write_empty_base(storage: &dyn Storage) -> Result<()> {
     let bytes = footer.serialize()?;
     storage.write(Bytes::from(bytes)).await
 }
-

@@ -8,11 +8,11 @@
 //! ```
 
 use ndarray::Array;
-use array_format::{File, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
 
 #[tokio::main]
 async fn main() {
-    let mut file = File::create_memory(FileConfig::new(NoCompression)).await.unwrap();
+    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression)).await.unwrap();
     file.define_array::<i32>("values", vec!["x".into()], vec![4], None, None).unwrap();
 
     // Layer 1: write initial data

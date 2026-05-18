@@ -116,6 +116,8 @@ impl Delta<DeltaMutable> {
     pub async fn commit(
         self,
         storage: Arc<dyn crate::storage::Storage>,
+        path: Arc<str>,
+        cache: Option<Arc<super::DeltaCache>>,
         base_file_hint: impl Into<String>,
     ) -> Result<Delta<DeltaImmutable>> {
         use crate::footer::{FOOTER_VERSION, Footer};
@@ -140,7 +142,7 @@ impl Delta<DeltaMutable> {
         let footer_bytes = footer.serialize()?;
 
         super::write_file_then_bytes(&mut file, output_size, &footer_bytes, &*storage).await?;
-        Delta::<DeltaImmutable>::open(storage).await
+        Delta::<DeltaImmutable>::open(storage, path, cache).await
     }
 }
 
@@ -241,7 +243,7 @@ mod tests {
         .unwrap();
         d.write_raw_chunk("temps", vec![0], &raw).unwrap();
         let storage = Arc::new(InMemoryStorage::new());
-        let immutable = d.commit(storage, "base").await.unwrap();
+        let immutable = d.commit(storage, Arc::from("test"), None, "base").await.unwrap();
         let meta = immutable
             .array_meta("temps")
             .expect("array not found after commit");
@@ -260,7 +262,7 @@ mod tests {
             d.write_raw_chunk("m", vec![i as u32 * 8], chunk).unwrap();
         }
         let storage = Arc::new(InMemoryStorage::new());
-        let immutable = d.commit(storage, "base").await.unwrap();
+        let immutable = d.commit(storage, Arc::from("test"), None, "base").await.unwrap();
         for (i, expected) in chunks.iter().enumerate() {
             let bytes = immutable
                 .read_raw_chunk("m", &[i as u32 * 8])

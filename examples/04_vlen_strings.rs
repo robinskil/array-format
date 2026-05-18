@@ -4,11 +4,11 @@
 //! cargo run --example 04_vlen_strings
 //! ```
 
-use array_format::{File, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
 
 #[tokio::main]
 async fn main() {
-    let mut file = File::create_memory(FileConfig::new(NoCompression))
+    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
         .await
         .unwrap();
 

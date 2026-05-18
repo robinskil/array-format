@@ -43,14 +43,18 @@ macro_rules! impl_element_uint {
     ($ty:ty, $variant:expr) => {
         impl ArrayElement for $ty {
             const DTYPE: DType = $variant;
-            fn encode_chunk(values: &[Self]) -> Vec<u8> { encode_copy(values) }
-            fn decode_chunk(bytes: &[u8]) -> Vec<Self> { decode_copy(bytes) }
+            fn encode_chunk(values: &[Self]) -> Vec<u8> {
+                encode_copy(values)
+            }
+            fn decode_chunk(bytes: &[u8]) -> Vec<Self> {
+                decode_copy(bytes)
+            }
             fn fill_element(fill: Option<&FillValue>) -> Self {
                 match fill {
-                    Some(FillValue::UInt(v))  => *v as $ty,
-                    Some(FillValue::Int(v))   => *v as $ty,
+                    Some(FillValue::UInt(v)) => *v as $ty,
+                    Some(FillValue::Int(v)) => *v as $ty,
                     Some(FillValue::Float(v)) => *v as $ty,
-                    Some(FillValue::Bool(v))  => *v as u8 as $ty,
+                    Some(FillValue::Bool(v)) => *v as u8 as $ty,
                     _ => 0,
                 }
             }
@@ -62,12 +66,16 @@ macro_rules! impl_element_int {
     ($ty:ty, $variant:expr) => {
         impl ArrayElement for $ty {
             const DTYPE: DType = $variant;
-            fn encode_chunk(values: &[Self]) -> Vec<u8> { encode_copy(values) }
-            fn decode_chunk(bytes: &[u8]) -> Vec<Self> { decode_copy(bytes) }
+            fn encode_chunk(values: &[Self]) -> Vec<u8> {
+                encode_copy(values)
+            }
+            fn decode_chunk(bytes: &[u8]) -> Vec<Self> {
+                decode_copy(bytes)
+            }
             fn fill_element(fill: Option<&FillValue>) -> Self {
                 match fill {
-                    Some(FillValue::Int(v))   => *v as $ty,
-                    Some(FillValue::UInt(v))  => *v as $ty,
+                    Some(FillValue::Int(v)) => *v as $ty,
+                    Some(FillValue::UInt(v)) => *v as $ty,
                     Some(FillValue::Float(v)) => *v as $ty,
                     _ => 0,
                 }
@@ -80,13 +88,17 @@ macro_rules! impl_element_float {
     ($ty:ty, $variant:expr) => {
         impl ArrayElement for $ty {
             const DTYPE: DType = $variant;
-            fn encode_chunk(values: &[Self]) -> Vec<u8> { encode_copy(values) }
-            fn decode_chunk(bytes: &[u8]) -> Vec<Self> { decode_copy(bytes) }
+            fn encode_chunk(values: &[Self]) -> Vec<u8> {
+                encode_copy(values)
+            }
+            fn decode_chunk(bytes: &[u8]) -> Vec<Self> {
+                decode_copy(bytes)
+            }
             fn fill_element(fill: Option<&FillValue>) -> Self {
                 match fill {
                     Some(FillValue::Float(v)) => *v as $ty,
-                    Some(FillValue::Int(v))   => *v as $ty,
-                    Some(FillValue::UInt(v))  => *v as $ty,
+                    Some(FillValue::Int(v)) => *v as $ty,
+                    Some(FillValue::UInt(v)) => *v as $ty,
                     _ => 0.0,
                 }
             }
@@ -94,11 +106,11 @@ macro_rules! impl_element_float {
     };
 }
 
-impl_element_uint!(u8,  DType::UInt8);
+impl_element_uint!(u8, DType::UInt8);
 impl_element_uint!(u16, DType::UInt16);
 impl_element_uint!(u32, DType::UInt32);
 impl_element_uint!(u64, DType::UInt64);
-impl_element_int!(i8,  DType::Int8);
+impl_element_int!(i8, DType::Int8);
 impl_element_int!(i16, DType::Int16);
 impl_element_int!(i32, DType::Int32);
 impl_element_int!(i64, DType::Int64);
@@ -135,8 +147,7 @@ fn decode_offsets(bytes: &[u8]) -> Vec<Vec<u8>> {
             if pos + 4 > bytes.len() {
                 break;
             }
-            let off =
-                u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            let off = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
             if pos + 4 + off == bytes.len() {
                 n += 1;
                 break;
@@ -151,11 +162,9 @@ fn decode_offsets(bytes: &[u8]) -> Vec<Vec<u8>> {
     let values_base = (n + 1) * 4;
     (0..n)
         .map(|i| {
-            let start =
-                u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
-            let end = u32::from_le_bytes(
-                bytes[(i + 1) * 4..(i + 1) * 4 + 4].try_into().unwrap(),
-            ) as usize;
+            let start = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+            let end = u32::from_le_bytes(bytes[(i + 1) * 4..(i + 1) * 4 + 4].try_into().unwrap())
+                as usize;
             bytes[values_base + start..values_base + end].to_vec()
         })
         .collect()

@@ -99,56 +99,6 @@ impl Storage for InMemoryStorage {
     }
 }
 
-/// Discovers sidecar files for a base `.af` file.
-///
-/// Scans the parent directory for files named `{stem}.{N}.arrf` where N is
-/// a positive integer, returning their paths sorted by N ascending.
-pub(crate) fn discover_sidecars(
-    base_path: &std::path::Path,
-) -> crate::error::Result<Vec<std::path::PathBuf>> {
-    let abs = if base_path.is_absolute() {
-        base_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(crate::error::Error::Io)?
-            .join(base_path)
-    };
-
-    let dir = abs
-        .parent()
-        .ok_or_else(|| crate::error::Error::Storage("path has no parent directory".into()))?;
-
-    let stem = abs
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| crate::error::Error::Storage("path has no valid UTF-8 stem".into()))?
-        .to_owned();
-
-    let entries = std::fs::read_dir(dir).map_err(crate::error::Error::Io)?;
-
-    let mut sidecars: Vec<(u32, std::path::PathBuf)> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name();
-            let name = name.to_str()?;
-            // Match "{stem}.{N}.arrf"
-            let rest = name.strip_prefix(&stem)?.strip_prefix('.')?;
-            let (num_str, ext) = rest.rsplit_once('.')?;
-            if ext != "af" {
-                return None;
-            }
-            let n: u32 = num_str.parse().ok()?;
-            if n == 0 {
-                return None;
-            }
-            Some((n, e.path()))
-        })
-        .collect();
-
-    sidecars.sort_by_key(|(n, _)| *n);
-    Ok(sidecars.into_iter().map(|(_, p)| p).collect())
-}
-
 /// A storage backend backed by an [`object_store::ObjectStore`] implementation.
 ///
 /// Wraps any `ObjectStore` (local filesystem, S3, GCS, Azure, in-memory)

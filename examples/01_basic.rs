@@ -5,11 +5,11 @@
 //! ```
 
 use ndarray::Array;
-use array_format::{File, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
 
 #[tokio::main]
 async fn main() {
-    let mut file = File::create_memory(FileConfig::new(NoCompression)).await.unwrap();
+    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression)).await.unwrap();
 
     // 1-D float array
     file.define_array::<f64>("temperature", vec!["time".into()], vec![6], None, None).unwrap();

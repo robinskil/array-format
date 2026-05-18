@@ -42,10 +42,12 @@ pub mod ndarray_ext;
 // ── Public re-exports ───────────────────────────────────────────────
 pub use array::ArrayElement;
 pub use codec::{CompressionCodec, Lz4Codec, NoCompression, ZstdCodec};
+pub use delta::DeltaCache;
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub use file::{
-    DEFAULT_BLOCK_TARGET_SIZE, DEFAULT_CACHE_CAPACITY, File, FileConfig, MergedArrayMeta,
+    ArrayFile, DEFAULT_BLOCK_TARGET_SIZE, DEFAULT_CACHE_CAPACITY, DEFAULT_IO_CACHE_CAPACITY,
+    FileConfig, MergedArrayMeta,
 };
 pub use layout::{AttributeValue, FillValue};
 pub use storage::InMemoryStorage;
