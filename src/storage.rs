@@ -14,6 +14,19 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 
+/// Streaming writer used to build up a file in chunks.
+///
+/// Obtained from [`Storage::write_multipart`]. Callers push successive
+/// chunks via [`write_chunk`] and finalize with [`complete`]; dropping
+/// the writer without calling `complete` aborts the upload.
+pub trait MultipartWriter: Send {
+    /// Appends `data` to the in-flight upload.
+    fn write_chunk(&mut self, data: Bytes) -> BoxFuture<'_, Result<()>>;
+
+    /// Finalizes the upload, committing all previously written chunks.
+    fn complete(self: Box<Self>) -> BoxFuture<'static, Result<()>>;
+}
+
 /// Async storage backend for reading and writing file data.
 ///
 /// All methods return [`BoxFuture`] so the trait is object-safe
@@ -32,6 +45,14 @@ pub trait Storage: Send + Sync {
 
     /// Returns the total size of the file in bytes.
     fn size(&self) -> BoxFuture<'_, Result<u64>>;
+
+    /// Begins a streaming write that replaces the file's contents.
+    ///
+    /// The returned writer accepts successive byte chunks; the upload is
+    /// committed once [`MultipartWriter::complete`] is awaited. This lets
+    /// callers ship large payloads without materializing the whole file in
+    /// memory.
+    fn write_multipart(&self) -> BoxFuture<'_, Result<Box<dyn MultipartWriter>>>;
 }
 
 /// An in-memory storage backend for testing.
@@ -97,6 +118,37 @@ impl Storage for InMemoryStorage {
             Ok(data.len() as u64)
         })
     }
+
+    fn write_multipart(&self) -> BoxFuture<'_, Result<Box<dyn MultipartWriter>>> {
+        Box::pin(async move {
+            Ok(Box::new(InMemoryMultipart {
+                data: Arc::clone(&self.data),
+                buf: Vec::new(),
+            }) as Box<dyn MultipartWriter>)
+        })
+    }
+}
+
+struct InMemoryMultipart {
+    data: Arc<RwLock<Vec<u8>>>,
+    buf: Vec<u8>,
+}
+
+impl MultipartWriter for InMemoryMultipart {
+    fn write_chunk(&mut self, data: Bytes) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.buf.extend_from_slice(&data);
+            Ok(())
+        })
+    }
+
+    fn complete(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            let mut guard = self.data.write().await;
+            *guard = self.buf;
+            Ok(())
+        })
+    }
 }
 
 /// A storage backend backed by an [`object_store::ObjectStore`] implementation.
@@ -151,6 +203,44 @@ impl Storage for ObjectStoreBackend {
             Ok(meta.size as u64)
         })
     }
+
+    fn write_multipart(&self) -> BoxFuture<'_, Result<Box<dyn MultipartWriter>>> {
+        Box::pin(async move {
+            use object_store::buffered::BufWriter;
+            let writer = BufWriter::with_capacity(
+                Arc::clone(&self.store),
+                self.path.clone(),
+                8 * 1024 * 1024,
+            );
+            Ok(Box::new(ObjectStoreMultipart { writer }) as Box<dyn MultipartWriter>)
+        })
+    }
+}
+
+struct ObjectStoreMultipart {
+    writer: object_store::buffered::BufWriter,
+}
+
+impl MultipartWriter for ObjectStoreMultipart {
+    fn write_chunk(&mut self, data: Bytes) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+            self.writer
+                .write_all(&data)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))
+        })
+    }
+
+    fn complete(mut self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+            self.writer
+                .shutdown()
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +276,25 @@ mod tests {
         assert_eq!(size, 6);
         let data = storage.read_range(0..6).await.unwrap();
         assert_eq!(&data[..], b"second");
+    }
+
+    #[tokio::test]
+    async fn in_memory_multipart_streams_chunks() {
+        let storage = InMemoryStorage::from_bytes(b"stale".to_vec());
+        let mut writer = storage.write_multipart().await.unwrap();
+        writer.write_chunk(Bytes::from_static(b"hello "))
+            .await
+            .unwrap();
+        writer.write_chunk(Bytes::from_static(b"streaming "))
+            .await
+            .unwrap();
+        writer.write_chunk(Bytes::from_static(b"world"))
+            .await
+            .unwrap();
+        writer.complete().await.unwrap();
+
+        assert_eq!(storage.size().await.unwrap(), 21);
+        let data = storage.read_range(0..21).await.unwrap();
+        assert_eq!(&data[..], b"hello streaming world");
     }
 }

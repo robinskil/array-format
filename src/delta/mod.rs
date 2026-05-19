@@ -20,8 +20,8 @@ pub struct Delta<D> {
 
 const STREAM_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 
-/// Reads `file` sequentially in 1 MiB slices, appends `suffix`, and writes
-/// the result to `storage`. The file must already be seeked to position 0.
+/// Streams `file` in 1 MiB chunks to `storage`, then appends `suffix`.
+/// The file must already be seeked to position 0.
 pub(crate) async fn write_file_then_bytes(
     file: &mut tokio::fs::File,
     file_size: u64,
@@ -29,15 +29,17 @@ pub(crate) async fn write_file_then_bytes(
     storage: &dyn Storage,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
-    let mut buf = Vec::with_capacity(file_size as usize + suffix.len());
+    let mut writer = storage.write_multipart().await?;
     let mut remaining = file_size as usize;
     while remaining > 0 {
         let to_read = remaining.min(STREAM_CHUNK_SIZE);
-        let prev_len = buf.len();
-        buf.resize(prev_len + to_read, 0);
-        file.read_exact(&mut buf[prev_len..]).await.map_err(Error::Io)?;
+        let mut chunk = vec![0u8; to_read];
+        file.read_exact(&mut chunk).await.map_err(Error::Io)?;
+        writer.write_chunk(Bytes::from(chunk)).await?;
         remaining -= to_read;
     }
-    buf.extend_from_slice(suffix);
-    storage.write(Bytes::from(buf)).await
+    if !suffix.is_empty() {
+        writer.write_chunk(Bytes::copy_from_slice(suffix)).await?;
+    }
+    writer.complete().await
 }
