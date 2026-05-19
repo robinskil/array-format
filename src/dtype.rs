@@ -67,6 +67,11 @@ pub enum DType {
         #[rkyv(omit_bounds)]
         child: Box<DType>,
     },
+    /// 64-bit nanosecond timestamp since the Unix epoch (little-endian).
+    ///
+    /// Byte-identical to [`DType::Int64`] but carries the
+    /// "nanoseconds since 1970-01-01 UTC" meaning in the type system.
+    TimestampNs,
 }
 
 impl DType {
@@ -77,7 +82,7 @@ impl DType {
             DType::Bool | DType::Int8 | DType::UInt8 => Some(1),
             DType::Int16 | DType::UInt16 => Some(2),
             DType::Int32 | DType::UInt32 | DType::Float32 => Some(4),
-            DType::Int64 | DType::UInt64 | DType::Float64 => Some(8),
+            DType::Int64 | DType::UInt64 | DType::Float64 | DType::TimestampNs => Some(8),
             DType::FixedSizeList { child, size } => {
                 child.element_size().map(|cs| cs * (*size as usize))
             }
@@ -109,6 +114,7 @@ mod tests {
         assert_eq!(DType::UInt64.element_size(), Some(8));
         assert_eq!(DType::Float32.element_size(), Some(4));
         assert_eq!(DType::Float64.element_size(), Some(8));
+        assert_eq!(DType::TimestampNs.element_size(), Some(8));
     }
 
     #[test]

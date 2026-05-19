@@ -16,6 +16,8 @@ pub enum StatValue {
     Float(f64),
     /// String or binary: raw bytes in lexicographic order.
     Bytes(Vec<u8>),
+    /// Nanoseconds since the Unix epoch — matches [`DType::TimestampNs`].
+    TimestampNs(i64),
 }
 
 /// Aggregate statistics for a single array covering all its chunks.
@@ -248,6 +250,7 @@ pub fn compute_chunk_partial(
         DType::Float32 => float_partial!(bytes, fill_value, f32),
         DType::Float64 => float_partial!(bytes, fill_value, f64),
         DType::String | DType::Binary => vlen_partial(bytes, fill_value),
+        DType::TimestampNs => timestamp_partial(bytes, fill_value),
         DType::FixedSizeList { .. } | DType::List { .. } => (None, None, 0, 0),
     }
 }
@@ -288,6 +291,7 @@ fn stat_le(a: &StatValue, b: &StatValue) -> bool {
         (StatValue::UInt(a), StatValue::UInt(b)) => a <= b,
         (StatValue::Float(a), StatValue::Float(b)) => a.total_cmp(b).is_le(),
         (StatValue::Bytes(a), StatValue::Bytes(b)) => a <= b,
+        (StatValue::TimestampNs(a), StatValue::TimestampNs(b)) => a <= b,
         _ => false,
     }
 }
@@ -365,6 +369,36 @@ fn vlen_partial(
     )
 }
 
+fn timestamp_partial(
+    bytes: &[u8],
+    fill: Option<&FillValue>,
+) -> (Option<StatValue>, Option<StatValue>, u64, u64) {
+    let n = bytes.len() / 8;
+    let fill_val: Option<i64> = match fill {
+        Some(FillValue::TimestampNs(v)) => Some(*v),
+        Some(FillValue::Int(v)) => Some(*v),
+        _ => None,
+    };
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    let mut null_count = 0u64;
+    for i in 0..n {
+        let e = i64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
+        if fill_val.map_or(false, |f| e == f) {
+            null_count += 1;
+        } else {
+            min = Some(min.map_or(e, |m| m.min(e)));
+            max = Some(max.map_or(e, |m| m.max(e)));
+        }
+    }
+    (
+        min.map(StatValue::TimestampNs),
+        max.map(StatValue::TimestampNs),
+        null_count,
+        n as u64,
+    )
+}
+
 /// Determines the number of elements from an offset-buffer encoded chunk.
 /// Uses the same algorithm as `decode_offsets` in `array.rs`.
 fn find_vlen_count(bytes: &[u8]) -> usize {
@@ -392,6 +426,10 @@ mod tests {
     use super::*;
 
     fn i32_bytes(values: &[i32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn i64_bytes(values: &[i64]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
@@ -518,5 +556,35 @@ mod tests {
         let bytes = sf.serialize().unwrap();
         let restored = StatsFile::deserialize(&bytes).unwrap();
         assert_eq!(sf, restored);
+    }
+
+    #[test]
+    fn timestamp_min_max() {
+        // values: [10, 20, -5, 7, 20] with fill=20 — two 20s are nulls, excluded
+        // from min/max; min comes from -5, max from 10.
+        let bytes = i64_bytes(&[10, 20, -5, 7, 20]);
+        let (min, max, null_count, row_count) = compute_chunk_partial(
+            &bytes,
+            &DType::TimestampNs,
+            Some(&FillValue::TimestampNs(20)),
+        );
+        assert_eq!(min, Some(StatValue::TimestampNs(-5)));
+        assert_eq!(max, Some(StatValue::TimestampNs(10)));
+        assert_eq!(null_count, 2);
+        assert_eq!(row_count, 5);
+    }
+
+    #[test]
+    fn timestamp_fill_value_int_fallback() {
+        // FillValue::Int is accepted as a fallback for the TimestampNs path,
+        // so a value matching it still counts as a null.
+        let bytes = i64_bytes(&[1, 2, 3]);
+        let (_min, _max, null_count, row_count) = compute_chunk_partial(
+            &bytes,
+            &DType::TimestampNs,
+            Some(&FillValue::Int(2)),
+        );
+        assert_eq!(null_count, 1);
+        assert_eq!(row_count, 3);
     }
 }

@@ -39,6 +39,7 @@ pub mod file;
 pub mod stats;
 
 pub mod ndarray_ext;
+pub mod timestamp;
 
 // ── Public re-exports ───────────────────────────────────────────────
 pub use array::ArrayElement;
@@ -53,3 +54,4 @@ pub use file::{
 pub use layout::{AttributeValue, FillValue};
 pub use stats::{ArrayStats, StatValue, StatsFile};
 pub use storage::InMemoryStorage;
+pub use timestamp::TimestampNs;

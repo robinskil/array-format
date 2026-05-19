@@ -198,6 +198,9 @@ pub enum FillValue {
     UInt(u64),
     Float(f64),
     String(String),
+    /// Fill value for [`DType::TimestampNs`](crate::dtype::DType::TimestampNs)
+    /// arrays — interpreted as `i64` nanoseconds since the Unix epoch.
+    TimestampNs(i64),
 }
 
 impl PartialEq for FillValue {
@@ -209,6 +212,7 @@ impl PartialEq for FillValue {
             // Compare by bit pattern so NaN == NaN.
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::String(a), Self::String(b)) => a == b,
+            (Self::TimestampNs(a), Self::TimestampNs(b)) => a == b,
             _ => false,
         }
     }

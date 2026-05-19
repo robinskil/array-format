@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use array_format::{
     ArrayFile, AttributeValue, FileConfig, FillValue, InMemoryStorage, NoCompression, StatValue,
+    TimestampNs,
 };
 use ndarray::{Array, IxDyn};
 use object_store::{ObjectStore, local::LocalFileSystem};
@@ -1134,4 +1135,45 @@ async fn stats_unwritten_chunks_count_as_nulls() {
     assert_eq!(stats.null_count, 5);       // 5 unwritten elements
     assert_eq!(stats.min, Some(StatValue::Int(1)));
     assert_eq!(stats.max, Some(StatValue::Int(5)));
+}
+
+#[tokio::test]
+async fn timestamp_ns_roundtrip_and_stats() {
+    let fill = 1_000_000_000i64; // 1 second past the epoch — our "missing" marker
+    let values = vec![
+        TimestampNs(0),
+        TimestampNs(fill),
+        TimestampNs(2_000_000_000),
+        TimestampNs(-500),
+        TimestampNs(fill),
+    ];
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    file.define_array::<TimestampNs>(
+        "events",
+        vec!["t".into()],
+        vec![values.len()],
+        None,
+        Some(FillValue::TimestampNs(fill)),
+    )
+    .unwrap();
+    file.write_array(
+        "events",
+        vec![0],
+        Array::from_vec(values.clone()).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+
+    let back = file
+        .read_array::<TimestampNs>("events", vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(back.iter().cloned().collect::<Vec<_>>(), values);
+
+    let stats = file.array_stats("events").expect("stats missing");
+    assert_eq!(stats.min, Some(StatValue::TimestampNs(-500)));
+    assert_eq!(stats.max, Some(StatValue::TimestampNs(2_000_000_000)));
+    assert_eq!(stats.null_count, 2);
+    assert_eq!(stats.row_count, values.len() as u64);
 }

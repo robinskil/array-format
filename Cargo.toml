@@ -1,6 +1,6 @@
 [package]
 name = "array-format"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,7 @@ lz4_flex = "0.11"
 ndarray = "0.16"
 tempfile = "3"
 indexmap = "*"
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

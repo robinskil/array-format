@@ -1,5 +1,8 @@
+use zerocopy::IntoBytes;
+
 use crate::dtype::DType;
 use crate::layout::FillValue;
+use crate::timestamp::TimestampNs;
 
 // ── ArrayElement trait ──────────────────────────────────────────────
 
@@ -116,6 +119,34 @@ impl_element_int!(i32, DType::Int32);
 impl_element_int!(i64, DType::Int64);
 impl_element_float!(f32, DType::Float32);
 impl_element_float!(f64, DType::Float64);
+
+// ── TimestampNs (wrapper around i64, zerocopy-backed) ────────────────
+
+impl ArrayElement for TimestampNs {
+    const DTYPE: DType = DType::TimestampNs;
+
+    fn encode_chunk(values: &[Self]) -> Vec<u8> {
+        values.as_bytes().to_vec()
+    }
+
+    fn decode_chunk(bytes: &[u8]) -> Vec<Self> {
+        let elem = std::mem::size_of::<Self>();
+        let n = bytes.len() / elem;
+        let mut out = vec![Self(0); n];
+        if n > 0 {
+            out.as_mut_bytes().copy_from_slice(&bytes[..n * elem]);
+        }
+        out
+    }
+
+    fn fill_element(fill: Option<&FillValue>) -> Self {
+        match fill {
+            Some(FillValue::TimestampNs(v)) => Self(*v),
+            Some(FillValue::Int(v)) => Self(*v),
+            _ => Self(0),
+        }
+    }
+}
 
 // ── Variable-length helpers ──────────────────────────────────────────
 
@@ -263,5 +294,33 @@ mod tests {
     fn decode_empty() {
         assert_eq!(i32::decode_chunk(&[]), Vec::<i32>::new());
         assert_eq!(String::decode_chunk(&[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn timestamp_roundtrip() {
+        let values = vec![
+            TimestampNs(0),
+            TimestampNs(1_700_000_000_000_000_000),
+            TimestampNs(-1),
+            TimestampNs(i64::MAX),
+            TimestampNs(i64::MIN),
+        ];
+        let bytes = TimestampNs::encode_chunk(&values);
+        assert_eq!(bytes.len(), values.len() * 8);
+        let back = TimestampNs::decode_chunk(&bytes);
+        assert_eq!(back, values);
+    }
+
+    #[test]
+    fn timestamp_fill_element() {
+        assert_eq!(
+            TimestampNs::fill_element(Some(&FillValue::TimestampNs(123))),
+            TimestampNs(123)
+        );
+        assert_eq!(
+            TimestampNs::fill_element(Some(&FillValue::Int(7))),
+            TimestampNs(7)
+        );
+        assert_eq!(TimestampNs::fill_element(None), TimestampNs(0));
     }
 }
