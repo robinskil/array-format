@@ -48,6 +48,52 @@ async fn flat_array_roundtrip() {
 }
 
 #[tokio::test]
+async fn scalar_array_roundtrip() {
+    // 0-D arrays: shape = [], length = 1.
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    // Fixed-width scalar (f64).
+    file.define_array::<f64>("pi", vec![], vec![], None, None)
+        .unwrap();
+    let pi = Array::from_shape_vec(IxDyn(&[]), vec![3.14f64]).unwrap();
+    file.write_array("pi", vec![], pi.view()).await.unwrap();
+
+    // Variable-length scalar (String) — exercises the offset-buffer encoder with N=1.
+    file.define_array::<String>("greeting", vec![], vec![], None, None)
+        .unwrap();
+    let greeting = Array::from_shape_vec(IxDyn(&[]), vec!["hello".to_string()]).unwrap();
+    file.write_array("greeting", vec![], greeting.view())
+        .await
+        .unwrap();
+
+    // Defined-but-unwritten scalar with an explicit fill_value.
+    file.define_array::<i32>("answer", vec![], vec![], None, Some(FillValue::Int(42)))
+        .unwrap();
+
+    let overlay = InMemoryStorage::new();
+    file.flush_memory(&overlay).await.unwrap();
+
+    let pi_back = file.read_array::<f64>("pi", vec![], vec![]).await.unwrap();
+    assert_eq!(pi_back.ndim(), 0);
+    assert_eq!(pi_back.len(), 1);
+    assert_eq!(pi_back[IxDyn(&[])], 3.14f64);
+
+    let greeting_back = file
+        .read_array::<String>("greeting", vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(greeting_back.ndim(), 0);
+    assert_eq!(greeting_back[IxDyn(&[])], "hello");
+
+    let answer_back = file
+        .read_array::<i32>("answer", vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(answer_back.ndim(), 0);
+    assert_eq!(answer_back[IxDyn(&[])], 42i32);
+}
+
+#[tokio::test]
 async fn delete_and_compact() {
     let dir = tempfile::tempdir().unwrap();
     let store =
@@ -1070,15 +1116,14 @@ async fn stats_survive_compact() {
 #[tokio::test]
 async fn stats_loaded_on_open() {
     let dir = tempfile::tempdir().unwrap();
-    let path = object_store::path::Path::from(
-        dir.path().to_string_lossy().as_ref(),
-    )
-    .join("data.af");
+    let path =
+        object_store::path::Path::from(dir.path().to_string_lossy().as_ref()).join("data.af");
     let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
 
     {
-        let mut file =
-            ArrayFile::create(store.clone(), path.clone(), small_config()).await.unwrap();
+        let mut file = ArrayFile::create(store.clone(), path.clone(), small_config())
+            .await
+            .unwrap();
         file.define_array::<i32>("nums", vec!["i".into()], vec![3], None, None)
             .unwrap();
         file.write_array(
@@ -1092,7 +1137,9 @@ async fn stats_loaded_on_open() {
     }
 
     // Re-open and verify stats are loaded from .stats file.
-    let file = ArrayFile::open(store.clone(), path.clone(), small_config()).await.unwrap();
+    let file = ArrayFile::open(store.clone(), path.clone(), small_config())
+        .await
+        .unwrap();
     let stats = file.array_stats("nums").expect("stats not loaded on open");
     assert_eq!(stats.min, Some(StatValue::Int(2)));
     assert_eq!(stats.max, Some(StatValue::Int(7)));
@@ -1131,8 +1178,8 @@ async fn stats_unwritten_chunks_count_as_nulls() {
     file.flush_memory(&InMemoryStorage::new()).await.unwrap();
 
     let stats = file.array_stats("partial").expect("stats missing");
-    assert_eq!(stats.row_count, 10);       // full array capacity
-    assert_eq!(stats.null_count, 5);       // 5 unwritten elements
+    assert_eq!(stats.row_count, 10); // full array capacity
+    assert_eq!(stats.null_count, 5); // 5 unwritten elements
     assert_eq!(stats.min, Some(StatValue::Int(1)));
     assert_eq!(stats.max, Some(StatValue::Int(5)));
 }

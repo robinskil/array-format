@@ -13,7 +13,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "fs", "io-util"] }
 zstd = "0.13"
 lz4_flex = "0.11"
-ndarray = "0.16"
+ndarray = "0.17"
 tempfile = "3"
 indexmap = "*"
 zerocopy = { version = "0.8", features = ["derive"] }
@@ -24,7 +24,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 rand = "0.9"
 object_store = "0.13"
 crossbeam-queue = "0.3"
-ndarray = "0.16"
+ndarray = "0.17"
 
 [[bench]]
 name = "read_chunks"
