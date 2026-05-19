@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use indexmap::IndexMap;
 
 use crate::{
     DType, Error, Result,
-    address::ChunkAddress,
+    address::{BlockAllocAddress, ChunkAddress},
     layout::{
-        ArrayLayout, ArrayMeta, AttrIndexKind, Attributes, ChunkEntry, FillValue, StorageLayout,
+        ArrayLayout, ArrayMeta, AttrIndexKind, AttributeValue, Attributes, ChunkEntry, FillValue,
+        StorageLayout,
     },
 };
 
@@ -20,6 +22,12 @@ pub struct DeltaMutable {
     pub delta_index: u32,
     pub array_meta: IndexMap<String, ArrayMeta>,
     pub allocator: DeltaAllocator,
+    pub attr_keys: Vec<String>,
+    pub attr_values: Vec<AttributeValue>,
+}
+
+fn alloc_addr_from_chunk(addr: &ChunkAddress) -> BlockAllocAddress {
+    BlockAllocAddress::new(addr.block_id, addr.offset as u64, addr.size as u64)
 }
 
 impl Delta<DeltaMutable> {
@@ -33,6 +41,8 @@ impl Delta<DeltaMutable> {
                 delta_index,
                 array_meta: IndexMap::new(),
                 allocator: DeltaAllocator::new(codec, block_target_size),
+                attr_keys: Vec::new(),
+                attr_values: Vec::new(),
             },
         }
     }
@@ -111,6 +121,56 @@ impl Delta<DeltaMutable> {
         Ok(())
     }
 
+    /// Returns a mutable reference to the ArrayMeta for `name`, if present.
+    pub fn array_meta_mut(&mut self, name: &str) -> Option<&mut ArrayMeta> {
+        self.inner.array_meta.get_mut(name)
+    }
+
+    /// Inserts or replaces the ArrayMeta for `meta.name`.
+    pub fn upsert_array_meta(&mut self, meta: ArrayMeta) {
+        self.inner.array_meta.insert(meta.name.clone(), meta);
+    }
+
+    /// Stamps `meta` as deleted, clears its chunks, and upserts it.
+    pub fn mark_deleted(&mut self, mut meta: ArrayMeta) {
+        meta.deleted = true;
+        meta.layout.storage.chunks.clear();
+        self.upsert_array_meta(meta);
+    }
+
+    /// Interns `key` into the attribute key dictionary, returning its index.
+    pub fn intern_attr_key(&mut self, key: &str) -> usize {
+        if let Some(i) = self.inner.attr_keys.iter().position(|k| k == key) {
+            i
+        } else {
+            self.inner.attr_keys.push(key.to_string());
+            self.inner.attr_keys.len() - 1
+        }
+    }
+
+    /// Interns `value` into the attribute value dictionary, returning its index.
+    pub fn intern_attr_value(&mut self, value: AttributeValue) -> usize {
+        if let Some(i) = self.inner.attr_values.iter().position(|v| *v == value) {
+            i
+        } else {
+            self.inner.attr_values.push(value);
+            self.inner.attr_values.len() - 1
+        }
+    }
+
+    /// Reads raw (uncompressed) chunk bytes previously written into this
+    /// mutable delta. Returns `None` if the array or coord is not present.
+    pub fn read_raw_chunk(&self, name: &str, coord: &[u32]) -> Option<Bytes> {
+        let meta = self.inner.array_meta.get(name)?;
+        let entry = meta
+            .layout
+            .storage
+            .chunks
+            .iter()
+            .find(|e| e.coord.as_slice() == coord)?;
+        self.inner.allocator.fetch(&alloc_addr_from_chunk(&entry.address))
+    }
+
     /// Commits this delta: compresses all buffered blocks, serializes the
     /// footer, and writes the complete delta bytes to `storage`.
     pub async fn commit(
@@ -124,6 +184,8 @@ impl Delta<DeltaMutable> {
 
         let overlay_index = self.inner.delta_index;
         let arrays: Vec<ArrayMeta> = self.inner.array_meta.into_values().collect();
+        let attr_keys = self.inner.attr_keys;
+        let attr_values = self.inner.attr_values;
         let AllocatorOutput {
             mut file,
             output_size,
@@ -134,8 +196,8 @@ impl Delta<DeltaMutable> {
             version: FOOTER_VERSION,
             blocks,
             arrays,
-            attr_keys: vec![],
-            attr_values: vec![],
+            attr_keys,
+            attr_values,
             overlay_index,
             base_file_hint: base_file_hint.into(),
         };

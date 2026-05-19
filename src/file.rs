@@ -9,7 +9,9 @@ use crate::{
     address::ChunkAddress,
     array::ArrayElement,
     codec::CompressionCodec,
-    delta::{Delta, DeltaAllocator, DeltaCache, DeltaImmutable, write_file_then_bytes},
+    delta::{
+        Delta, DeltaAllocator, DeltaCache, DeltaImmutable, DeltaMutable, write_file_then_bytes,
+    },
     footer::{FOOTER_VERSION, Footer},
     layout::{
         ArrayLayout, ArrayMeta, AttrIndexKind, AttributeValue, Attributes, ChunkEntry, FillValue,
@@ -58,26 +60,6 @@ pub struct MergedArrayMeta {
     pub fill_value: Option<FillValue>,
 }
 
-// ── PendingState ────────────────────────────────────────────────────
-
-#[derive(Default)]
-struct PendingState {
-    /// Arrays defined or modified (or deleted) in this session.
-    arrays: IndexMap<String, ArrayMeta>,
-    /// Raw uncompressed chunk bytes for dirty chunks.
-    dirty_chunks: IndexMap<String, IndexMap<Vec<u32>, Bytes>>,
-    /// Global attribute key dictionary (accumulated across all sessions).
-    attr_keys: Vec<String>,
-    /// Global attribute value dictionary.
-    attr_values: Vec<AttributeValue>,
-}
-
-impl PendingState {
-    fn is_empty(&self) -> bool {
-        self.arrays.is_empty() && self.dirty_chunks.is_empty()
-    }
-}
-
 // ── File ────────────────────────────────────────────────────────────
 
 /// Object store and base-file path for an on-disk file.
@@ -97,10 +79,12 @@ pub(crate) struct ChunkedSchema {
 /// The top-level file handle.
 ///
 /// Layers are stacked oldest → newest in `deltas`. Uncommitted writes
-/// accumulate in `pending` and are flushed by [`flush`](File::flush).
+/// accumulate in a disk-backed mutable delta (`pending`) and are flushed
+/// by [`flush`](File::flush). The mutable delta is created lazily on the
+/// first mutation after open/flush.
 pub struct ArrayFile {
     deltas: Vec<Delta<DeltaImmutable>>,
-    pending: PendingState,
+    pending: Option<Delta<DeltaMutable>>,
     codec: Arc<dyn CompressionCodec>,
     block_target_size: usize,
     cache: Option<Arc<DeltaCache>>,
@@ -127,7 +111,7 @@ impl ArrayFile {
         let base_delta = Delta::<DeltaImmutable>::open(storage, delta_path, cache.clone()).await?;
         Ok(ArrayFile {
             deltas: vec![base_delta],
-            pending: PendingState::default(),
+            pending: None,
             codec: Arc::new(config.codec),
             block_target_size: config.block_target_size,
             cache,
@@ -169,7 +153,7 @@ impl ArrayFile {
 
         Ok(ArrayFile {
             deltas,
-            pending: PendingState::default(),
+            pending: None,
             codec: Arc::new(config.codec),
             block_target_size: config.block_target_size,
             cache,
@@ -193,7 +177,7 @@ impl ArrayFile {
                 .await?;
         Ok(ArrayFile {
             deltas: vec![base_delta],
-            pending: PendingState::default(),
+            pending: None,
             codec: Arc::new(config.codec),
             block_target_size: config.block_target_size,
             cache,
@@ -216,7 +200,9 @@ impl ArrayFile {
     }
 
     fn resolve_array_meta(&self, name: &str) -> Option<&ArrayMeta> {
-        if let Some(m) = self.pending.arrays.get(name) {
+        if let Some(p) = self.pending.as_ref()
+            && let Some(m) = p.inner.array_meta.get(name)
+        {
             return if m.deleted { None } else { Some(m) };
         }
         for delta in self.deltas.iter().rev() {
@@ -226,6 +212,19 @@ impl ArrayFile {
             }
         }
         None
+    }
+
+    /// Lazily creates a mutable pending delta and returns a mutable reference.
+    fn pending_mut(&mut self) -> &mut Delta<DeltaMutable> {
+        if self.pending.is_none() {
+            let overlay_index = self.deltas.len() as u32;
+            self.pending = Some(Delta::<DeltaMutable>::new(
+                Arc::clone(&self.codec),
+                self.block_target_size,
+                overlay_index,
+            ));
+        }
+        self.pending.as_mut().unwrap()
     }
 
     /// Returns the array schema in the form expected by the ndarray write path.
@@ -243,14 +242,11 @@ impl ArrayFile {
                 }
             }
         }
-        if let Some(m) = self.pending.arrays.get(name) {
+        if let Some(p) = self.pending.as_ref()
+            && let Some(m) = p.inner.array_meta.get(name)
+        {
             for e in &m.layout.storage.chunks {
                 existing.entry(e.coord.clone()).or_default();
-            }
-        }
-        if let Some(chunks) = self.pending.dirty_chunks.get(name) {
-            for c in chunks.keys() {
-                existing.entry(c.clone()).or_default();
             }
         }
         Ok(ChunkedSchema {
@@ -285,21 +281,23 @@ impl ArrayFile {
                 }
             }
         }
-        for (name, a) in &self.pending.arrays {
-            if a.deleted {
-                seen.shift_remove(name);
-            } else {
-                seen.insert(
-                    name.clone(),
-                    MergedArrayMeta {
-                        name: a.name.clone(),
-                        dtype: a.dtype.clone(),
-                        shape: a.layout.shape.clone(),
-                        chunk_shape: a.layout.storage.chunk_shape.clone(),
-                        dimension_names: a.layout.dimension_names.clone(),
-                        fill_value: a.fill_value.clone(),
-                    },
-                );
+        if let Some(p) = self.pending.as_ref() {
+            for (name, a) in &p.inner.array_meta {
+                if a.deleted {
+                    seen.shift_remove(name);
+                } else {
+                    seen.insert(
+                        name.clone(),
+                        MergedArrayMeta {
+                            name: a.name.clone(),
+                            dtype: a.dtype.clone(),
+                            shape: a.layout.shape.clone(),
+                            chunk_shape: a.layout.storage.chunk_shape.clone(),
+                            dimension_names: a.layout.dimension_names.clone(),
+                            fill_value: a.fill_value.clone(),
+                        },
+                    );
+                }
             }
         }
         seen.into_values().collect()
@@ -319,9 +317,8 @@ impl ArrayFile {
         let meta = self.get_array(name)?;
         let key_idx = match self
             .pending
-            .attr_keys
-            .iter()
-            .position(|k| k == key)
+            .as_ref()
+            .and_then(|p| p.inner.attr_keys.iter().position(|k| k == key))
             .or_else(|| {
                 // Check global dicts in most-recent delta
                 self.deltas
@@ -337,8 +334,10 @@ impl ArrayFile {
             None => return Ok(None),
         };
         // Look up in pending first, then deltas
-        if val_idx < self.pending.attr_values.len() {
-            return Ok(Some(&self.pending.attr_values[val_idx]));
+        if let Some(p) = self.pending.as_ref()
+            && val_idx < p.inner.attr_values.len()
+        {
+            return Ok(Some(&p.inner.attr_values[val_idx]));
         }
         for delta in self.deltas.iter().rev() {
             if val_idx < delta.inner.footer.attr_values.len() {
@@ -349,33 +348,22 @@ impl ArrayFile {
     }
 
     pub fn set_attribute(&mut self, name: &str, key: &str, value: AttributeValue) -> Result<()> {
-        // Ensure the array exists (in deltas or pending).
-        self.get_array(name)?;
+        // Ensure the array exists (in deltas or pending), and snapshot its meta
+        // in case we need to copy it down into the pending mutable delta.
+        // Clear the cloned chunks list so we don't carry stale block addresses
+        // from a lower layer into this delta's footer.
+        let mut existing_meta = self.get_array(name)?.clone();
+        existing_meta.layout.storage.chunks.clear();
 
-        // Upsert key into pending dict.
-        let key_idx = if let Some(i) = self.pending.attr_keys.iter().position(|k| k == key) {
-            i
-        } else {
-            self.pending.attr_keys.push(key.to_string());
-            self.pending.attr_keys.len() - 1
-        };
+        let pending = self.pending_mut();
+        let key_idx = pending.intern_attr_key(key);
+        let val_idx = pending.intern_attr_value(value);
 
-        // Upsert value into pending dict.
-        let val_idx = if let Some(i) = self.pending.attr_values.iter().position(|v| *v == value) {
-            i
-        } else {
-            self.pending.attr_values.push(value);
-            self.pending.attr_values.len() - 1
-        };
-
-        // Update the array meta in pending (create a copy if only in deltas).
-        let meta = if let Some(m) = self.pending.arrays.get_mut(name) {
-            m
-        } else {
-            let m = self.get_array(name)?.clone();
-            self.pending.arrays.insert(name.to_string(), m);
-            self.pending.arrays.get_mut(name).unwrap()
-        };
+        // Update the array meta in pending (copy from lower layer if absent).
+        if pending.array_meta_mut(name).is_none() {
+            pending.upsert_array_meta(existing_meta);
+        }
+        let meta = pending.array_meta_mut(name).unwrap();
         meta.attributes.upsert(key_idx, val_idx);
         Ok(())
     }
@@ -415,27 +403,21 @@ impl ArrayFile {
                 chunks: vec![],
             },
         };
-        self.pending.arrays.insert(
-            name.clone(),
-            ArrayMeta {
-                name,
-                dtype: T::DTYPE,
-                layout,
-                fill_value,
-                deleted: false,
-                attributes: Attributes::empty(AttrIndexKind::U16),
-            },
-        );
+        self.pending_mut().upsert_array_meta(ArrayMeta {
+            name,
+            dtype: T::DTYPE,
+            layout,
+            fill_value,
+            deleted: false,
+            attributes: Attributes::empty(AttrIndexKind::U16),
+        });
         Ok(())
     }
 
     /// Marks an array as deleted in the pending layer.
     pub fn delete(&mut self, name: &str) -> Result<()> {
         let meta = self.get_array(name)?.clone();
-        let mut tombstone = meta;
-        tombstone.deleted = true;
-        tombstone.layout.storage.chunks.clear();
-        self.pending.arrays.insert(name.to_string(), tombstone);
+        self.pending_mut().mark_deleted(meta);
         Ok(())
     }
 }
@@ -473,20 +455,34 @@ impl ArrayFile {
         coord: Vec<u32>,
         bytes: Vec<u8>,
     ) -> Result<()> {
-        self.get_array(name)?;
-        self.pending
-            .dirty_chunks
-            .entry(name.to_string())
-            .or_default()
-            .insert(coord, Bytes::from(bytes));
-        Ok(())
+        // If the array isn't yet present in pending, copy its meta down so the
+        // mutable delta has an entry to attach the chunk to. Clear the cloned
+        // chunks list — the lower-layer addresses don't apply to this delta's
+        // data file, and only chunks written into this session belong here.
+        let snapshot = if self
+            .pending
+            .as_ref()
+            .and_then(|p| p.inner.array_meta.get(name))
+            .is_none()
+        {
+            let mut m = self.get_array(name)?.clone();
+            m.layout.storage.chunks.clear();
+            Some(m)
+        } else {
+            None
+        };
+        let pending = self.pending_mut();
+        if let Some(meta) = snapshot {
+            pending.upsert_array_meta(meta);
+        }
+        pending.write_raw_chunk(name, coord, &bytes)
     }
 
     async fn resolve_raw_chunk(&self, name: &str, coord: &[u32]) -> Result<Option<Bytes>> {
-        if let Some(chunks) = self.pending.dirty_chunks.get(name)
-            && let Some(b) = chunks.get(coord)
+        if let Some(p) = self.pending.as_ref()
+            && let Some(bytes) = p.read_raw_chunk(name, coord)
         {
-            return Ok(Some(b.clone()));
+            return Ok(Some(bytes));
         }
         for delta in self.deltas.iter().rev() {
             if let Some(bytes) = delta.read_raw_chunk(name, coord).await? {
@@ -548,7 +544,7 @@ impl ArrayFile {
 impl ArrayFile {
     /// Commits pending writes to a new sidecar file on disk.
     pub async fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        if self.pending.is_none() {
             return Ok(());
         }
         let (store, base_path) = match &self.store_dir {
@@ -556,35 +552,35 @@ impl ArrayFile {
             None => {
                 return Err(Error::Storage(
                     "in-memory file: use flush_memory instead".into(),
-                ))
+                ));
             }
         };
-        let dirty_names: Vec<String> = self.pending.dirty_chunks.keys().cloned().collect();
         let overlay_index = self.deltas.len() as u32;
         let scar_path = sidecar_path(&base_path, overlay_index);
         let delta_path = Arc::<str>::from(scar_path.as_ref());
         let storage =
             Arc::new(ObjectStoreBackend::new(Arc::clone(&store), scar_path)) as Arc<dyn Storage>;
         let hint = base_path.as_ref().to_string();
-        self.flush_to(storage, delta_path, overlay_index, hint).await?;
+        let dirty_names = self.commit_pending(storage, delta_path, hint).await?;
 
         let merged = self.compute_stats_for(&dirty_names).await?;
         let s_storage = ObjectStoreBackend::new(Arc::clone(&store), stats_path(&base_path));
-        s_storage.write(bytes::Bytes::from(merged.serialize()?)).await?;
+        s_storage
+            .write(bytes::Bytes::from(merged.serialize()?))
+            .await?;
         self.stats = Some(merged);
         Ok(())
     }
 
     /// Commits pending writes to `storage` (for in-memory testing).
     pub async fn flush_memory(&mut self, storage: &InMemoryStorage) -> Result<()> {
-        if self.pending.is_empty() {
+        if self.pending.is_none() {
             return Ok(());
         }
-        let dirty_names: Vec<String> = self.pending.dirty_chunks.keys().cloned().collect();
         let overlay_index = self.deltas.len() as u32;
         let delta_path = Arc::<str>::from(format!("__memory_{overlay_index}__").as_str());
         let arc: Arc<dyn Storage> = Arc::new(storage.clone());
-        self.flush_to(arc, delta_path, overlay_index, String::new()).await?;
+        let dirty_names = self.commit_pending(arc, delta_path, String::new()).await?;
 
         let merged = self.compute_stats_for(&dirty_names).await?;
         self.stats = Some(merged);
@@ -598,7 +594,9 @@ impl ArrayFile {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let fill_value = self.resolve_array_meta(name).and_then(|m| m.fill_value.clone());
+            let fill_value = self
+                .resolve_array_meta(name)
+                .and_then(|m| m.fill_value.clone());
             let shape_product: u64 = schema.full_shape.iter().map(|&s| s as u64).product();
             let mut stats = ArrayStats::new(name.clone());
             let mut written_non_null: u64 = 0;
@@ -617,89 +615,31 @@ impl ArrayFile {
         Ok(merged)
     }
 
-    async fn flush_to(
+    /// Commits the pending mutable delta to `storage`, appends the resulting
+    /// immutable delta to `self.deltas`, and returns the names of arrays that
+    /// had dirty chunks (used to recompute stats).
+    async fn commit_pending(
         &mut self,
         storage: Arc<dyn Storage>,
         delta_path: Arc<str>,
-        overlay_index: u32,
         base_file_hint: String,
-    ) -> Result<()> {
-        let (mut file, output_size, footer_bytes) = self
-            .build_pending_output(overlay_index, &base_file_hint)
+    ) -> Result<Vec<String>> {
+        let mutable = self
+            .pending
+            .take()
+            .expect("commit_pending: no pending delta");
+        let dirty_names: Vec<String> = mutable
+            .inner
+            .array_meta
+            .iter()
+            .filter(|(_, m)| !m.layout.storage.chunks.is_empty())
+            .map(|(name, _)| name.clone())
+            .collect();
+        let immutable = mutable
+            .commit(storage, delta_path, self.cache.clone(), base_file_hint)
             .await?;
-        write_file_then_bytes(&mut file, output_size, &footer_bytes, &*storage).await?;
-        let immutable =
-            Delta::<DeltaImmutable>::open(Arc::clone(&storage), delta_path, self.cache.clone())
-                .await?;
         self.deltas.push(immutable);
-        self.pending = PendingState::default();
-        Ok(())
-    }
-
-    /// Allocates all pending dirty chunks into an `DeltaAllocator` output file
-    /// and serializes the footer. Returns the output file (seeked to 0), its
-    /// byte count, and the footer bytes ready to be appended.
-    async fn build_pending_output(
-        &self,
-        overlay_index: u32,
-        base_file_hint: &str,
-    ) -> Result<(tokio::fs::File, u64, Vec<u8>)> {
-        let mut allocator = DeltaAllocator::new(Arc::clone(&self.codec), self.block_target_size);
-
-        // Collect all array names touched in this flush.
-        let mut all_names: indexmap::IndexSet<String> = indexmap::IndexSet::new();
-        all_names.extend(self.pending.arrays.keys().cloned());
-        all_names.extend(self.pending.dirty_chunks.keys().cloned());
-
-        let mut arrays: Vec<ArrayMeta> = Vec::new();
-        for name in &all_names {
-            let mut meta: ArrayMeta = if let Some(m) = self.pending.arrays.get(name) {
-                m.clone()
-            } else {
-                self.resolve_array_meta(name)
-                    .ok_or_else(|| Error::ArrayNotFound { name: name.clone() })?
-                    .clone()
-            };
-
-            // This delta only stores dirty chunks.
-            let mut delta_chunks: Vec<ChunkEntry> = Vec::new();
-            if let Some(dirty) = self.pending.dirty_chunks.get(name) {
-                for (coord, raw) in dirty {
-                    let alloc = allocator.allocate(raw);
-                    delta_chunks.push(ChunkEntry {
-                        coord: coord.clone(),
-                        address: ChunkAddress::from(alloc),
-                    });
-                }
-            }
-            meta.layout.storage.chunks = delta_chunks;
-            arrays.push(meta);
-        }
-
-        let crate::delta::AllocatorOutput {
-            mut file,
-            output_size,
-            blocks,
-        } = allocator.commit().await;
-
-        let footer = Footer {
-            version: FOOTER_VERSION,
-            blocks,
-            arrays,
-            attr_keys: self.pending.attr_keys.clone(),
-            attr_values: self.pending.attr_values.clone(),
-            overlay_index,
-            base_file_hint: base_file_hint.to_string(),
-        };
-        let footer_bytes = footer.serialize()?;
-
-        // Re-seek so the caller can stream from position 0.
-        use tokio::io::AsyncSeekExt;
-        file.seek(std::io::SeekFrom::Start(0))
-            .await
-            .map_err(Error::Io)?;
-
-        Ok((file, output_size, footer_bytes))
+        Ok(dirty_names)
     }
 }
 
@@ -829,7 +769,9 @@ impl ArrayFile {
         if let Some(sd) = &self.store_dir {
             let s_storage =
                 ObjectStoreBackend::new(Arc::clone(&sd.store), stats_path(&sd.base_path));
-            s_storage.write(bytes::Bytes::from(new_stats.serialize()?)).await?;
+            s_storage
+                .write(bytes::Bytes::from(new_stats.serialize()?))
+                .await?;
         }
         self.stats = Some(new_stats);
         Ok(())

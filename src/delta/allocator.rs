@@ -94,10 +94,11 @@ impl DeltaAllocator {
 
     /// Returns the raw (uncompressed) bytes for the given allocation address.
     ///
-    /// Serves the current block from memory; for completed blocks it seeks
-    /// the output file, decompresses the block, and slices out the bytes.
-    pub fn fetch(&mut self, addr: &BlockAllocAddress) -> Option<Bytes> {
-        use std::io::{Read, Seek};
+    /// Serves the current block from memory; for completed blocks it reads
+    /// from the tempfile at the block's offset (positional read, no seek),
+    /// decompresses the block, and slices out the bytes.
+    pub fn fetch(&self, addr: &BlockAllocAddress) -> Option<Bytes> {
+        use std::os::unix::fs::FileExt;
 
         let block_id = addr.id().0;
         let off = addr.offset() as usize;
@@ -117,11 +118,8 @@ impl DeltaAllocator {
         let uncompressed_size = block.uncompressed_size as usize;
         let codec = block.codec.clone();
 
-        self.output_file
-            .seek(std::io::SeekFrom::Start(file_offset))
-            .ok()?;
         let mut compressed = vec![0u8; compressed_size];
-        self.output_file.read_exact(&mut compressed).ok()?;
+        self.output_file.read_exact_at(&mut compressed, file_offset).ok()?;
 
         let decompressed = decompress_by_id(&codec, &compressed, uncompressed_size).ok()?;
         let end = off + sz;
