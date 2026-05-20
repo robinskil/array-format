@@ -1,10 +1,10 @@
 [package]
 name = "array-format"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
-rkyv = { version = "0.8", features = ["bytecheck"] }
+rkyv = { version = "0.8", features = ["bytecheck", "pointer_width_64"] }
 moka = { version = "0.12", features = ["future"] }
 object_store = "0.13"
 bytes = "1"
