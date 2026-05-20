@@ -8,6 +8,40 @@ use crate::{
     codec::{CompressionCodec, decompress_by_id},
 };
 
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(
+    file: &std::fs::File,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Packs raw chunk bytes into compressed blocks.
 ///
 /// The current (unflushed) block is held in memory; completed blocks are
@@ -98,8 +132,6 @@ impl DeltaAllocator {
     /// from the tempfile at the block's offset (positional read, no seek),
     /// decompresses the block, and slices out the bytes.
     pub fn fetch(&self, addr: &BlockAllocAddress) -> Option<Bytes> {
-        use std::os::unix::fs::FileExt;
-
         let block_id = addr.id().0;
         let off = addr.offset() as usize;
         let sz = addr.size() as usize;
@@ -119,7 +151,7 @@ impl DeltaAllocator {
         let codec = block.codec.clone();
 
         let mut compressed = vec![0u8; compressed_size];
-        self.output_file.read_exact_at(&mut compressed, file_offset).ok()?;
+        read_exact_at(&self.output_file, &mut compressed, file_offset).ok()?;
 
         let decompressed = decompress_by_id(&codec, &compressed, uncompressed_size).ok()?;
         let end = off + sz;

@@ -34,6 +34,9 @@ pub struct FileConfig<C: CompressionCodec> {
     pub block_target_size: usize,
     pub cache_capacity: usize,
     pub io_cache_capacity: usize,
+    /// Optional pre-built cache to share across multiple `ArrayFile`s.
+    /// When `Some`, `cache_capacity` and `io_cache_capacity` are ignored.
+    pub cache: Option<Arc<DeltaCache>>,
 }
 
 impl<C: CompressionCodec> FileConfig<C> {
@@ -43,6 +46,7 @@ impl<C: CompressionCodec> FileConfig<C> {
             block_target_size: DEFAULT_BLOCK_TARGET_SIZE,
             cache_capacity: DEFAULT_CACHE_CAPACITY,
             io_cache_capacity: DEFAULT_IO_CACHE_CAPACITY,
+            cache: None,
         }
     }
 }
@@ -103,7 +107,7 @@ impl ArrayFile {
         path: object_store::path::Path,
         config: FileConfig<C>,
     ) -> Result<Self> {
-        let cache = make_cache(config.cache_capacity, config.io_cache_capacity);
+        let cache = resolve_cache(&config);
         let delta_path = Arc::<str>::from(path.as_ref());
         let storage =
             Arc::new(ObjectStoreBackend::new(Arc::clone(&store), path.clone())) as Arc<dyn Storage>;
@@ -129,7 +133,7 @@ impl ArrayFile {
         path: object_store::path::Path,
         config: FileConfig<C>,
     ) -> Result<Self> {
-        let cache = make_cache(config.cache_capacity, config.io_cache_capacity);
+        let cache = resolve_cache(&config);
         let delta_path = Arc::<str>::from(path.as_ref());
         let storage =
             Arc::new(ObjectStoreBackend::new(Arc::clone(&store), path.clone())) as Arc<dyn Storage>;
@@ -169,7 +173,7 @@ impl ArrayFile {
     pub async fn create_memory<C: CompressionCodec + 'static>(
         config: FileConfig<C>,
     ) -> Result<Self> {
-        let cache = make_cache(config.cache_capacity, config.io_cache_capacity);
+        let cache = resolve_cache(&config);
         let storage = Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>;
         write_empty_base(&*storage).await?;
         let base_delta =
@@ -780,13 +784,15 @@ impl ArrayFile {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn make_cache(block_capacity: usize, io_capacity: usize) -> Option<Arc<DeltaCache>> {
-    if block_capacity == 0 && io_capacity == 0 {
+fn resolve_cache<C: CompressionCodec>(config: &FileConfig<C>) -> Option<Arc<DeltaCache>> {
+    if let Some(c) = &config.cache {
+        Some(Arc::clone(c))
+    } else if config.cache_capacity == 0 && config.io_cache_capacity == 0 {
         None
     } else {
         Some(Arc::new(DeltaCache::new(
-            block_capacity as u64,
-            io_capacity as u64,
+            config.cache_capacity as u64,
+            config.io_cache_capacity as u64,
         )))
     }
 }
@@ -844,4 +850,28 @@ async fn write_empty_base(storage: &dyn Storage) -> Result<()> {
     let footer = Footer::new();
     let bytes = footer.serialize()?;
     storage.write(Bytes::from(bytes)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::NoCompression;
+
+    #[tokio::test]
+    async fn shared_cache_is_reused_across_files() {
+        let shared = Arc::new(DeltaCache::new(1024 * 1024, 0));
+
+        let mut cfg_a = FileConfig::new(NoCompression);
+        cfg_a.cache = Some(Arc::clone(&shared));
+        let file_a = ArrayFile::create_memory(cfg_a).await.unwrap();
+
+        let mut cfg_b = FileConfig::new(NoCompression);
+        cfg_b.cache = Some(Arc::clone(&shared));
+        let file_b = ArrayFile::create_memory(cfg_b).await.unwrap();
+
+        let a = file_a.cache.as_ref().expect("file_a has cache");
+        let b = file_b.cache.as_ref().expect("file_b has cache");
+        assert!(Arc::ptr_eq(a, &shared));
+        assert!(Arc::ptr_eq(b, &shared));
+    }
 }

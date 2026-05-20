@@ -34,7 +34,6 @@ pub mod storage;
 
 // ── Layer 3: Runtime ────────────────────────────────────────────────
 pub mod array;
-pub mod cache;
 pub mod file;
 pub mod stats;
 

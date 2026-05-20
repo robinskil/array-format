@@ -95,14 +95,42 @@ file.compact().await?
 ### `FileConfig`
 
 ```rust
-FileConfig::new(Lz4Codec)                // convenience; block_target_size=4MiB, cache=128
+FileConfig::new(Lz4Codec)                // defaults: 8 MiB blocks, 256 MiB block cache, 64 MiB I/O cache, no shared cache
 
 FileConfig {
     codec: ZstdCodec { level: 3 },
-    block_target_size: 4 * 1024 * 1024,
-    cache_capacity: 128,
+    block_target_size: 8 * 1024 * 1024,
+    cache_capacity: 256 * 1024 * 1024,
+    io_cache_capacity: 64 * 1024 * 1024,
+    cache: None,                         // see "Sharing a cache across files"
 }
 ```
+
+### Sharing a cache across files
+
+By default each `ArrayFile` builds its own `DeltaCache` sized by `cache_capacity` and
+`io_cache_capacity`. When you open many files, that adds up. Set `config.cache` to a
+pre-built `Arc<DeltaCache>` to put every file under one shared byte budget — entries
+are keyed by `(file_path, block_id)`, so files do not interfere with each other.
+
+```rust
+use std::sync::Arc;
+use array_format::{ArrayFile, DeltaCache, FileConfig, Lz4Codec};
+
+let shared = Arc::new(DeltaCache::new(
+    256 * 1024 * 1024,   // decompressed block budget
+    64 * 1024 * 1024,    // raw I/O slab budget (0 to disable)
+));
+
+let mut cfg = FileConfig::new(Lz4Codec);
+cfg.cache = Some(Arc::clone(&shared));
+
+let file_a = ArrayFile::open(store.clone(), path_a, cfg).await?;
+// reuse `shared` for file_b, file_c, ... — all bounded by the same budget
+```
+
+When `config.cache` is `Some`, the `cache_capacity` / `io_cache_capacity` fields are
+ignored for that file.
 
 ## Supported data types
 
