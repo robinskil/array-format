@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn numeric_roundtrip_f32() {
-        let values = vec![1.0f32, 2.5, 3.14];
+        let values = vec![1.0f32, 2.5, 3.5];
         let bytes = f32::encode_chunk(&values);
         assert_eq!(bytes.len(), 12);
         let back = f32::decode_chunk(&bytes);
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn fill_element_numeric() {
         assert_eq!(i32::fill_element(Some(&FillValue::Int(-7))), -7i32);
-        assert_eq!(f64::fill_element(Some(&FillValue::Float(3.14))), 3.14f64);
+        assert_eq!(f64::fill_element(Some(&FillValue::Float(1.5))), 1.5f64);
         assert_eq!(u8::fill_element(None), 0u8);
     }
 

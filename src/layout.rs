@@ -46,17 +46,12 @@ impl PartialEq for AttributeValue {
 }
 
 /// Controls the integer width used for attribute key/value dictionary indices.
-#[derive(Debug, Clone, Copy, PartialEq, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Archive, Serialize, Deserialize)]
 pub enum AttrIndexKind {
+    #[default]
     U16,
     U32,
     U64,
-}
-
-impl Default for AttrIndexKind {
-    fn default() -> Self {
-        Self::U16
-    }
 }
 
 /// Per-array attribute entries as pairs of dictionary indices.

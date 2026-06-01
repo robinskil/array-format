@@ -14,11 +14,19 @@
 ## Quick start
 
 ```rust
-use array_format::{File, FileConfig, Lz4Codec};
+use std::sync::Arc;
+use array_format::{ArrayFile, FileConfig, Lz4Codec};
 use ndarray::Array;
+use object_store::{ObjectStore, local::LocalFileSystem};
+
+// Back the file with any object_store backend
+let store = Arc::new(LocalFileSystem::new_with_prefix("/data")?) as Arc<dyn ObjectStore>;
+// `path` is the base file (must end in `.af`), not a directory. Sidecars and
+// stats are written next to it in the same prefix: signal.1.af, signal.stats, …
+let path = object_store::path::Path::from("signal.af");
 
 // Create a new file
-let mut file = File::create(path, FileConfig::new(Lz4Codec)).await?;
+let mut file = ArrayFile::create(store, path, FileConfig::new(Lz4Codec)).await?;
 
 // Define and write a 1-D f32 array
 file.define_array::<f32>("signal", vec!["t".into()], vec![1024], None, None)?;
@@ -46,7 +54,7 @@ let out = file.read_array::<String>("labels", vec![], vec![]).await?;
 Opening a file discovers the base file and all sidecars:
 
 ```text
-mydata.af        ← base (overlay_index 0, written by File::create)
+mydata.af        ← base (overlay_index 0, written by ArrayFile::create)
 mydata.1.af      ← first flush
 mydata.2.af      ← second flush
 ...
@@ -65,12 +73,12 @@ After compact:
 ## File API
 
 ```rust
-// On-disk
-File::create(path, config).await?
-File::open(path, config).await?           // base + any sidecars
+// On-disk — store: Arc<dyn ObjectStore>, path: object_store::path::Path
+ArrayFile::create(store, path, config).await?
+ArrayFile::open(store, path, config).await?   // base + any sidecars
 
 // In-memory (for testing)
-File::create_memory(config).await?
+ArrayFile::create_memory(config).await?
 file.flush_memory(&storage).await?
 
 // Schema
@@ -86,6 +94,9 @@ file.read_array::<T>(name, start, shape).await?   // vec![], vec![] for full arr
 // Attributes
 file.set_attribute(name, key, AttributeValue::String("m/s".into()))?
 file.get_attribute(name, key)?
+
+// Statistics (min/max/null_count/row_count, refreshed on flush & compact)
+file.array_stats(name)                    // Option<&ArrayStats>
 
 // Flush and compact
 file.flush().await?
@@ -274,15 +285,55 @@ file.compact().await?;
 assert_eq!(file.num_layers(), 1);
 ```
 
+## Statistics
+
+Every array carries aggregate statistics, recomputed automatically on `flush()` and `compact()` and persisted to a `{stem}.stats` sidecar (same rkyv + trailer format as the footer, magic `b"ARST"`). On `open()` they are loaded if present; a missing or unreadable stats file is not an error — `array_stats` simply returns `None` until the next flush.
+
+```rust
+file.flush().await?;                       // computes & writes {stem}.stats
+
+if let Some(s) = file.array_stats("signal") {
+    println!("{:?} .. {:?}", s.min, s.max);
+    println!("{} of {} are fill/unwritten", s.null_count, s.row_count);
+}
+```
+
+`ArrayStats` covers all chunks of one array:
+
+| Field         | Meaning                                                                 |
+| ------------- | ----------------------------------------------------------------------- |
+| `name`        | Array name                                                              |
+| `min` / `max` | Global min/max across all chunks; `None` for dtypes without ordering    |
+| `null_count`  | Elements equal to the fill value, including positions never written     |
+| `row_count`   | Total element count across all chunks (the product of the array shape)  |
+
+`min`/`max` are typed via `StatValue`, which mirrors the dtype families:
+
+```rust
+pub enum StatValue {
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Bytes(Vec<u8>),     // String / Binary, compared lexicographically
+    TimestampNs(i64),
+}
+```
+
+Stats are computed incrementally: a flush only recomputes arrays whose chunks were dirtied in that flush and merges them with the previously stored stats, so unchanged arrays are not re-scanned.
+
 ## In-memory usage
 
 ```rust
-use array_format::{File, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
 
-let mut file = File::create_memory(FileConfig::new(NoCompression)).await?;
+let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression)).await?;
 file.define_array::<i32>("data", vec!["x".into()], vec![10], None, None)?;
 // ... write ...
 
 let storage = InMemoryStorage::new();
 file.flush_memory(&storage).await?;
 ```
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

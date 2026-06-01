@@ -55,7 +55,7 @@ async fn scalar_array_roundtrip() {
     // Fixed-width scalar (f64).
     file.define_array::<f64>("pi", vec![], vec![], None, None)
         .unwrap();
-    let pi = Array::from_shape_vec(IxDyn(&[]), vec![3.14f64]).unwrap();
+    let pi = Array::from_shape_vec(IxDyn(&[]), vec![std::f64::consts::PI]).unwrap();
     file.write_array("pi", vec![], pi.view()).await.unwrap();
 
     // Variable-length scalar (String) — exercises the offset-buffer encoder with N=1.
@@ -76,7 +76,7 @@ async fn scalar_array_roundtrip() {
     let pi_back = file.read_array::<f64>("pi", vec![], vec![]).await.unwrap();
     assert_eq!(pi_back.ndim(), 0);
     assert_eq!(pi_back.len(), 1);
-    assert_eq!(pi_back[IxDyn(&[])], 3.14f64);
+    assert_eq!(pi_back[IxDyn(&[])], std::f64::consts::PI);
 
     let greeting_back = file
         .read_array::<String>("greeting", vec![], vec![])

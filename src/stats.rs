@@ -45,15 +45,9 @@ impl ArrayStats {
 /// Stored in `{stem}.stats` alongside the `.af` file using the same
 /// rkyv + trailer format as the footer:
 /// `[rkyv_bytes][size: u64 LE][MAGIC: b"ARST"]`
-#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Archive, Serialize, Deserialize)]
 pub struct StatsFile {
     pub arrays: Vec<ArrayStats>,
-}
-
-impl Default for StatsFile {
-    fn default() -> Self {
-        Self { arrays: Vec::new() }
-    }
 }
 
 impl StatsFile {
@@ -308,7 +302,7 @@ fn bool_partial(
     let mut max: Option<u8> = None;
     let mut null_count = 0u64;
     for &e in bytes {
-        if fill_val.map_or(false, |f| e == f) {
+        if fill_val == Some(e) {
             null_count += 1;
         } else {
             min = Some(min.map_or(e, |m| m.min(e)));
@@ -346,7 +340,7 @@ fn vlen_partial(
             u32::from_le_bytes(bytes[(i + 1) * 4..(i + 1) * 4 + 4].try_into().unwrap())
                 as usize;
         let val = &bytes[values_base + start..values_base + end];
-        if fill_bytes.map_or(false, |f| val == f) {
+        if fill_bytes == Some(val) {
             null_count += 1;
         } else {
             match &mut min {
@@ -384,7 +378,7 @@ fn timestamp_partial(
     let mut null_count = 0u64;
     for i in 0..n {
         let e = i64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
-        if fill_val.map_or(false, |f| e == f) {
+        if fill_val == Some(e) {
             null_count += 1;
         } else {
             min = Some(min.map_or(e, |m| m.min(e)));

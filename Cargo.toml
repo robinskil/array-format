@@ -2,6 +2,16 @@
 name = "array-format"
 version = "0.8.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A block-backed, footer-indexed container for storing multiple n-dimensional arrays in a single file, with a delta/overlay architecture and pluggable compression and storage backends."
+documentation = "https://docs.rs/array-format"
+homepage = "https://github.com/robinskil/array-format"
+repository = "https://github.com/robinskil/array-format"
+readme = "README.md"
+license = "Apache-2.0"
+keywords = ["array", "ndarray", "tensor", "storage", "compression"]
+categories = ["data-structures", "encoding", "filesystem"]
+exclude = ["/target", "/.github", "/benches"]
 
 [dependencies]
 rkyv = { version = "0.8", features = ["bytecheck", "pointer_width_64"] }
@@ -15,7 +25,7 @@ zstd = "0.13"
 lz4_flex = "0.11"
 ndarray = "0.17"
 tempfile = "3"
-indexmap = "*"
+indexmap = "2"
 zerocopy = { version = "0.8", features = ["derive"] }
 
 [dev-dependencies]
