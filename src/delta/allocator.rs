@@ -15,11 +15,7 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::
 }
 
 #[cfg(windows)]
-fn read_exact_at(
-    file: &std::fs::File,
-    mut buf: &mut [u8],
-    mut offset: u64,
-) -> std::io::Result<()> {
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
@@ -120,7 +116,9 @@ impl DeltaAllocator {
             uncompressed_size,
             codec: self.codec.id(),
         });
-        self.output_file.write_all(&compressed).expect("output_file write failed");
+        self.output_file
+            .write_all(&compressed)
+            .expect("output_file write failed");
         self.file_offset += compressed_size;
         self.current_block_id += 1;
         self.current_block.clear();
@@ -169,7 +167,11 @@ impl DeltaAllocator {
         file.seek(std::io::SeekFrom::Start(0))
             .await
             .expect("output_file seek failed");
-        AllocatorOutput { file, output_size, blocks: self.completed_blocks }
+        AllocatorOutput {
+            file,
+            output_size,
+            blocks: self.completed_blocks,
+        }
     }
 }
 
@@ -219,7 +221,10 @@ mod tests {
     fn allocator_flush_triggered_at_target_size() {
         let mut alloc = DeltaAllocator::new(codec(), 8);
         let addr = alloc.allocate(&[1u8; 8]);
-        assert_eq!(alloc.current_block_id, 1, "expected flush to advance block_id");
+        assert_eq!(
+            alloc.current_block_id, 1,
+            "expected flush to advance block_id"
+        );
         assert_eq!(addr.id(), BlockId(0));
     }
 
@@ -229,7 +234,9 @@ mod tests {
         let mut alloc = DeltaAllocator::new(codec(), 8);
         let addr = alloc.allocate(&payload);
         alloc.allocate(&[0u8; 4]);
-        let bytes = alloc.fetch(&addr).expect("fetch from completed block returned None");
+        let bytes = alloc
+            .fetch(&addr)
+            .expect("fetch from completed block returned None");
         assert_eq!(bytes.as_ref(), &payload);
     }
 

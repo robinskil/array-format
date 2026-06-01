@@ -8,12 +8,14 @@
 //! cargo run --example 08_statistics
 //! ```
 
+use array_format::{ArrayFile, FileConfig, FillValue, InMemoryStorage, NoCompression, StatValue};
 use ndarray::Array;
-use array_format::{ArrayFile, FillValue, FileConfig, InMemoryStorage, NoCompression, StatValue};
 
 #[tokio::main]
 async fn main() {
-    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression)).await.unwrap();
+    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
+        .await
+        .unwrap();
 
     // Define a sensor array where -999 signals a missing reading.
     file.define_array::<i32>(
@@ -37,10 +39,10 @@ async fn main() {
 
     let s = file.array_stats("sensor").unwrap();
     println!("After first flush:");
-    println!("  min        = {:?}", s.min);      // Int(23) — fill value excluded from range
-    println!("  max        = {:?}", s.max);      // Int(31)
+    println!("  min        = {:?}", s.min); // Int(23) — fill value excluded from range
+    println!("  max        = {:?}", s.max); // Int(31)
     println!("  null_count = {}", s.null_count); // 5: 1 fill match + 4 unwritten elements
-    println!("  row_count  = {}", s.row_count);  // 8: total array capacity
+    println!("  row_count  = {}", s.row_count); // 8: total array capacity
     assert_eq!(s.null_count, 5);
     assert_eq!(s.row_count, 8);
 
@@ -56,10 +58,10 @@ async fn main() {
 
     let s = file.array_stats("sensor").unwrap();
     println!("\nAfter second flush (all 8 elements written):");
-    println!("  min        = {:?}", s.min);      // Int(19)
-    println!("  max        = {:?}", s.max);      // Int(31)
+    println!("  min        = {:?}", s.min); // Int(19)
+    println!("  max        = {:?}", s.max); // Int(31)
     println!("  null_count = {}", s.null_count); // 1: just the -999 fill match
-    println!("  row_count  = {}", s.row_count);  // 8
+    println!("  row_count  = {}", s.row_count); // 8
 
     // Overwrite the first chunk with clean data — the missing value is gone.
     file.write_array(

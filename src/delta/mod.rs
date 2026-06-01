@@ -1,5 +1,5 @@
-pub mod cache;
 mod allocator;
+pub mod cache;
 mod immutable;
 mod mutable;
 

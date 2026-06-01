@@ -168,7 +168,9 @@ impl Delta<DeltaMutable> {
             .chunks
             .iter()
             .find(|e| e.coord.as_slice() == coord)?;
-        self.inner.allocator.fetch(&alloc_addr_from_chunk(&entry.address))
+        self.inner
+            .allocator
+            .fetch(&alloc_addr_from_chunk(&entry.address))
     }
 
     /// Commits this delta: compresses all buffered blocks, serializes the
@@ -305,7 +307,10 @@ mod tests {
         .unwrap();
         d.write_raw_chunk("temps", vec![0], &raw).unwrap();
         let storage = Arc::new(InMemoryStorage::new());
-        let immutable = d.commit(storage, Arc::from("test"), None, "base").await.unwrap();
+        let immutable = d
+            .commit(storage, Arc::from("test"), None, "base")
+            .await
+            .unwrap();
         let meta = immutable
             .array_meta("temps")
             .expect("array not found after commit");
@@ -324,7 +329,10 @@ mod tests {
             d.write_raw_chunk("m", vec![i as u32 * 8], chunk).unwrap();
         }
         let storage = Arc::new(InMemoryStorage::new());
-        let immutable = d.commit(storage, Arc::from("test"), None, "base").await.unwrap();
+        let immutable = d
+            .commit(storage, Arc::from("test"), None, "base")
+            .await
+            .unwrap();
         for (i, expected) in chunks.iter().enumerate() {
             let bytes = immutable
                 .read_raw_chunk("m", &[i as u32 * 8])

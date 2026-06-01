@@ -57,7 +57,12 @@ impl Delta<DeltaImmutable> {
     /// Returns the raw (uncompressed) bytes for the chunk at `coord`, or
     /// `None` if this delta does not have that chunk.
     pub async fn read_raw_chunk(&self, name: &str, coord: &[u32]) -> Result<Option<Bytes>> {
-        let meta = match self.inner.array_index.get(name).map(|&i| &self.inner.footer.arrays[i]) {
+        let meta = match self
+            .inner
+            .array_index
+            .get(name)
+            .map(|&i| &self.inner.footer.arrays[i])
+        {
             Some(m) => m,
             None => return Ok(None),
         };

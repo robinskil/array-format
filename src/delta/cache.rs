@@ -114,7 +114,10 @@ impl DeltaCache {
         } else {
             None
         };
-        Self { block_cache, io_cache }
+        Self {
+            block_cache,
+            io_cache,
+        }
     }
 
     /// Returns the decompressed block, loading from `storage` on a cache miss.
@@ -138,12 +141,10 @@ impl DeltaCache {
                 // Only use the I/O slab cache when the block fits in a single slab.
                 // Multi-slab blocks (compressed_size > IO_SLAB_SIZE) are read directly:
                 // splitting them across N slab loads adds overhead with no coalescing benefit.
-                let same_slab = range.start / IO_SLAB_SIZE
-                    == (range.end.saturating_sub(1)) / IO_SLAB_SIZE;
+                let same_slab =
+                    range.start / IO_SLAB_SIZE == (range.end.saturating_sub(1)) / IO_SLAB_SIZE;
                 let raw = match &io_cache {
-                    Some(io) if same_slab => {
-                        io.read_range(&path_for_io, range, storage).await?
-                    }
+                    Some(io) if same_slab => io.read_range(&path_for_io, range, storage).await?,
                     _ => storage.read_range(range).await?,
                 };
                 let decompressed = if codec_id == CodecId::None {
@@ -189,7 +190,10 @@ mod tests {
         let cache = DeltaCache::new(1024, 0);
         let meta = make_block_meta(0, 0, 100);
 
-        let result = cache.get_or_load(&Arc::from("p"), &meta, &storage).await.unwrap();
+        let result = cache
+            .get_or_load(&Arc::from("p"), &meta, &storage)
+            .await
+            .unwrap();
         assert_eq!(&result[..], &data[..]);
     }
 
@@ -200,8 +204,14 @@ mod tests {
         let cache = DeltaCache::new(4096, 0);
         let meta = make_block_meta(0, 0, 200);
 
-        let first = cache.get_or_load(&Arc::from("p"), &meta, &storage).await.unwrap();
-        let second = cache.get_or_load(&Arc::from("p"), &meta, &storage).await.unwrap();
+        let first = cache
+            .get_or_load(&Arc::from("p"), &meta, &storage)
+            .await
+            .unwrap();
+        let second = cache
+            .get_or_load(&Arc::from("p"), &meta, &storage)
+            .await
+            .unwrap();
         assert_eq!(first, second);
         assert_eq!(&first[..], &data[..]);
     }
@@ -218,7 +228,10 @@ mod tests {
         let io = IoCache::new(4 * 1024 * 1024);
 
         let range = 100u64..500u64;
-        let result = io.read_range(&Arc::from("p"), range.clone(), &storage).await.unwrap();
+        let result = io
+            .read_range(&Arc::from("p"), range.clone(), &storage)
+            .await
+            .unwrap();
         assert_eq!(&result[..], &data[100..500]);
     }
 
@@ -263,7 +276,10 @@ mod tests {
         let cache = DeltaCache::new(4096, 2 * 1024 * 1024);
         let meta = make_block_meta(0, 0, 300);
 
-        let result = cache.get_or_load(&Arc::from("p"), &meta, &storage).await.unwrap();
+        let result = cache
+            .get_or_load(&Arc::from("p"), &meta, &storage)
+            .await
+            .unwrap();
         assert_eq!(&result[..], &data[..]);
     }
 }

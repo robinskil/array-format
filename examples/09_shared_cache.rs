@@ -35,7 +35,9 @@ async fn main() {
         let mut cfg = FileConfig::new(Lz4Codec);
         cfg.cache = Some(Arc::clone(&shared));
 
-        let mut file = ArrayFile::create(Arc::clone(&store), path, cfg).await.unwrap();
+        let mut file = ArrayFile::create(Arc::clone(&store), path, cfg)
+            .await
+            .unwrap();
         file.define_array::<f32>("v", vec!["i".into()], vec![4], None, None)
             .unwrap();
         let data = Array::from_vec(vec![i as f32; 4]).into_dyn();
@@ -49,7 +51,11 @@ async fn main() {
         let path = object_store::path::Path::from(*name);
         let mut cfg = FileConfig::new(Lz4Codec);
         cfg.cache = Some(Arc::clone(&shared));
-        files.push(ArrayFile::open(Arc::clone(&store), path, cfg).await.unwrap());
+        files.push(
+            ArrayFile::open(Arc::clone(&store), path, cfg)
+                .await
+                .unwrap(),
+        );
     }
 
     for (i, file) in files.iter().enumerate() {
@@ -58,5 +64,8 @@ async fn main() {
     }
 
     // The Arc is reference-counted: one cache, three readers + the local handle.
-    println!("shared cache Arc strong count: {}", Arc::strong_count(&shared));
+    println!(
+        "shared cache Arc strong count: {}",
+        Arc::strong_count(&shared)
+    );
 }

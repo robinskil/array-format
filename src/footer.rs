@@ -220,7 +220,11 @@ mod tests {
                         chunk_shape: vec![1000, 1000],
                         chunks: vec![ChunkEntry {
                             coord: vec![0, 0],
-                            address: ChunkAddress { block_id: BlockId(0), offset: 0, size: 4000 },
+                            address: ChunkAddress {
+                                block_id: BlockId(0),
+                                offset: 0,
+                                size: 4000,
+                            },
                         }],
                     },
                 },

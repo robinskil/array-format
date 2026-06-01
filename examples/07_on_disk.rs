@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use ndarray::Array;
 use array_format::{ArrayFile, FileConfig, Lz4Codec};
+use ndarray::Array;
 use object_store::local::LocalFileSystem;
 
 #[tokio::main]
@@ -19,7 +19,10 @@ async fn main() {
 
     // Create and write
     {
-        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), FileConfig::new(Lz4Codec)).await.unwrap();
+        let mut file =
+            ArrayFile::create(Arc::clone(&store), path.clone(), FileConfig::new(Lz4Codec))
+                .await
+                .unwrap();
 
         file.define_array::<f32>(
             "matrix",
@@ -27,10 +30,13 @@ async fn main() {
             vec![4, 4],
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let data: Vec<f32> = (0..16).map(|x| x as f32 * 0.5).collect();
         let nd = Array::from_shape_vec(ndarray::IxDyn(&[4, 4]), data).unwrap();
-        file.write_array("matrix", vec![0, 0], nd.view()).await.unwrap();
+        file.write_array("matrix", vec![0, 0], nd.view())
+            .await
+            .unwrap();
         file.flush().await.unwrap();
 
         println!("wrote {} array(s)", file.list_arrays().len());
@@ -38,9 +44,14 @@ async fn main() {
 
     // Re-open and read
     {
-        let file = ArrayFile::open(Arc::clone(&store), path, FileConfig::new(Lz4Codec)).await.unwrap();
-        let out = file.read_array::<f32>("matrix", vec![], vec![]).await.unwrap();
-        println!("matrix[3, 2] = {}", out[[3, 2]]);  // 3*4 + 2 = 14 → 7.0
+        let file = ArrayFile::open(Arc::clone(&store), path, FileConfig::new(Lz4Codec))
+            .await
+            .unwrap();
+        let out = file
+            .read_array::<f32>("matrix", vec![], vec![])
+            .await
+            .unwrap();
+        println!("matrix[3, 2] = {}", out[[3, 2]]); // 3*4 + 2 = 14 → 7.0
         assert!((out[[3, 2]] - 7.0).abs() < 1e-6);
     }
 }

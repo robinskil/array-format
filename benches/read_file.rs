@@ -32,7 +32,9 @@ async fn prepare_file_on_disk<C: array_format::CompressionCodec + Clone + 'stati
         block_target_size: BLOCK_TARGET,
         ..FileConfig::new(codec)
     };
-    let mut file = ArrayFile::create(Arc::clone(&store), path, config).await.unwrap();
+    let mut file = ArrayFile::create(Arc::clone(&store), path, config)
+        .await
+        .unwrap();
     file.define_array::<u8>(
         "data",
         vec!["x".into(), "y".into()],
@@ -42,7 +44,9 @@ async fn prepare_file_on_disk<C: array_format::CompressionCodec + Clone + 'stati
     )
     .unwrap();
     for i in 0..NUM_CHUNKS as usize {
-        let chunk = ndarray::Array::from_shape_vec(ndarray::IxDyn(&[1, CHUNK_SIZE]), chunk_data.to_vec()).unwrap();
+        let chunk =
+            ndarray::Array::from_shape_vec(ndarray::IxDyn(&[1, CHUNK_SIZE]), chunk_data.to_vec())
+                .unwrap();
         file.write_array("data", vec![i, 0], chunk.view())
             .await
             .unwrap();
@@ -55,8 +59,8 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let total_bytes = (CHUNK_SIZE * NUM_CHUNKS as usize) as u64;
     let tmp_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap())
-        as Arc<dyn ObjectStore>;
+    let store =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap()) as Arc<dyn ObjectStore>;
 
     let mut group = c.benchmark_group("file_read_all_chunks");
     group.throughput(Throughput::Bytes(total_bytes));
@@ -67,7 +71,12 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     macro_rules! bench_codec {
         ($codec:expr, $name:literal, $data:expr, $filename:literal) => {{
             let path = object_store::path::Path::from($filename);
-            rt.block_on(prepare_file_on_disk(Arc::clone(&store), path.clone(), $codec, $data));
+            rt.block_on(prepare_file_on_disk(
+                Arc::clone(&store),
+                path.clone(),
+                $codec,
+                $data,
+            ));
             let s = Arc::clone(&store);
             group.bench_function(BenchmarkId::new($name, "patterned"), |b| {
                 let store = Arc::clone(&s);
@@ -94,7 +103,12 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     bench_codec!(Lz4Codec, "lz4", &patterned, "lz4_pat.af");
 
     let path_no_rnd = object_store::path::Path::from("none_rnd.af");
-    rt.block_on(prepare_file_on_disk(Arc::clone(&store), path_no_rnd.clone(), NoCompression, &random));
+    rt.block_on(prepare_file_on_disk(
+        Arc::clone(&store),
+        path_no_rnd.clone(),
+        NoCompression,
+        &random,
+    ));
     group.bench_function(BenchmarkId::new("none", "random"), |b| {
         let store = Arc::clone(&store);
         let path = path_no_rnd.clone();
@@ -102,7 +116,9 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression)).await.unwrap();
+                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression))
+                    .await
+                    .unwrap();
                 for i in 0..NUM_CHUNKS as usize {
                     file.read_array::<u8>("data", vec![i, 0], vec![1, CHUNK_SIZE])
                         .await
@@ -113,7 +129,12 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     });
 
     let path_zstd_rnd = object_store::path::Path::from("zstd_rnd.af");
-    rt.block_on(prepare_file_on_disk(Arc::clone(&store), path_zstd_rnd.clone(), ZstdCodec::default(), &random));
+    rt.block_on(prepare_file_on_disk(
+        Arc::clone(&store),
+        path_zstd_rnd.clone(),
+        ZstdCodec::default(),
+        &random,
+    ));
     group.bench_function(BenchmarkId::new("zstd", "random"), |b| {
         let store = Arc::clone(&store);
         let path = path_zstd_rnd.clone();
@@ -121,7 +142,9 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression)).await.unwrap();
+                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression))
+                    .await
+                    .unwrap();
                 for i in 0..NUM_CHUNKS as usize {
                     file.read_array::<u8>("data", vec![i, 0], vec![1, CHUNK_SIZE])
                         .await
@@ -132,7 +155,12 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
     });
 
     let path_lz4_rnd = object_store::path::Path::from("lz4_rnd.af");
-    rt.block_on(prepare_file_on_disk(Arc::clone(&store), path_lz4_rnd.clone(), Lz4Codec, &random));
+    rt.block_on(prepare_file_on_disk(
+        Arc::clone(&store),
+        path_lz4_rnd.clone(),
+        Lz4Codec,
+        &random,
+    ));
     group.bench_function(BenchmarkId::new("lz4", "random"), |b| {
         let store = Arc::clone(&store);
         let path = path_lz4_rnd.clone();
@@ -140,7 +168,9 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression)).await.unwrap();
+                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression))
+                    .await
+                    .unwrap();
                 for i in 0..NUM_CHUNKS as usize {
                     file.read_array::<u8>("data", vec![i, 0], vec![1, CHUNK_SIZE])
                         .await
@@ -156,8 +186,8 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
 fn bench_file_single_chunk_read(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let tmp_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap())
-        as Arc<dyn ObjectStore>;
+    let store =
+        Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap()) as Arc<dyn ObjectStore>;
 
     let mut group = c.benchmark_group("file_single_chunk_read");
     group.throughput(Throughput::Bytes(CHUNK_SIZE as u64));
@@ -165,7 +195,12 @@ fn bench_file_single_chunk_read(c: &mut Criterion) {
     let patterned = patterned_chunk();
 
     let path_no = object_store::path::Path::from("single_none.af");
-    rt.block_on(prepare_file_on_disk(Arc::clone(&store), path_no.clone(), NoCompression, &patterned));
+    rt.block_on(prepare_file_on_disk(
+        Arc::clone(&store),
+        path_no.clone(),
+        NoCompression,
+        &patterned,
+    ));
     group.bench_function("none/uncached", |b| {
         let store = Arc::clone(&store);
         let path = path_no.clone();
@@ -186,7 +221,12 @@ fn bench_file_single_chunk_read(c: &mut Criterion) {
     });
 
     let path_zstd = object_store::path::Path::from("single_zstd.af");
-    rt.block_on(prepare_file_on_disk(Arc::clone(&store), path_zstd.clone(), ZstdCodec::default(), &patterned));
+    rt.block_on(prepare_file_on_disk(
+        Arc::clone(&store),
+        path_zstd.clone(),
+        ZstdCodec::default(),
+        &patterned,
+    ));
     group.bench_function("zstd/uncached", |b| {
         let store = Arc::clone(&store);
         let path = path_zstd.clone();
@@ -207,7 +247,12 @@ fn bench_file_single_chunk_read(c: &mut Criterion) {
     });
 
     let path_lz4 = object_store::path::Path::from("single_lz4.af");
-    rt.block_on(prepare_file_on_disk(Arc::clone(&store), path_lz4.clone(), Lz4Codec, &patterned));
+    rt.block_on(prepare_file_on_disk(
+        Arc::clone(&store),
+        path_lz4.clone(),
+        Lz4Codec,
+        &patterned,
+    ));
     group.bench_function("lz4/uncached", |b| {
         let store = Arc::clone(&store);
         let path = path_lz4.clone();

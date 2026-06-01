@@ -25,8 +25,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::stream::{self, StreamExt};
 use array_format::{ArrayFile, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
+use futures::stream::{self, StreamExt};
 use object_store::{ObjectStore, local::LocalFileSystem};
 
 const ARRAY_COUNT: usize = 25_000;
@@ -82,8 +82,14 @@ async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
         let name = format!("arr_{i:05}");
         let values: Vec<i32> = vec![1; ELEMENTS_PER_ARRAY];
         let nd = ndarray::Array::from_vec(values).into_dyn();
-        file.define_array::<i32>(&name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY], None, None)
-            .unwrap();
+        file.define_array::<i32>(
+            &name,
+            vec!["x".into()],
+            vec![ELEMENTS_PER_ARRAY],
+            None,
+            None,
+        )
+        .unwrap();
         file.write_array(&name, vec![0], nd.view()).await.unwrap();
         names.push(name);
     }
@@ -132,7 +138,10 @@ async fn ensure_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
     file.flush().await.unwrap();
     file.compact().await.unwrap();
 
-    eprintln!("Write complete ({}).", humanize(ARRAY_COUNT * ELEMENTS_PER_ARRAY * 4));
+    eprintln!(
+        "Write complete ({}).",
+        humanize(ARRAY_COUNT * ELEMENTS_PER_ARRAY * 4)
+    );
     names
 }
 
@@ -168,7 +177,9 @@ fn main() {
         .build()
         .unwrap();
 
-    eprintln!("backend={backend}  codec={codec_arg}  iters={iters}  par={PARALLELISM}  conc={CONCURRENCY}");
+    eprintln!(
+        "backend={backend}  codec={codec_arg}  iters={iters}  par={PARALLELISM}  conc={CONCURRENCY}"
+    );
 
     match backend {
         "memory" => {
@@ -183,7 +194,13 @@ fn main() {
                 eprintln!("Starting {iters} read iteration(s)…");
                 for i in 1..=iters {
                     eprintln!("  iter {i}/{iters}");
-                    read_parallel_concurrent(Arc::clone(&file), names.clone(), PARALLELISM, CONCURRENCY).await;
+                    read_parallel_concurrent(
+                        Arc::clone(&file),
+                        names.clone(),
+                        PARALLELISM,
+                        CONCURRENCY,
+                    )
+                    .await;
                 }
             });
         }
@@ -201,15 +218,20 @@ fn main() {
             let full_path = parent.join(&filename);
             let obj_path = object_store::path::Path::from(filename.as_str());
 
-            let store = Arc::new(
-                LocalFileSystem::new_with_prefix(&parent).unwrap(),
-            ) as Arc<dyn ObjectStore>;
+            let store = Arc::new(LocalFileSystem::new_with_prefix(&parent).unwrap())
+                as Arc<dyn ObjectStore>;
 
             rt.block_on(async {
                 let names = if use_lz4 {
                     ensure_on_disk(Arc::clone(&store), obj_path.clone(), &full_path, Lz4Codec).await
                 } else {
-                    ensure_on_disk(Arc::clone(&store), obj_path.clone(), &full_path, NoCompression).await
+                    ensure_on_disk(
+                        Arc::clone(&store),
+                        obj_path.clone(),
+                        &full_path,
+                        NoCompression,
+                    )
+                    .await
                 };
 
                 let cfg = FileConfig {
@@ -217,13 +239,21 @@ fn main() {
                     ..FileConfig::new(NoCompression)
                 };
                 let file = Arc::new(
-                    ArrayFile::open(Arc::clone(&store), obj_path, cfg).await.unwrap(),
+                    ArrayFile::open(Arc::clone(&store), obj_path, cfg)
+                        .await
+                        .unwrap(),
                 );
 
                 eprintln!("Starting {iters} read iteration(s)…");
                 for i in 1..=iters {
                     eprintln!("  iter {i}/{iters}");
-                    read_parallel_concurrent(Arc::clone(&file), names.clone(), PARALLELISM, CONCURRENCY).await;
+                    read_parallel_concurrent(
+                        Arc::clone(&file),
+                        names.clone(),
+                        PARALLELISM,
+                        CONCURRENCY,
+                    )
+                    .await;
                 }
             });
 

@@ -37,7 +37,9 @@ async fn prepare_file<C: array_format::CompressionCodec + Clone + 'static>(
     )
     .unwrap();
     for i in 0..NUM_CHUNKS as usize {
-        let chunk = ndarray::Array::from_shape_vec(ndarray::IxDyn(&[1, CHUNK_SIZE]), chunk_data.to_vec()).unwrap();
+        let chunk =
+            ndarray::Array::from_shape_vec(ndarray::IxDyn(&[1, CHUNK_SIZE]), chunk_data.to_vec())
+                .unwrap();
         file.write_array("data", vec![i, 0], chunk.view())
             .await
             .unwrap();

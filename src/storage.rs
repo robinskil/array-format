@@ -282,13 +282,16 @@ mod tests {
     async fn in_memory_multipart_streams_chunks() {
         let storage = InMemoryStorage::from_bytes(b"stale".to_vec());
         let mut writer = storage.write_multipart().await.unwrap();
-        writer.write_chunk(Bytes::from_static(b"hello "))
+        writer
+            .write_chunk(Bytes::from_static(b"hello "))
             .await
             .unwrap();
-        writer.write_chunk(Bytes::from_static(b"streaming "))
+        writer
+            .write_chunk(Bytes::from_static(b"streaming "))
             .await
             .unwrap();
-        writer.write_chunk(Bytes::from_static(b"world"))
+        writer
+            .write_chunk(Bytes::from_static(b"world"))
             .await
             .unwrap();
         writer.complete().await.unwrap();

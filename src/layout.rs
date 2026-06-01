@@ -269,7 +269,10 @@ mod tests {
     }
 
     fn chunk(coord: Vec<u32>, block: u32, offset: u32, size: u32) -> ChunkEntry {
-        ChunkEntry { coord, address: sample_addr(block, offset, size) }
+        ChunkEntry {
+            coord,
+            address: sample_addr(block, offset, size),
+        }
     }
 
     #[test]

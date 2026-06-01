@@ -36,7 +36,13 @@ pub struct ArrayStats {
 
 impl ArrayStats {
     pub(crate) fn new(name: String) -> Self {
-        Self { name, min: None, max: None, null_count: 0, row_count: 0 }
+        Self {
+            name,
+            min: None,
+            max: None,
+            null_count: 0,
+            row_count: 0,
+        }
     }
 }
 
@@ -83,8 +89,7 @@ impl StatsFile {
             return Err(Error::InvalidFooter("invalid stats magic".into()));
         }
         let size_start = magic_start - 8;
-        let size =
-            u64::from_le_bytes(data[size_start..magic_start].try_into().unwrap()) as usize;
+        let size = u64::from_le_bytes(data[size_start..magic_start].try_into().unwrap()) as usize;
         if size > size_start {
             return Err(Error::InvalidFooter("stats size exceeds data".into()));
         }
@@ -102,7 +107,9 @@ pub(crate) async fn read_stats_file(storage: &(dyn Storage + Sync)) -> Result<St
     if (file_size as usize) < TRAILER_SIZE {
         return Err(Error::InvalidFooter("stats file too short".into()));
     }
-    let trailer = storage.read_range(file_size - TRAILER_SIZE as u64..file_size).await?;
+    let trailer = storage
+        .read_range(file_size - TRAILER_SIZE as u64..file_size)
+        .await?;
     if trailer[8..] != MAGIC {
         return Err(Error::InvalidFooter("invalid stats magic".into()));
     }
@@ -128,8 +135,7 @@ macro_rules! int_partial {
         let mut max: Option<$ty> = None;
         let mut null_count = 0u64;
         for i in 0..n {
-            let e =
-                <$ty>::from_le_bytes($bytes[i * size..(i + 1) * size].try_into().unwrap());
+            let e = <$ty>::from_le_bytes($bytes[i * size..(i + 1) * size].try_into().unwrap());
             if fill_val.map_or(false, |f| e == f) {
                 null_count += 1;
             } else {
@@ -159,8 +165,7 @@ macro_rules! uint_partial {
         let mut max: Option<$ty> = None;
         let mut null_count = 0u64;
         for i in 0..n {
-            let e =
-                <$ty>::from_le_bytes($bytes[i * size..(i + 1) * size].try_into().unwrap());
+            let e = <$ty>::from_le_bytes($bytes[i * size..(i + 1) * size].try_into().unwrap());
             if fill_val.map_or(false, |f| e == f) {
                 null_count += 1;
             } else {
@@ -189,21 +194,31 @@ macro_rules! float_partial {
         let mut max: Option<$ty> = None;
         let mut null_count = 0u64;
         for i in 0..n {
-            let e =
-                <$ty>::from_le_bytes($bytes[i * size..(i + 1) * size].try_into().unwrap());
-            let is_fill = fill_val.map_or(false, |f: $ty| {
-                if f.is_nan() { e.is_nan() } else { e == f }
-            });
+            let e = <$ty>::from_le_bytes($bytes[i * size..(i + 1) * size].try_into().unwrap());
+            let is_fill =
+                fill_val.map_or(false, |f: $ty| if f.is_nan() { e.is_nan() } else { e == f });
             if is_fill {
                 null_count += 1;
             } else {
                 min = Some(match min {
                     None => e,
-                    Some(m) => if e.total_cmp(&m).is_lt() { e } else { m },
+                    Some(m) => {
+                        if e.total_cmp(&m).is_lt() {
+                            e
+                        } else {
+                            m
+                        }
+                    }
                 });
                 max = Some(match max {
                     None => e,
-                    Some(m) => if e.total_cmp(&m).is_gt() { e } else { m },
+                    Some(m) => {
+                        if e.total_cmp(&m).is_gt() {
+                            e
+                        } else {
+                            m
+                        }
+                    }
                 });
             }
         }
@@ -334,11 +349,9 @@ fn vlen_partial(
     let mut max: Option<Vec<u8>> = None;
     let mut null_count = 0u64;
     for i in 0..n {
-        let start =
-            u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+        let start = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
         let end =
-            u32::from_le_bytes(bytes[(i + 1) * 4..(i + 1) * 4 + 4].try_into().unwrap())
-                as usize;
+            u32::from_le_bytes(bytes[(i + 1) * 4..(i + 1) * 4 + 4].try_into().unwrap()) as usize;
         let val = &bytes[values_base + start..values_base + end];
         if fill_bytes == Some(val) {
             null_count += 1;
@@ -402,8 +415,7 @@ fn find_vlen_count(bytes: &[u8]) -> usize {
         if pos + 4 > bytes.len() {
             break;
         }
-        let off =
-            u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let off = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         if pos + 4 + off == bytes.len() {
             n += 1;
             break;
@@ -451,11 +463,8 @@ mod tests {
         // values: [3, 1, 4, 1, 5, 9], fill=1 — the two 1s count as nulls and are
         // excluded from min/max, so the range covers only non-fill elements.
         let bytes = i32_bytes(&[3, 1, 4, 1, 5, 9]);
-        let (min, max, null_count, row_count) = compute_chunk_partial(
-            &bytes,
-            &DType::Int32,
-            Some(&FillValue::Int(1)),
-        );
+        let (min, max, null_count, row_count) =
+            compute_chunk_partial(&bytes, &DType::Int32, Some(&FillValue::Int(1)));
         assert_eq!(min, Some(StatValue::Int(3)));
         assert_eq!(max, Some(StatValue::Int(9)));
         assert_eq!(null_count, 2); // two 1s
@@ -465,8 +474,7 @@ mod tests {
     #[test]
     fn i32_no_fill_value() {
         let bytes = i32_bytes(&[10, 20, 30]);
-        let (min, max, null_count, row_count) =
-            compute_chunk_partial(&bytes, &DType::Int32, None);
+        let (min, max, null_count, row_count) = compute_chunk_partial(&bytes, &DType::Int32, None);
         assert_eq!(min, Some(StatValue::Int(10)));
         assert_eq!(max, Some(StatValue::Int(30)));
         assert_eq!(null_count, 0);
@@ -476,11 +484,8 @@ mod tests {
     #[test]
     fn all_elements_equal_fill_value() {
         let bytes = i32_bytes(&[7, 7, 7]);
-        let (_, _, null_count, row_count) = compute_chunk_partial(
-            &bytes,
-            &DType::Int32,
-            Some(&FillValue::Int(7)),
-        );
+        let (_, _, null_count, row_count) =
+            compute_chunk_partial(&bytes, &DType::Int32, Some(&FillValue::Int(7)));
         assert_eq!(null_count, row_count);
         assert_eq!(row_count, 3);
     }
@@ -499,8 +504,7 @@ mod tests {
     #[test]
     fn string_lexicographic_min_max() {
         let bytes = string_bytes(&["banana", "apple", "cherry"]);
-        let (min, max, null_count, row_count) =
-            compute_chunk_partial(&bytes, &DType::String, None);
+        let (min, max, null_count, row_count) = compute_chunk_partial(&bytes, &DType::String, None);
         assert_eq!(min, Some(StatValue::Bytes(b"apple".to_vec())));
         assert_eq!(max, Some(StatValue::Bytes(b"cherry".to_vec())));
         assert_eq!(null_count, 0);
@@ -520,8 +524,20 @@ mod tests {
     #[test]
     fn merge_partial_aggregates_correctly() {
         let mut stats = ArrayStats::new("x".into());
-        merge_partial(&mut stats, Some(StatValue::Int(5)), Some(StatValue::Int(10)), 1, 3);
-        merge_partial(&mut stats, Some(StatValue::Int(2)), Some(StatValue::Int(8)), 0, 2);
+        merge_partial(
+            &mut stats,
+            Some(StatValue::Int(5)),
+            Some(StatValue::Int(10)),
+            1,
+            3,
+        );
+        merge_partial(
+            &mut stats,
+            Some(StatValue::Int(2)),
+            Some(StatValue::Int(8)),
+            0,
+            2,
+        );
         assert_eq!(stats.min, Some(StatValue::Int(2)));
         assert_eq!(stats.max, Some(StatValue::Int(10)));
         assert_eq!(stats.null_count, 1);
@@ -573,11 +589,8 @@ mod tests {
         // FillValue::Int is accepted as a fallback for the TimestampNs path,
         // so a value matching it still counts as a null.
         let bytes = i64_bytes(&[1, 2, 3]);
-        let (_min, _max, null_count, row_count) = compute_chunk_partial(
-            &bytes,
-            &DType::TimestampNs,
-            Some(&FillValue::Int(2)),
-        );
+        let (_min, _max, null_count, row_count) =
+            compute_chunk_partial(&bytes, &DType::TimestampNs, Some(&FillValue::Int(2)));
         assert_eq!(null_count, 1);
         assert_eq!(row_count, 3);
     }

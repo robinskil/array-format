@@ -110,7 +110,11 @@ impl CompressionCodec for Lz4Codec {
 ///
 /// This allows the reader to decompress blocks without requiring a statically
 /// known codec — the codec is inferred from the block metadata at read time.
-pub fn decompress_by_id(codec_id: &CodecId, data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
+pub fn decompress_by_id(
+    codec_id: &CodecId,
+    data: &[u8],
+    uncompressed_size: usize,
+) -> Result<Vec<u8>> {
     match codec_id {
         CodecId::None => NoCompression.decompress(data, uncompressed_size),
         CodecId::Named(name) => match name.as_str() {
