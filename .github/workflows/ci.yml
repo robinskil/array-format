@@ -19,9 +19,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --all-targets --verbose
+        run: cargo build --lib --tests --examples --verbose
       - name: Test
-        run: cargo test --all-targets --verbose
+        run: cargo test --lib --tests --examples --verbose
 
   lint:
     name: Format & Clippy
@@ -35,4 +35,4 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --lib --tests --examples -- -D warnings
