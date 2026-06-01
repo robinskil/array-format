@@ -1,15 +1,17 @@
 //! Storage backend trait and implementations.
 //!
-//! The [`Storage`] trait abstracts file I/O so the format can work with
-//! local files, object stores, or in-memory buffers. An
-//! [`ObjectStoreBackend`] adapter is provided for the `object_store` crate,
-//! and [`InMemoryStorage`] is provided for testing.
+//! The `Storage` trait is an internal abstraction over file I/O. Files are
+//! created and opened through any `object_store`-compatible backend (adapted by
+//! the internal `ObjectStoreBackend`); in-memory files use `object_store`'s
+//! `InMemory` backend. `InMemoryStorage` here is a lightweight crate-internal
+//! `Storage` implementation used only by unit tests.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+#[cfg(test)]
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
@@ -20,7 +22,7 @@ use crate::error::{Error, Result};
 /// chunks via [`write_chunk`](Self::write_chunk) and finalize with
 /// [`complete`](Self::complete); dropping the writer without calling `complete`
 /// aborts the upload.
-pub trait MultipartWriter: Send {
+pub(crate) trait MultipartWriter: Send {
     /// Appends `data` to the in-flight upload.
     fn write_chunk(&mut self, data: Bytes) -> BoxFuture<'_, Result<()>>;
 
@@ -31,13 +33,10 @@ pub trait MultipartWriter: Send {
 /// Async storage backend for reading and writing file data.
 ///
 /// All methods return [`BoxFuture`] so the trait is object-safe
-/// (`dyn Storage` is valid).
-///
-/// # Extensibility
-///
-/// Implement this trait to plug in custom storage backends (e.g. a
-/// distributed file system, an HTTP range-request backend, etc.).
-pub trait Storage: Send + Sync {
+/// (`dyn Storage` is valid). This is an internal abstraction; production files
+/// use the `object_store` adapter (`ObjectStoreBackend`), and unit tests use the
+/// `#[cfg(test)]`-only `InMemoryStorage`.
+pub(crate) trait Storage: Send + Sync {
     /// Reads the byte range `range` from the file.
     fn read_range(&self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>>;
 
@@ -60,11 +59,13 @@ pub trait Storage: Send + Sync {
 ///
 /// Wraps a `Vec<u8>` behind an `Arc<RwLock<..>>` so it can be shared
 /// across async tasks.
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct InMemoryStorage {
+pub(crate) struct InMemoryStorage {
     data: Arc<RwLock<Vec<u8>>>,
 }
 
+#[cfg(test)]
 impl InMemoryStorage {
     /// Creates a new empty in-memory store.
     pub fn new() -> Self {
@@ -81,12 +82,14 @@ impl InMemoryStorage {
     }
 }
 
+#[cfg(test)]
 impl Default for InMemoryStorage {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl Storage for InMemoryStorage {
     fn read_range(&self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
         Box::pin(async move {
@@ -130,11 +133,13 @@ impl Storage for InMemoryStorage {
     }
 }
 
+#[cfg(test)]
 struct InMemoryMultipart {
     data: Arc<RwLock<Vec<u8>>>,
     buf: Vec<u8>,
 }
 
+#[cfg(test)]
 impl MultipartWriter for InMemoryMultipart {
     fn write_chunk(&mut self, data: Bytes) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
@@ -157,7 +162,7 @@ impl MultipartWriter for InMemoryMultipart {
 /// Wraps any `ObjectStore` (local filesystem, S3, GCS, Azure, in-memory)
 /// and a [`Path`](object_store::path::Path) pointing to the target file.
 #[derive(Clone)]
-pub struct ObjectStoreBackend {
+pub(crate) struct ObjectStoreBackend {
     store: Arc<dyn object_store::ObjectStore>,
     path: object_store::path::Path,
 }

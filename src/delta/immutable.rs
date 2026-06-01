@@ -1,22 +1,30 @@
+//! Sealed delta layer: a read-only view over a flushed footer + data region.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
 
+#[cfg(test)]
+use crate::layout::ArrayMeta;
 use crate::{
     Error, Result,
     codec::decompress_by_id,
     footer::{Footer, read_footer},
-    layout::ArrayMeta,
     storage::Storage,
 };
 
 use super::{Delta, DeltaCache};
 
+/// A sealed, read-only delta layer backed by a flushed file.
 pub struct DeltaImmutable {
+    /// The decoded footer: the index of arrays and blocks in this layer.
     pub footer: Footer,
+    /// Storage backend the layer's bytes are read from.
     pub storage: Arc<dyn Storage>,
+    /// Path of the backing file within `storage`.
     pub path: Arc<str>,
+    /// Optional shared read cache for decompressed blocks.
     pub cache: Option<Arc<DeltaCache>>,
     /// Maps array name → index in `footer.arrays` for O(1) lookup.
     pub array_index: HashMap<String, usize>,
@@ -48,7 +56,8 @@ impl Delta<DeltaImmutable> {
     }
 
     /// Returns the array metadata for `name` if present and not deleted.
-    pub fn array_meta(&self, name: &str) -> Option<&ArrayMeta> {
+    #[cfg(test)]
+    pub(crate) fn array_meta(&self, name: &str) -> Option<&ArrayMeta> {
         let idx = self.inner.array_index.get(name)?;
         let a = &self.inner.footer.arrays[*idx];
         if a.deleted { None } else { Some(a) }

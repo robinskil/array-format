@@ -1,3 +1,9 @@
+//! Two-level read cache shared across the delta layers of a file.
+//!
+//! [`DeltaCache`] holds decompressed blocks (level 1) on top of an internal
+//! raw-bytes slab cache (level 2), so repeated reads avoid both storage round
+//! trips and redundant decompression.
+
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -123,7 +129,7 @@ impl DeltaCache {
     /// Returns the decompressed block, loading from `storage` on a cache miss.
     ///
     /// Concurrent requests for the same `(path, block_id)` are coalesced.
-    pub async fn get_or_load(
+    pub(crate) async fn get_or_load(
         &self,
         path: &Arc<str>,
         block_meta: &BlockMeta,

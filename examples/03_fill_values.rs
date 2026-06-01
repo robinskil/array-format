@@ -4,7 +4,7 @@
 //! cargo run --example 03_fill_values
 //! ```
 
-use array_format::{ArrayFile, FileConfig, FillValue, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, FillValue, NoCompression};
 use ndarray::Array;
 
 #[tokio::main]
@@ -29,8 +29,7 @@ async fn main() {
         .await
         .unwrap();
 
-    let ov = InMemoryStorage::new();
-    file.flush_memory(&ov).await.unwrap();
+    file.flush().await.unwrap();
 
     let out = file
         .read_array::<i32>("sensor", vec![], vec![])

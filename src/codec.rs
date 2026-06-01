@@ -13,6 +13,21 @@ use crate::error::{Error, Result};
 /// Implementations must be `Send + Sync` so they can be shared across
 /// threads and async tasks.
 ///
+/// # Examples
+///
+/// Any built-in codec round-trips block bytes:
+///
+/// ```
+/// use array_format::{CompressionCodec, Lz4Codec};
+///
+/// let codec = Lz4Codec;
+/// let data = b"some block bytes";
+/// let compressed = codec.compress(data)?;
+/// let restored = codec.decompress(&compressed, data.len())?;
+/// assert_eq!(restored, data);
+/// # Ok::<(), array_format::Error>(())
+/// ```
+///
 /// # Extensibility
 ///
 /// Implement this trait to add support for custom compression algorithms

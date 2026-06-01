@@ -25,7 +25,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use array_format::{ArrayFile, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
+use array_format::{ArrayFile, FileConfig, Lz4Codec, NoCompression};
 use futures::stream::{self, StreamExt};
 use object_store::{ObjectStore, local::LocalFileSystem};
 
@@ -70,7 +70,7 @@ async fn read_parallel_concurrent(
 
 async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
     codec: C,
-) -> (ArrayFile, Vec<String>, InMemoryStorage) {
+) -> (ArrayFile, Vec<String>) {
     let config = FileConfig {
         block_target_size: BLOCK_TARGET,
         cache_capacity: CACHE_SIZE,
@@ -93,9 +93,8 @@ async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
         file.write_array(&name, vec![0], nd.view()).await.unwrap();
         names.push(name);
     }
-    let overlay = InMemoryStorage::new();
-    file.flush_memory(&overlay).await.unwrap();
-    (file, names, overlay)
+    file.flush().await.unwrap();
+    (file, names)
 }
 
 /// Creates the file at `disk_path / obj_name` if it doesn't already exist.
@@ -185,7 +184,7 @@ fn main() {
         "memory" => {
             rt.block_on(async {
                 eprintln!("Preparing in-memory file…");
-                let (file, names, _ov) = if use_lz4 {
+                let (file, names) = if use_lz4 {
                     prepare_in_memory(Lz4Codec).await
                 } else {
                     prepare_in_memory(NoCompression).await

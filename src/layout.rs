@@ -11,17 +11,29 @@ use crate::dtype::DType;
 /// A scalar value for a per-array key-value attribute.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub enum AttributeValue {
+    /// Boolean value.
     Bool(bool),
+    /// Signed 8-bit integer.
     Int8(i8),
+    /// Signed 16-bit integer.
     Int16(i16),
+    /// Signed 32-bit integer.
     Int32(i32),
+    /// Signed 64-bit integer.
     Int64(i64),
+    /// Unsigned 8-bit integer.
     UInt8(u8),
+    /// Unsigned 16-bit integer.
     UInt16(u16),
+    /// Unsigned 32-bit integer.
     UInt32(u32),
+    /// Unsigned 64-bit integer.
     UInt64(u64),
+    /// 32-bit floating point.
     Float32(f32),
+    /// 64-bit floating point.
     Float64(f64),
+    /// UTF-8 string.
     String(String),
 }
 
@@ -48,9 +60,12 @@ impl PartialEq for AttributeValue {
 /// Controls the integer width used for attribute key/value dictionary indices.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Archive, Serialize, Deserialize)]
 pub enum AttrIndexKind {
+    /// 16-bit dictionary indices (the default).
     #[default]
     U16,
+    /// 32-bit dictionary indices.
     U32,
+    /// 64-bit dictionary indices.
     U64,
 }
 
@@ -61,8 +76,11 @@ pub enum AttrIndexKind {
 /// use different variants; each is self-describing.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub enum Attributes {
+    /// `(key_index, value_index)` pairs stored as 16-bit indices.
     U16(Vec<(u16, u16)>),
+    /// `(key_index, value_index)` pairs stored as 32-bit indices.
     U32(Vec<(u32, u32)>),
+    /// `(key_index, value_index)` pairs stored as 64-bit indices.
     U64(Vec<(u64, u64)>),
 }
 
@@ -162,7 +180,9 @@ pub struct ArrayLayout {
 /// dimension). `address` locates the chunk's bytes within a compressed block.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub struct ChunkEntry {
+    /// Chunk coordinate within the array's grid (one index per dimension).
     pub coord: Vec<u32>,
+    /// Location of the chunk's bytes within a compressed block.
     pub address: ChunkAddress,
 }
 
@@ -188,10 +208,15 @@ pub struct StorageLayout {
 /// are not representable here.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub enum FillValue {
+    /// Boolean fill value.
     Bool(bool),
+    /// Signed integer fill value (for the signed integer dtypes).
     Int(i64),
+    /// Unsigned integer fill value (for the unsigned integer dtypes).
     UInt(u64),
+    /// Floating-point fill value (for `Float32`/`Float64`).
     Float(f64),
+    /// String fill value.
     String(String),
     /// Fill value for [`DType::TimestampNs`] arrays — interpreted as `i64`
     /// nanoseconds since the Unix epoch.

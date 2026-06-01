@@ -28,7 +28,7 @@ pub const TRAILER_SIZE: usize = 12;
 ///
 /// Serialized with [`rkyv`] for zero-copy access to the archived form.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
-pub struct Footer {
+pub(crate) struct Footer {
     /// Format version.
     pub version: u32,
     /// Block table: metadata for every block in the data region.
@@ -73,21 +73,6 @@ impl Footer {
             overlay_index: 0,
             base_file_hint: String::new(),
         }
-    }
-
-    /// Creates a new empty overlay (sidecar) footer.
-    pub fn new_overlay(overlay_index: u32, base_file_hint: impl Into<String>) -> Self {
-        Self {
-            version: FOOTER_VERSION,
-            overlay_index,
-            base_file_hint: base_file_hint.into(),
-            ..Self::new()
-        }
-    }
-
-    /// Returns `true` if this footer belongs to a sidecar file.
-    pub fn is_overlay(&self) -> bool {
-        self.overlay_index > 0
     }
 
     /// Serializes the footer to bytes, appending the trailer.

@@ -1,15 +1,19 @@
+//! Pending delta layer: accumulates writes in memory before being sealed.
+
 use std::sync::Arc;
 
 use bytes::Bytes;
 use indexmap::IndexMap;
 
+#[cfg(test)]
 use crate::{
-    DType, Error, Result,
+    DType,
+    layout::{ArrayLayout, AttrIndexKind, Attributes, FillValue, StorageLayout},
+};
+use crate::{
+    Error, Result,
     address::{BlockAllocAddress, ChunkAddress},
-    layout::{
-        ArrayLayout, ArrayMeta, AttrIndexKind, AttributeValue, Attributes, ChunkEntry, FillValue,
-        StorageLayout,
-    },
+    layout::{ArrayMeta, AttributeValue, ChunkEntry},
 };
 
 use super::{
@@ -18,11 +22,17 @@ use super::{
     immutable::DeltaImmutable,
 };
 
+/// A pending delta layer that accumulates writes before being sealed.
 pub struct DeltaMutable {
+    /// Position of this layer in the overlay stack.
     pub delta_index: u32,
+    /// Per-array metadata being built up, keyed by array name.
     pub array_meta: IndexMap<String, ArrayMeta>,
+    /// Allocator that compresses chunks and spills them to a temp file.
     pub allocator: DeltaAllocator,
+    /// Interned attribute keys shared across arrays in this layer.
     pub attr_keys: Vec<String>,
+    /// Interned attribute values, parallel to `attr_keys`.
     pub attr_values: Vec<AttributeValue>,
 }
 
@@ -31,6 +41,7 @@ fn alloc_addr_from_chunk(addr: &ChunkAddress) -> BlockAllocAddress {
 }
 
 impl Delta<DeltaMutable> {
+    /// Creates an empty pending layer using `codec` for block compression.
     pub fn new(
         codec: Arc<dyn crate::codec::CompressionCodec>,
         block_target_size: usize,
@@ -47,7 +58,9 @@ impl Delta<DeltaMutable> {
         }
     }
 
-    pub fn define_array(
+    /// Registers a new array's schema (shape, dtype, chunking) in this layer.
+    #[cfg(test)]
+    pub(crate) fn define_array(
         &mut self,
         name: impl Into<String>,
         dtype: DType,
@@ -89,7 +102,9 @@ impl Delta<DeltaMutable> {
         Ok(())
     }
 
-    pub fn array_meta(&self, name: &str) -> Option<&ArrayMeta> {
+    /// Returns the pending metadata for `name`, if the array is defined here.
+    #[cfg(test)]
+    pub(crate) fn array_meta(&self, name: &str) -> Option<&ArrayMeta> {
         self.inner.array_meta.get(name)
     }
 

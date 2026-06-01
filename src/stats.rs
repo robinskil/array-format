@@ -1,3 +1,9 @@
+//! Per-array statistics stored in an optional `.stats` sidecar.
+//!
+//! A [`StatsFile`] holds [`ArrayStats`] (e.g. min/max as [`StatValue`]) for the
+//! arrays in a file. It is serialized to its own sidecar with an `ARST` trailer,
+//! mirroring the footer format, so stats can be read without touching the data.
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::dtype::DType;
@@ -11,8 +17,11 @@ const TRAILER_SIZE: usize = 12;
 /// A typed min or max value.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub enum StatValue {
+    /// Signed integer value (for the signed integer dtypes).
     Int(i64),
+    /// Unsigned integer value (for the unsigned integer dtypes).
     UInt(u64),
+    /// Floating-point value (for `Float32`/`Float64`).
     Float(f64),
     /// String or binary: raw bytes in lexicographic order.
     Bytes(Vec<u8>),
@@ -23,6 +32,7 @@ pub enum StatValue {
 /// Aggregate statistics for a single array covering all its chunks.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub struct ArrayStats {
+    /// Name of the array these statistics describe.
     pub name: String,
     /// Global min across all chunks; `None` for unsupported dtypes.
     pub min: Option<StatValue>,
@@ -53,6 +63,7 @@ impl ArrayStats {
 /// `[rkyv_bytes][size: u64 LE][MAGIC: b"ARST"]`
 #[derive(Debug, Clone, PartialEq, Default, Archive, Serialize, Deserialize)]
 pub struct StatsFile {
+    /// Per-array statistics, one entry per array in the file.
     pub arrays: Vec<ArrayStats>,
 }
 
@@ -65,6 +76,7 @@ impl StatsFile {
         }
     }
 
+    /// Returns the statistics for the array named `name`, if present.
     pub fn get_array(&self, name: &str) -> Option<&ArrayStats> {
         self.arrays.iter().find(|a| a.name == name)
     }
@@ -238,7 +250,7 @@ macro_rules! float_partial {
 /// `null_count` counts elements equal to `fill_value`; 0 when none is set.
 /// Floats use `total_cmp` so NaN sorts last (max). `FixedSizeList` / `List`
 /// return `(None, None, 0, 0)`.
-pub fn compute_chunk_partial(
+pub(crate) fn compute_chunk_partial(
     bytes: &[u8],
     dtype: &DType,
     fill_value: Option<&FillValue>,
@@ -265,7 +277,7 @@ pub fn compute_chunk_partial(
 }
 
 /// Merges one chunk's partial results into an aggregate [`ArrayStats`].
-pub fn merge_partial(
+pub(crate) fn merge_partial(
     stats: &mut ArrayStats,
     min: Option<StatValue>,
     max: Option<StatValue>,

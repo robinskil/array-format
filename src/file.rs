@@ -1,3 +1,10 @@
+//! The runtime: [`ArrayFile`], the top-level read/write/compact handle.
+//!
+//! [`ArrayFile`] ties the lower layers together — it defines and reads/writes
+//! arrays, manages the stack of delta layers (flushing pending writes into
+//! sidecars and compacting them back down), and is configured through
+//! [`FileConfig`].
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,7 +25,7 @@ use crate::{
         StorageLayout,
     },
     stats::{ArrayStats, StatsFile, compute_chunk_partial, merge_partial, read_stats_file},
-    storage::{InMemoryStorage, ObjectStoreBackend, Storage},
+    storage::{ObjectStoreBackend, Storage},
 };
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -104,7 +111,7 @@ pub struct MergedArrayMeta {
 
 // ── File ────────────────────────────────────────────────────────────
 
-/// Object store and base-file path for an on-disk file.
+/// Object store and base-file path backing a file.
 struct StoreDir {
     store: Arc<dyn ObjectStore>,
     base_path: object_store::path::Path,
@@ -130,8 +137,9 @@ pub struct ArrayFile {
     codec: Arc<dyn CompressionCodec>,
     block_target_size: usize,
     cache: Option<Arc<DeltaCache>>,
-    /// Object store and stem for on-disk files; `None` for in-memory files.
-    store_dir: Option<StoreDir>,
+    /// Object store and stem backing this file (an in-memory file uses
+    /// `object_store`'s in-memory backend).
+    store_dir: StoreDir,
     /// Per-array aggregate statistics; `None` until first flush or open.
     stats: Option<StatsFile>,
 }
@@ -162,10 +170,10 @@ impl ArrayFile {
             codec: Arc::new(config.codec),
             block_target_size: config.block_target_size,
             cache,
-            store_dir: Some(StoreDir {
+            store_dir: StoreDir {
                 store,
                 base_path: path,
-            }),
+            },
             stats: None,
         })
     }
@@ -209,37 +217,24 @@ impl ArrayFile {
             codec: Arc::new(config.codec),
             block_target_size: config.block_target_size,
             cache,
-            store_dir: Some(StoreDir {
+            store_dir: StoreDir {
                 store,
                 base_path: path,
-            }),
+            },
             stats,
         })
     }
 
     /// Creates a new empty in-memory file.
     ///
-    /// Has no backing object store; commit pending writes with
-    /// [`flush_memory`](Self::flush_memory) rather than [`flush`](Self::flush).
-    /// Useful for tests and ephemeral pipelines.
+    /// Backed by `object_store`'s in-memory backend, so it behaves exactly like
+    /// an on-disk file (commit pending writes with [`flush`](Self::flush)) but
+    /// keeps everything in process. Useful for tests and ephemeral pipelines.
     pub async fn create_memory<C: CompressionCodec + 'static>(
         config: FileConfig<C>,
     ) -> Result<Self> {
-        let cache = resolve_cache(&config);
-        let storage = Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>;
-        write_empty_base(&*storage).await?;
-        let base_delta =
-            Delta::<DeltaImmutable>::open(storage, Arc::from("__memory_0__"), cache.clone())
-                .await?;
-        Ok(ArrayFile {
-            deltas: vec![base_delta],
-            pending: None,
-            codec: Arc::new(config.codec),
-            block_target_size: config.block_target_size,
-            cache,
-            store_dir: None,
-            stats: None,
-        })
+        let store = Arc::new(object_store::memory::InMemory::new());
+        Self::create(store, object_store::path::Path::from("memory.af"), config).await
     }
 }
 
@@ -631,23 +626,16 @@ impl ArrayFile {
 // ── Flush ────────────────────────────────────────────────────────────
 
 impl ArrayFile {
-    /// Commits pending writes to a new on-disk sidecar layer and refreshes the
+    /// Commits pending writes to a new sidecar layer and refreshes the
     /// `{stem}.stats` file.
     ///
-    /// A no-op if there are no pending changes. Errors for in-memory files —
-    /// use [`flush_memory`](Self::flush_memory) instead.
+    /// A no-op if there are no pending changes.
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending.is_none() {
             return Ok(());
         }
-        let (store, base_path) = match &self.store_dir {
-            Some(sd) => (Arc::clone(&sd.store), sd.base_path.clone()),
-            None => {
-                return Err(Error::Storage(
-                    "in-memory file: use flush_memory instead".into(),
-                ));
-            }
-        };
+        let store = Arc::clone(&self.store_dir.store);
+        let base_path = self.store_dir.base_path.clone();
         let overlay_index = self.deltas.len() as u32;
         let scar_path = sidecar_path(&base_path, overlay_index);
         let delta_path = Arc::<str>::from(scar_path.as_ref());
@@ -661,25 +649,6 @@ impl ArrayFile {
         s_storage
             .write(bytes::Bytes::from(merged.serialize()?))
             .await?;
-        self.stats = Some(merged);
-        Ok(())
-    }
-
-    /// Commits pending writes as a new in-memory layer, writing the serialized
-    /// sidecar into `storage`.
-    ///
-    /// The in-memory counterpart to [`flush`](Self::flush); a no-op if there
-    /// are no pending changes.
-    pub async fn flush_memory(&mut self, storage: &InMemoryStorage) -> Result<()> {
-        if self.pending.is_none() {
-            return Ok(());
-        }
-        let overlay_index = self.deltas.len() as u32;
-        let delta_path = Arc::<str>::from(format!("__memory_{overlay_index}__").as_str());
-        let arc: Arc<dyn Storage> = Arc::new(storage.clone());
-        let dirty_names = self.commit_pending(arc, delta_path, String::new()).await?;
-
-        let merged = self.compute_stats_for(&dirty_names).await?;
         self.stats = Some(merged);
         Ok(())
     }
@@ -834,30 +803,21 @@ impl ArrayFile {
         let footer_bytes = footer.serialize()?;
 
         // Write the new base file.
-        let base_storage: Arc<dyn Storage> = if let Some(sd) = &self.store_dir {
-            // Delete old sidecars first.
-            for i in 1..self.deltas.len() {
-                let _ = sd
-                    .store
-                    .delete(&sidecar_path(&sd.base_path, i as u32))
-                    .await;
-            }
-            // Write new base.
-            Arc::new(ObjectStoreBackend::new(
-                Arc::clone(&sd.store),
-                sd.base_path.clone(),
-            ))
-        } else {
-            // In-memory: reuse the first layer's storage.
-            Arc::clone(&self.deltas[0].inner.storage)
-        };
+        let sd = &self.store_dir;
+        // Delete old sidecars first.
+        for i in 1..self.deltas.len() {
+            let _ = sd
+                .store
+                .delete(&sidecar_path(&sd.base_path, i as u32))
+                .await;
+        }
+        let base_storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::new(
+            Arc::clone(&sd.store),
+            sd.base_path.clone(),
+        ));
 
         write_file_then_bytes(&mut file, output_size, &footer_bytes, &*base_storage).await?;
-        let base_delta_path: Arc<str> = if let Some(sd) = &self.store_dir {
-            Arc::from(sd.base_path.as_ref())
-        } else {
-            Arc::from("__memory_0__")
-        };
+        let base_delta_path: Arc<str> = Arc::from(sd.base_path.as_ref());
         let new_base =
             Delta::<DeltaImmutable>::open(base_storage, base_delta_path, self.cache.clone())
                 .await?;
@@ -867,13 +827,13 @@ impl ArrayFile {
         for s in per_array_stats {
             new_stats.upsert(s);
         }
-        if let Some(sd) = &self.store_dir {
-            let s_storage =
-                ObjectStoreBackend::new(Arc::clone(&sd.store), stats_path(&sd.base_path));
-            s_storage
-                .write(bytes::Bytes::from(new_stats.serialize()?))
-                .await?;
-        }
+        let s_storage = ObjectStoreBackend::new(
+            Arc::clone(&self.store_dir.store),
+            stats_path(&self.store_dir.base_path),
+        );
+        s_storage
+            .write(bytes::Bytes::from(new_stats.serialize()?))
+            .await?;
         self.stats = Some(new_stats);
         Ok(())
     }

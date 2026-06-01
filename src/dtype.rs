@@ -3,6 +3,11 @@
 //! The format supports fixed-width primitives, variable-length values
 //! (`String`, `Binary`), and list types (`FixedSizeList`, `List`).
 
+// `DType` has named-field struct variants; rkyv's `Archive` derive generates an
+// archived type whose fields carry no docs and cannot be annotated, so scope
+// `missing_docs` off for this module. Every public source item here is documented.
+#![allow(missing_docs)]
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// Describes the element type of an array.

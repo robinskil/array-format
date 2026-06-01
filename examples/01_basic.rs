@@ -4,7 +4,7 @@
 //! cargo run --example 01_basic
 //! ```
 
-use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, NoCompression};
 use ndarray::Array;
 
 #[tokio::main]
@@ -29,8 +29,7 @@ async fn main() {
         .await
         .unwrap();
 
-    let ov = InMemoryStorage::new();
-    file.flush_memory(&ov).await.unwrap();
+    file.flush().await.unwrap();
 
     let t = file
         .read_array::<f64>("temperature", vec![], vec![])

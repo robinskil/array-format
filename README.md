@@ -1,5 +1,11 @@
 # array-format
 
+[![crates.io](https://img.shields.io/crates/v/array-format.svg)](https://crates.io/crates/array-format)
+[![docs.rs](https://img.shields.io/docsrs/array-format)](https://docs.rs/array-format)
+[![CI](https://github.com/robinskil/array-format/actions/workflows/ci.yml/badge.svg)](https://github.com/robinskil/array-format/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/array-format.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/)
+
 `array-format` stores many n-dimensional arrays in a single file. It uses a **delta/overlay architecture**: each flush produces a self-describing sidecar file that stacks on top of the base, recording only the chunks that changed. Reads fall through to older layers for unchanged chunks. Layers can be merged into a single file with `compact`.
 
 ## Why this format exists
@@ -77,9 +83,8 @@ After compact:
 ArrayFile::create(store, path, config).await?
 ArrayFile::open(store, path, config).await?   // base + any sidecars
 
-// In-memory (for testing)
-ArrayFile::create_memory(config).await?
-file.flush_memory(&storage).await?
+// In-memory (for testing) — backed by object_store's in-memory backend
+ArrayFile::create_memory(config).await?   // then flush()/compact() as normal
 
 // Schema
 file.define_array::<T>(name, dim_names, shape, chunk_shape, fill_value)?
@@ -231,7 +236,7 @@ When `chunk_shape` is `None`, the entire array is stored as a single chunk.
 
 **Footer contents:**
 
-- `version` — format version (currently `1`)
+- `version` — format version (currently `4`)
 - `overlay_index` — which layer this file represents (`0` = base)
 - `base_file_hint` — stem of the base file
 - `blocks` — `Vec<BlockMeta>`: id, file offset, compressed/uncompressed sizes, codec
@@ -249,18 +254,13 @@ The footer is serialized with `rkyv`. Reading it is a two-pass operation: first 
 
 ## Storage
 
-```rust
-pub trait Storage: Send + Sync {
-    fn read_range(&self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>>;
-    fn write(&self, data: Bytes) -> BoxFuture<'_, Result<()>>;
-    fn size(&self) -> BoxFuture<'_, Result<u64>>;
-}
-```
-
-Two built-in implementations:
-
-- `ObjectStoreBackend` — wraps any `object_store::ObjectStore`
-- `InMemoryStorage` — shared in-memory buffer, useful for testing
+Files are read and written through any
+[`object_store`](https://docs.rs/object_store) backend — local filesystem, S3,
+GCS, Azure, or its in-memory backend. Pass the `Arc<dyn ObjectStore>` and a base
+`path` (ending in `.af`) to `ArrayFile::create` / `ArrayFile::open`; array-format
+manages the base file, sidecars, and stats file within that store. There is no
+separate storage trait to implement — in-memory use goes through
+[`create_memory`](#in-memory-usage), which uses `object_store`'s in-memory backend.
 
 ## Compression codecs
 
@@ -323,15 +323,17 @@ Stats are computed incrementally: a flush only recomputes arrays whose chunks we
 
 ## In-memory usage
 
+`create_memory` backs the file with `object_store`'s in-memory backend, so it
+behaves exactly like an on-disk file — same `flush`/`compact` — but keeps
+everything in process. Handy for tests and ephemeral pipelines.
+
 ```rust
-use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, NoCompression};
 
 let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression)).await?;
 file.define_array::<i32>("data", vec!["x".into()], vec![10], None, None)?;
 // ... write ...
-
-let storage = InMemoryStorage::new();
-file.flush_memory(&storage).await?;
+file.flush().await?;
 ```
 
 ## License

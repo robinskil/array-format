@@ -1,7 +1,8 @@
 //! Block metadata stored in the footer.
 //!
-//! Each block in the data region has a [`BlockMeta`] entry that records
-//! its physical location in the file and compression information.
+//! Each block in the data region has an internal `BlockMeta` entry that records
+//! its physical location in the file and compression information. The publicly
+//! relevant type here is [`CodecId`], which names the codec used per block.
 
 use std::ops::Range;
 
@@ -27,7 +28,7 @@ pub enum CodecId {
 /// Stored in the footer's block table. Describes where to find the
 /// block in the file and how to decompress it.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
-pub struct BlockMeta {
+pub(crate) struct BlockMeta {
     /// Block identifier.
     pub id: BlockId,
     /// Byte offset of the compressed block within the file.
@@ -42,7 +43,7 @@ pub struct BlockMeta {
 
 impl BlockMeta {
     /// Returns the byte range within the file that contains this block.
-    pub fn file_range(&self) -> Range<u64> {
+    pub(crate) fn file_range(&self) -> Range<u64> {
         self.file_offset..self.file_offset + self.compressed_size
     }
 }

@@ -8,7 +8,7 @@
 //! cargo run --example 08_statistics
 //! ```
 
-use array_format::{ArrayFile, FileConfig, FillValue, InMemoryStorage, NoCompression, StatValue};
+use array_format::{ArrayFile, FileConfig, FillValue, NoCompression, StatValue};
 use ndarray::Array;
 
 #[tokio::main]
@@ -35,7 +35,7 @@ async fn main() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     let s = file.array_stats("sensor").unwrap();
     println!("After first flush:");
@@ -54,7 +54,7 @@ async fn main() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     let s = file.array_stats("sensor").unwrap();
     println!("\nAfter second flush (all 8 elements written):");
@@ -71,7 +71,7 @@ async fn main() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     let s = file.array_stats("sensor").unwrap();
     println!("\nAfter overwriting chunk 0 (no more missing values):");

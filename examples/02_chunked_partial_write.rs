@@ -8,7 +8,7 @@
 //! cargo run --example 02_chunked_partial_write
 //! ```
 
-use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, NoCompression};
 use ndarray::Array;
 
 #[tokio::main]
@@ -40,8 +40,7 @@ async fn main() {
 
     // Chunk 2 (indices 8-11) is never written → stays at fill value (0)
 
-    let ov = InMemoryStorage::new();
-    file.flush_memory(&ov).await.unwrap();
+    file.flush().await.unwrap();
 
     let full = file
         .read_array::<i32>("signal", vec![], vec![])

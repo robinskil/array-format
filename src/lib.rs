@@ -18,8 +18,7 @@
 //! - Chunked or single-chunk layouts with coordinate-addressed reads.
 //! - Logical deletes with periodic compaction to reclaim space.
 //! - Works with any [`object_store`]-compatible backend (local filesystem,
-//!   S3, GCS, Azure) via [`ObjectStoreBackend`](storage::ObjectStoreBackend),
-//!   plus an [`InMemoryStorage`] backend for tests.
+//!   S3, GCS, Azure).
 //!
 //! ## Quick start
 //!
@@ -45,46 +44,48 @@
 //!
 //! ## Architecture
 //!
-//! The crate is organized in four layers:
+//! The crate is organized in layers:
 //!
 //! | Layer | Purpose | Key types |
 //! |-------|---------|-----------|
 //! | 0 — Core | Primitives | [`DType`], [`ChunkAddress`], [`BlockId`], [`Error`] |
-//! | 1 — Metadata | Footer model | [`BlockMeta`], [`Footer`] |
-//! | 2 — Traits | Extension points | [`CompressionCodec`], [`Storage`] |
+//! | 1 — Metadata | Array description | [`MergedArrayMeta`], [`FillValue`] |
+//! | 2 — Codecs | Compression extension point | [`CompressionCodec`] |
 //! | 3 — Runtime | Read / write / compact | [`ArrayFile`] |
 //!
-//! The [`CompressionCodec`] and [`Storage`] traits are the extension points:
-//! implement them to plug in custom compression algorithms or storage backends.
+//! [`CompressionCodec`] is the extension point: implement it to plug in custom
+//! compression algorithms. Storage is provided through any
+//! [`object_store`]-compatible backend (passed to [`ArrayFile::create`]); for
+//! tests and ephemeral use, [`ArrayFile::create_memory`] uses `object_store`'s
+//! in-memory backend.
 //!
 //! [`ChunkAddress`]: address::ChunkAddress
 //! [`BlockId`]: address::BlockId
-//! [`BlockMeta`]: block::BlockMeta
-//! [`Footer`]: footer::Footer
-//! [`Storage`]: storage::Storage
 //! [`object_store`]: https://docs.rs/object_store
+
+#![warn(missing_docs)]
 
 // ── Layer 0: Core types ─────────────────────────────────────────────
 pub mod address;
-pub mod delta;
+mod delta;
 pub mod dtype;
 pub mod error;
 
 // ── Layer 1: Metadata ───────────────────────────────────────────────
 pub mod block;
-pub mod footer;
+mod footer;
 pub mod layout;
 
-// ── Layer 2: Extension traits ───────────────────────────────────────
+// ── Layer 2: Codec extension trait ──────────────────────────────────
 pub mod codec;
-pub mod storage;
+mod storage;
 
 // ── Layer 3: Runtime ────────────────────────────────────────────────
 pub mod array;
 pub mod file;
 pub mod stats;
 
-pub mod ndarray_ext;
+mod ndarray_ext;
 pub mod timestamp;
 
 // ── Public re-exports ───────────────────────────────────────────────
@@ -99,5 +100,4 @@ pub use file::{
 };
 pub use layout::{AttributeValue, FillValue};
 pub use stats::{ArrayStats, StatValue, StatsFile};
-pub use storage::InMemoryStorage;
 pub use timestamp::TimestampNs;

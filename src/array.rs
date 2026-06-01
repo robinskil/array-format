@@ -1,3 +1,9 @@
+//! The [`ArrayElement`] trait: the element types that can be stored.
+//!
+//! A single generic code path handles both fixed-width primitives and
+//! variable-length values by going through this trait, which provides
+//! chunk-level encode/decode and fill-value generation.
+
 use zerocopy::IntoBytes;
 
 use crate::dtype::DType;

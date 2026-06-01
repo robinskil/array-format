@@ -7,7 +7,7 @@
 //! cargo run --example 06_layers_and_compact
 //! ```
 
-use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, NoCompression};
 use ndarray::Array;
 
 #[tokio::main]
@@ -23,8 +23,7 @@ async fn main() {
     file.write_array("values", vec![0], v1.view())
         .await
         .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
     println!("after flush 1: {} layer(s)", file.num_layers()); // 2
 
     // Layer 2: patch a single element
@@ -32,8 +31,7 @@ async fn main() {
     file.write_array("values", vec![2], patch.view())
         .await
         .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
     println!("after flush 2: {} layer(s)", file.num_layers()); // 3
 
     let before = file

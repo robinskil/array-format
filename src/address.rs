@@ -5,8 +5,12 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
+/// A block-relative allocation: which block, and the byte range within it.
+///
+/// The write-side counterpart of [`ChunkAddress`], using `u64` offsets/sizes
+/// while a layer is being built; it narrows to [`ChunkAddress`] on flush.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Archive, Serialize, Deserialize)]
-pub struct BlockAllocAddress {
+pub(crate) struct BlockAllocAddress {
     id: BlockId,
     offset: u64,
     size: u64,
@@ -32,19 +36,23 @@ pub struct ChunkAddress {
 }
 
 impl BlockAllocAddress {
-    pub fn new(id: BlockId, offset: u64, size: u64) -> Self {
+    /// Creates an address for `size` bytes at `offset` within block `id`.
+    pub(crate) fn new(id: BlockId, offset: u64, size: u64) -> Self {
         Self { id, offset, size }
     }
 
-    pub fn id(&self) -> BlockId {
+    /// The block this allocation lives in.
+    pub(crate) fn id(&self) -> BlockId {
         self.id
     }
 
-    pub fn offset(&self) -> u64 {
+    /// Byte offset of the allocation within the block.
+    pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
 
-    pub fn size(&self) -> u64 {
+    /// Length of the allocation in bytes.
+    pub(crate) fn size(&self) -> u64 {
         self.size
     }
 }

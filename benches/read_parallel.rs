@@ -6,7 +6,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use futures::stream::{self, StreamExt};
 use rand::Rng;
 
-use array_format::{ArrayFile, FileConfig, InMemoryStorage, Lz4Codec, NoCompression};
+use array_format::{ArrayFile, FileConfig, Lz4Codec, NoCompression};
 use object_store::{ObjectStore, local::LocalFileSystem};
 
 const MANY_ARRAYS_COUNT: usize = 25_000;
@@ -20,7 +20,7 @@ fn total_bytes() -> u64 {
 
 async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
     codec: C,
-) -> (ArrayFile, Vec<String>, InMemoryStorage) {
+) -> (ArrayFile, Vec<String>) {
     let config = FileConfig {
         block_target_size: BLOCK_TARGET,
         cache_capacity: CACHE_SIZE,
@@ -47,9 +47,8 @@ async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone
         file.write_array(&name, vec![0], nd.view()).await.unwrap();
         names.push(name);
     }
-    let overlay = InMemoryStorage::new();
-    file.flush_memory(&overlay).await.unwrap();
-    (file, names, overlay)
+    file.flush().await.unwrap();
+    (file, names)
 }
 
 async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
@@ -138,7 +137,7 @@ fn bench_many_arrays_memory(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(total_bytes()));
     group.sample_size(10);
 
-    let (file_lz4, names_lz4, _ov) = rt.block_on(prepare_many_arrays_in_memory(Lz4Codec));
+    let (file_lz4, names_lz4) = rt.block_on(prepare_many_arrays_in_memory(Lz4Codec));
     let file_lz4 = Arc::new(file_lz4);
 
     group.bench_function(BenchmarkId::new("lz4", "sequential"), |b| {
@@ -171,7 +170,7 @@ fn bench_many_arrays_memory(c: &mut Criterion) {
         );
     }
 
-    let (file_none, names_none, _ov) = rt.block_on(prepare_many_arrays_in_memory(NoCompression));
+    let (file_none, names_none) = rt.block_on(prepare_many_arrays_in_memory(NoCompression));
     let file_none = Arc::new(file_none);
 
     group.bench_function(BenchmarkId::new("none", "sequential"), |b| {

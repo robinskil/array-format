@@ -4,7 +4,7 @@
 //! cargo run --example 04_vlen_strings
 //! ```
 
-use array_format::{ArrayFile, FileConfig, InMemoryStorage, NoCompression};
+use array_format::{ArrayFile, FileConfig, NoCompression};
 
 #[tokio::main]
 async fn main() {
@@ -25,8 +25,7 @@ async fn main() {
         .await
         .unwrap();
 
-    let ov = InMemoryStorage::new();
-    file.flush_memory(&ov).await.unwrap();
+    file.flush().await.unwrap();
 
     let out = file
         .read_array::<String>("labels", vec![], vec![])

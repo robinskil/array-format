@@ -1,6 +1,10 @@
-//! Optional integration with the `ndarray` crate.
+//! Internal n-dimensional read/write helpers built on the `ndarray` crate.
 //!
-//! Enabled via the `ndarray` Cargo feature.
+//! These are `pub(crate)` building blocks used by [`ArrayFile`](crate::ArrayFile)
+//! to translate between coordinate-addressed chunks and `ndarray` views:
+//! [`write_nd`] scatters an array into its covering chunks, [`assemble_nd`]
+//! gathers a (possibly sliced) array back out, and [`make_si`]/[`iter_nd_coords`]
+//! handle slice-info construction and chunk-coordinate iteration.
 
 use std::ops::Range;
 

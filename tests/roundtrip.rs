@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use array_format::{
-    ArrayFile, AttributeValue, FileConfig, FillValue, InMemoryStorage, NoCompression, StatValue,
-    TimestampNs,
+    ArrayFile, AttributeValue, FileConfig, FillValue, NoCompression, StatValue, TimestampNs,
 };
 use ndarray::{Array, IxDyn};
 use object_store::{ObjectStore, local::LocalFileSystem};
@@ -34,8 +33,7 @@ async fn flat_array_roundtrip() {
         .await
         .unwrap();
 
-    let overlay = InMemoryStorage::new();
-    file.flush_memory(&overlay).await.unwrap();
+    file.flush().await.unwrap();
 
     assert_eq!(file.list_arrays().len(), 2);
     let ints_back = file.read_array::<u8>("ints", vec![], vec![]).await.unwrap();
@@ -70,8 +68,7 @@ async fn scalar_array_roundtrip() {
     file.define_array::<i32>("answer", vec![], vec![], None, Some(FillValue::Int(42)))
         .unwrap();
 
-    let overlay = InMemoryStorage::new();
-    file.flush_memory(&overlay).await.unwrap();
+    file.flush().await.unwrap();
 
     let pi_back = file.read_array::<f64>("pi", vec![], vec![]).await.unwrap();
     assert_eq!(pi_back.ndim(), 0);
@@ -435,8 +432,7 @@ async fn write_nd_full_chunks() {
         .await
         .unwrap();
 
-    let overlay = InMemoryStorage::new();
-    file.flush_memory(&overlay).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file
         .read_array::<i32>("grid", vec![], vec![])
@@ -460,15 +456,13 @@ async fn write_nd_partial_chunk() {
     file.write_array("g", vec![0, 0], zeros.view())
         .await
         .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     let patch = Array::from_shape_vec(IxDyn(&[1, 1]), vec![7.0f32]).unwrap();
     file.write_array("g", vec![1, 1], patch.view())
         .await
         .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file.read_array::<f32>("g", vec![], vec![]).await.unwrap();
     for row in 0..4usize {
@@ -498,15 +492,13 @@ async fn write_nd_multi_chunk_span() {
     file.write_array("g", vec![0, 0], ones.view())
         .await
         .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     let patch = Array::from_shape_vec(IxDyn(&[2, 2]), vec![9i32; 4]).unwrap();
     file.write_array("g", vec![2, 2], patch.view())
         .await
         .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file.read_array::<i32>("g", vec![], vec![]).await.unwrap();
     for row in 0..6usize {
@@ -533,8 +525,7 @@ async fn write_nd_pending_array() {
     let b = Array::from_vec(vec![3.0f32, 4.0]).into_dyn();
     file.write_array("data", vec![2], b.view()).await.unwrap();
 
-    let overlay = InMemoryStorage::new();
-    file.flush_memory(&overlay).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file
         .read_array::<f32>("data", vec![], vec![])
@@ -566,8 +557,7 @@ async fn fill_value_used_for_unwritten_chunks() {
         .await
         .unwrap();
 
-    let ov = InMemoryStorage::new();
-    file.flush_memory(&ov).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file
         .read_array::<i32>("sparse", vec![], vec![])
@@ -586,8 +576,7 @@ async fn fill_value_default_zero_when_none() {
     file.define_array::<f64>("empty", vec!["x".into()], vec![4], Some(vec![4]), None)
         .unwrap();
 
-    let ov = InMemoryStorage::new();
-    file.flush_memory(&ov).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file
         .read_array::<f64>("empty", vec![], vec![])
@@ -604,8 +593,7 @@ async fn read_array_sub_region() {
         .unwrap();
     let data = Array::from_vec(vec![10i32, 20, 30, 40, 50, 60]).into_dyn();
     file.write_array("arr", vec![0], data.view()).await.unwrap();
-    let ov = InMemoryStorage::new();
-    file.flush_memory(&ov).await.unwrap();
+    file.flush().await.unwrap();
 
     // Read elements [2..5]
     let sub = file
@@ -641,8 +629,7 @@ async fn write_partial_offset_leaves_other_chunks_untouched() {
         .await
         .unwrap();
 
-    let ov = InMemoryStorage::new();
-    file.flush_memory(&ov).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file.read_array::<i32>("arr", vec![], vec![]).await.unwrap();
     let flat: Vec<i32> = result.iter().cloned().collect();
@@ -664,8 +651,7 @@ async fn replace_middle_chunk_leaves_neighbors_intact() {
     )
     .await
     .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     file.write_array(
         "arr",
@@ -674,8 +660,7 @@ async fn replace_middle_chunk_leaves_neighbors_intact() {
     )
     .await
     .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file.read_array::<u8>("arr", vec![], vec![]).await.unwrap();
     let flat: Vec<u8> = result.iter().cloned().collect();
@@ -703,8 +688,7 @@ async fn cross_chunk_patch_preserves_untouched_elements() {
     )
     .await
     .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     file.write_array(
         "arr",
@@ -713,8 +697,7 @@ async fn cross_chunk_patch_preserves_untouched_elements() {
     )
     .await
     .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file.read_array::<i32>("arr", vec![], vec![]).await.unwrap();
     let flat: Vec<i32> = result.iter().cloned().collect();
@@ -735,8 +718,7 @@ async fn non_adjacent_chunk_replacement() {
     )
     .await
     .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     file.write_array(
         "arr",
@@ -752,8 +734,7 @@ async fn non_adjacent_chunk_replacement() {
     )
     .await
     .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file.read_array::<u8>("arr", vec![], vec![]).await.unwrap();
     let flat: Vec<u8> = result.iter().cloned().collect();
@@ -774,8 +755,7 @@ async fn latest_write_wins_across_layers() {
     )
     .await
     .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     file.write_array(
         "arr",
@@ -784,8 +764,7 @@ async fn latest_write_wins_across_layers() {
     )
     .await
     .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file.read_array::<u8>("arr", vec![], vec![]).await.unwrap();
     let flat: Vec<u8> = result.iter().cloned().collect();
@@ -864,8 +843,7 @@ async fn two_d_row_update_spans_column_chunks() {
     )
     .await
     .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     file.write_array(
         "grid",
@@ -876,8 +854,7 @@ async fn two_d_row_update_spans_column_chunks() {
     )
     .await
     .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file
         .read_array::<i32>("grid", vec![], vec![])
@@ -917,8 +894,7 @@ async fn two_d_inner_patch_touches_all_four_chunks() {
     )
     .await
     .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     file.write_array(
         "g",
@@ -929,8 +905,7 @@ async fn two_d_inner_patch_touches_all_four_chunks() {
     )
     .await
     .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let result = file.read_array::<f32>("g", vec![], vec![]).await.unwrap();
     for row in 0..4usize {
@@ -962,8 +937,7 @@ async fn sub_region_read_after_partial_update() {
     )
     .await
     .unwrap();
-    let ov1 = InMemoryStorage::new();
-    file.flush_memory(&ov1).await.unwrap();
+    file.flush().await.unwrap();
 
     file.write_array(
         "arr",
@@ -972,8 +946,7 @@ async fn sub_region_read_after_partial_update() {
     )
     .await
     .unwrap();
-    let ov2 = InMemoryStorage::new();
-    file.flush_memory(&ov2).await.unwrap();
+    file.flush().await.unwrap();
 
     let first = file
         .read_array::<i32>("arr", vec![0], vec![5])
@@ -1015,8 +988,7 @@ async fn stats_flush_computes_correct_min_max_null_row_count() {
     )
     .await
     .unwrap();
-    let mem = InMemoryStorage::new();
-    file.flush_memory(&mem).await.unwrap();
+    file.flush().await.unwrap();
 
     let stats = file.array_stats("data").expect("stats missing after flush");
     assert_eq!(stats.min, Some(StatValue::Int(3))); // fill value 1 excluded from range
@@ -1040,7 +1012,7 @@ async fn stats_second_chunk_aggregates_globally() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     // Chunk [1]: values 6..=10
     file.write_array(
@@ -1050,7 +1022,7 @@ async fn stats_second_chunk_aggregates_globally() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     let stats = file.array_stats("a").expect("stats missing");
     assert_eq!(stats.min, Some(StatValue::Int(1)));
@@ -1074,7 +1046,7 @@ async fn stats_update_after_chunk_overwrite() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     // Overwrite with larger values
     file.write_array(
@@ -1084,7 +1056,7 @@ async fn stats_update_after_chunk_overwrite() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     let stats = file.array_stats("x").expect("stats missing");
     assert_eq!(stats.min, Some(StatValue::Int(10)));
@@ -1104,7 +1076,7 @@ async fn stats_survive_compact() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
     file.compact().await.unwrap();
 
     let stats = file.array_stats("v").expect("stats missing after compact");
@@ -1175,7 +1147,7 @@ async fn stats_unwritten_chunks_count_as_nulls() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     let stats = file.array_stats("partial").expect("stats missing");
     assert_eq!(stats.row_count, 10); // full array capacity
@@ -1210,7 +1182,7 @@ async fn timestamp_ns_roundtrip_and_stats() {
     )
     .await
     .unwrap();
-    file.flush_memory(&InMemoryStorage::new()).await.unwrap();
+    file.flush().await.unwrap();
 
     let back = file
         .read_array::<TimestampNs>("events", vec![], vec![])

@@ -1,19 +1,31 @@
+//! The delta/overlay layer.
+//!
+//! A file is a stack of *deltas*: an immutable base plus zero or more sidecar
+//! layers, each recording only the chunks that changed. Reads fall through from
+//! the newest layer to the base. The two states are wrapped by [`Delta<D>`]:
+//! [`DeltaMutable`] accumulates pending writes in memory (backed by a temp file
+//! via [`DeltaAllocator`]) and is sealed into a [`DeltaImmutable`] on flush.
+//! [`DeltaCache`] caches decompressed block reads shared across layers.
+
 mod allocator;
-pub mod cache;
+mod cache;
 mod immutable;
 mod mutable;
 
-pub use allocator::{AllocatorOutput, DeltaAllocator};
+pub(crate) use allocator::{AllocatorOutput, DeltaAllocator};
 pub use cache::DeltaCache;
-pub use immutable::DeltaImmutable;
-pub use mutable::DeltaMutable;
+pub(crate) use immutable::DeltaImmutable;
+pub(crate) use mutable::DeltaMutable;
 
 use bytes::Bytes;
 
 use crate::{Error, Result, storage::Storage};
 
-pub struct Delta<D> {
-    pub inner: D,
+/// A single layer in the overlay stack, wrapping either a
+/// [`DeltaMutable`] (pending, in-memory) or a [`DeltaImmutable`] (sealed) state.
+pub(crate) struct Delta<D> {
+    /// The wrapped layer state.
+    pub(crate) inner: D,
 }
 
 // ── Streaming helper ─────────────────────────────────────────────────

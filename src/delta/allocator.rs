@@ -1,3 +1,6 @@
+//! Block allocator for a pending layer: compresses chunks and spills them to a
+//! backing temp file, tracking each block's location for later positional reads.
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -68,10 +71,13 @@ pub struct AllocatorOutput {
     pub file: tokio::fs::File,
     /// Total number of bytes in `file`.
     pub output_size: u64,
+    /// Metadata for each block written to `file`, in file order.
     pub blocks: Vec<BlockMeta>,
 }
 
 impl DeltaAllocator {
+    /// Creates an allocator that compresses with `codec` and starts a new block
+    /// once the current one reaches `block_target_size` bytes.
     pub fn new(codec: Arc<dyn CompressionCodec>, block_target_size: usize) -> Self {
         let output_file =
             tempfile::tempfile().expect("DeltaAllocator: failed to create output tempfile");

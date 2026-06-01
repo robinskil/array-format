@@ -1,6 +1,6 @@
 [package]
 name = "array-format"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A block-backed, footer-indexed container for storing multiple n-dimensional arrays in a single file, with a delta/overlay architecture and pluggable compression and storage backends."
@@ -32,9 +32,6 @@ zerocopy = { version = "0.8", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 rand = "0.9"
-object_store = "0.13"
-crossbeam-queue = "0.3"
-ndarray = "0.17"
 
 [[bench]]
 name = "read_chunks"
