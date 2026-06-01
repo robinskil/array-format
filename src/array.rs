@@ -12,9 +12,16 @@ use crate::timestamp::TimestampNs;
 /// types (`String`, `Vec<u8>`). The trait provides chunk-level encode/decode
 /// and fill-value generation so that a single generic code path handles both.
 pub trait ArrayElement: Clone + Send + Sync + 'static {
+    /// The [`DType`] this Rust type maps to on disk.
     const DTYPE: DType;
+    /// Encodes a chunk's worth of values into the on-disk byte representation.
     fn encode_chunk(values: &[Self]) -> Vec<u8>;
+    /// Decodes bytes produced by [`encode_chunk`](Self::encode_chunk) back into
+    /// values.
     fn decode_chunk(bytes: &[u8]) -> Vec<Self>;
+    /// Returns the element used for unwritten positions, derived from the
+    /// array's `fill` value (or this type's natural default when `fill` is
+    /// `None` or not applicable).
     fn fill_element(fill: Option<&FillValue>) -> Self;
 }
 

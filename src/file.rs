@@ -23,23 +23,53 @@ use crate::{
 
 // ── Constants ───────────────────────────────────────────────────────
 
+/// Default target size for a data block before a new one is started (8 MiB).
 pub const DEFAULT_BLOCK_TARGET_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+/// Default byte budget for the decompressed-block cache (256 MiB).
 pub const DEFAULT_CACHE_CAPACITY: usize = 256 * 1024 * 1024; // 256 MiB
+/// Default byte budget for the raw I/O slab cache (64 MiB); useful for object-store workloads.
 pub const DEFAULT_IO_CACHE_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB; enable for object-store workloads
 
 // ── FileConfig ──────────────────────────────────────────────────────
 
+/// Configuration for opening or creating an [`ArrayFile`].
+///
+/// Construct with [`FileConfig::new`] for the defaults, then override fields as
+/// needed:
+///
+/// ```
+/// use array_format::{FileConfig, ZstdCodec};
+///
+/// let config = FileConfig {
+///     block_target_size: 4 * 1024 * 1024,
+///     ..FileConfig::new(ZstdCodec { level: 9 })
+/// };
+/// ```
 pub struct FileConfig<C: CompressionCodec> {
+    /// Compression codec applied to data blocks on write.
     pub codec: C,
+    /// Target size of a data block before a new block is started, in bytes.
     pub block_target_size: usize,
+    /// Byte budget for this file's decompressed-block cache.
+    ///
+    /// Ignored when [`cache`](Self::cache) is `Some`.
     pub cache_capacity: usize,
+    /// Byte budget for this file's raw I/O slab cache (0 disables it).
+    ///
+    /// Ignored when [`cache`](Self::cache) is `Some`.
     pub io_cache_capacity: usize,
-    /// Optional pre-built cache to share across multiple `ArrayFile`s.
-    /// When `Some`, `cache_capacity` and `io_cache_capacity` are ignored.
+    /// Optional pre-built cache to share across multiple [`ArrayFile`]s.
+    ///
+    /// When `Some`, [`cache_capacity`](Self::cache_capacity) and
+    /// [`io_cache_capacity`](Self::io_cache_capacity) are ignored and every file
+    /// sharing this cache is bounded by one combined byte budget. Entries are
+    /// keyed by `(file_path, block_id)`, so files do not interfere.
     pub cache: Option<Arc<DeltaCache>>,
 }
 
 impl<C: CompressionCodec> FileConfig<C> {
+    /// Creates a config using `codec` and the `DEFAULT_*` capacities, with no
+    /// shared cache.
     pub fn new(codec: C) -> Self {
         Self {
             codec,
@@ -54,13 +84,21 @@ impl<C: CompressionCodec> FileConfig<C> {
 // ── MergedArrayMeta ─────────────────────────────────────────────────
 
 /// Array metadata visible to the caller after merging all delta layers.
+///
+/// Returned by [`ArrayFile::list_arrays`].
 #[derive(Debug, Clone)]
 pub struct MergedArrayMeta {
+    /// Array name (unique within the file).
     pub name: String,
+    /// Element type.
     pub dtype: DType,
+    /// Full array shape, one entry per dimension.
     pub shape: Vec<u32>,
+    /// Chunk shape; equals [`shape`](Self::shape) for single-chunk arrays.
     pub chunk_shape: Vec<u32>,
+    /// Name of each dimension.
     pub dimension_names: Vec<String>,
+    /// Fill value used for unwritten elements, if one was set at definition.
     pub fill_value: Option<FillValue>,
 }
 
@@ -84,7 +122,7 @@ pub(crate) struct ChunkedSchema {
 ///
 /// Layers are stacked oldest → newest in `deltas`. Uncommitted writes
 /// accumulate in a disk-backed mutable delta (`pending`) and are flushed
-/// by [`flush`](File::flush). The mutable delta is created lazily on the
+/// by [`flush`](Self::flush). The mutable delta is created lazily on the
 /// first mutation after open/flush.
 pub struct ArrayFile {
     deltas: Vec<Delta<DeltaImmutable>>,
@@ -102,6 +140,11 @@ pub struct ArrayFile {
 
 impl ArrayFile {
     /// Creates a new empty file at `path` within `store`.
+    ///
+    /// `path` is the base file object and should end in `.af`; sidecars
+    /// (`{stem}.N.af`) and the stats file (`{stem}.stats`) are written alongside
+    /// it in the same prefix. Fails if an object already exists at `path` only
+    /// insofar as the backend allows overwriting — the base is (re)written empty.
     pub async fn create<C: CompressionCodec + 'static>(
         store: Arc<dyn ObjectStore>,
         path: object_store::path::Path,
@@ -127,7 +170,12 @@ impl ArrayFile {
         })
     }
 
-    /// Opens an existing file (base + any sidecars) from `store`.
+    /// Opens an existing file from `store`, discovering the base and all
+    /// sidecar layers under the same stem.
+    ///
+    /// `path` must end in `.af`. Aggregate statistics are loaded from
+    /// `{stem}.stats` if present; a missing or unreadable stats file is not an
+    /// error (see [`array_stats`](Self::array_stats)).
     pub async fn open<C: CompressionCodec + 'static>(
         store: Arc<dyn ObjectStore>,
         path: object_store::path::Path,
@@ -170,6 +218,10 @@ impl ArrayFile {
     }
 
     /// Creates a new empty in-memory file.
+    ///
+    /// Has no backing object store; commit pending writes with
+    /// [`flush_memory`](Self::flush_memory) rather than [`flush`](Self::flush).
+    /// Useful for tests and ephemeral pipelines.
     pub async fn create_memory<C: CompressionCodec + 'static>(
         config: FileConfig<C>,
     ) -> Result<Self> {
@@ -317,6 +369,8 @@ impl ArrayFile {
         self.deltas.len()
     }
 
+    /// Returns the value of attribute `key` on array `name`, or `None` if the
+    /// array has no such attribute. Errors if the array does not exist.
     pub fn get_attribute(&self, name: &str, key: &str) -> Result<Option<&AttributeValue>> {
         let meta = self.get_array(name)?;
         let key_idx = match self
@@ -351,6 +405,10 @@ impl ArrayFile {
         Ok(None)
     }
 
+    /// Sets attribute `key` on array `name` to `value`, inserting or replacing
+    /// any existing entry. The change lands in the pending layer and is
+    /// persisted on the next [`flush`](Self::flush). Errors if the array does
+    /// not exist.
     pub fn set_attribute(&mut self, name: &str, key: &str, value: AttributeValue) -> Result<()> {
         // Ensure the array exists (in deltas or pending), and snapshot its meta
         // in case we need to copy it down into the pending mutable delta.
@@ -376,7 +434,17 @@ impl ArrayFile {
 // ── Array definition / deletion ──────────────────────────────────────
 
 impl ArrayFile {
-    /// Defines a new array. `chunk_shape = None` means one chunk per array.
+    /// Defines a new array in the pending layer.
+    ///
+    /// `shape` is the full array shape; `chunk_shape` tiles it into a grid of
+    /// independently stored chunks, or `None` to store the whole array as a
+    /// single chunk. If `dimension_names` does not have one entry per dimension
+    /// it is replaced with `dim0`, `dim1`, … . `fill_value` is returned for
+    /// elements that are never written.
+    ///
+    /// Errors with [`Error::ArrayAlreadyExists`] if an array of this name is
+    /// already visible. The definition is persisted on the next
+    /// [`flush`](Self::flush).
     pub fn define_array<T: ArrayElement>(
         &mut self,
         name: impl Into<String>,
@@ -418,7 +486,11 @@ impl ArrayFile {
         Ok(())
     }
 
-    /// Marks an array as deleted in the pending layer.
+    /// Logically deletes an array by writing a tombstone to the pending layer.
+    ///
+    /// The array is excluded from [`list_arrays`](Self::list_arrays) and all
+    /// reads immediately, but its bytes remain on disk until
+    /// [`compact`](Self::compact) reclaims them.
     pub fn delete(&mut self, name: &str) -> Result<()> {
         let meta = self.get_array(name)?.clone();
         self.pending_mut().mark_deleted(meta);
@@ -500,6 +572,13 @@ impl ArrayFile {
 // ── ndarray read/write ───────────────────────────────────────────────
 
 impl ArrayFile {
+    /// Writes `data` into array `name` with its origin at coordinate `start`.
+    ///
+    /// The region may span multiple chunks and need not be chunk-aligned;
+    /// partially covered chunks are read-modify-written automatically. `T` must
+    /// match the array's declared dtype, otherwise [`Error::DTypeMismatch`] is
+    /// returned. Writes accumulate in the pending layer until
+    /// [`flush`](Self::flush).
     pub async fn write_array<T: ArrayElement>(
         &mut self,
         name: &str,
@@ -509,6 +588,12 @@ impl ArrayFile {
         crate::ndarray_ext::write_nd(self, name, data, &start).await
     }
 
+    /// Reads the sub-region of array `name` starting at `start` with the given
+    /// `shape`.
+    ///
+    /// Pass `vec![], vec![]` to read the whole array. Chunks that were never
+    /// written are materialized from the array's fill value. `T` must match the
+    /// array's declared dtype, otherwise [`Error::DTypeMismatch`] is returned.
     pub async fn read_array<T: ArrayElement>(
         &self,
         name: &str,
@@ -546,7 +631,11 @@ impl ArrayFile {
 // ── Flush ────────────────────────────────────────────────────────────
 
 impl ArrayFile {
-    /// Commits pending writes to a new sidecar file on disk.
+    /// Commits pending writes to a new on-disk sidecar layer and refreshes the
+    /// `{stem}.stats` file.
+    ///
+    /// A no-op if there are no pending changes. Errors for in-memory files —
+    /// use [`flush_memory`](Self::flush_memory) instead.
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending.is_none() {
             return Ok(());
@@ -576,7 +665,11 @@ impl ArrayFile {
         Ok(())
     }
 
-    /// Commits pending writes to `storage` (for in-memory testing).
+    /// Commits pending writes as a new in-memory layer, writing the serialized
+    /// sidecar into `storage`.
+    ///
+    /// The in-memory counterpart to [`flush`](Self::flush); a no-op if there
+    /// are no pending changes.
     pub async fn flush_memory(&mut self, storage: &InMemoryStorage) -> Result<()> {
         if self.pending.is_none() {
             return Ok(());
@@ -650,7 +743,11 @@ impl ArrayFile {
 // ── Compact ──────────────────────────────────────────────────────────
 
 impl ArrayFile {
-    /// Merges all committed layers into a single base file.
+    /// Merges all committed layers into a single new base file, deleting the
+    /// sidecars and reclaiming space held by overwritten and tombstoned chunks.
+    ///
+    /// After a successful compaction [`num_layers`](Self::num_layers) returns
+    /// `1`. Recomputes and rewrites the `{stem}.stats` file.
     pub async fn compact(&mut self) -> Result<()> {
         // Build the merged view.
         let merged_names: Vec<String> = self.list_arrays().into_iter().map(|m| m.name).collect();

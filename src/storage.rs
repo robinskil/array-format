@@ -17,8 +17,9 @@ use crate::error::{Error, Result};
 /// Streaming writer used to build up a file in chunks.
 ///
 /// Obtained from [`Storage::write_multipart`]. Callers push successive
-/// chunks via [`write_chunk`] and finalize with [`complete`]; dropping
-/// the writer without calling `complete` aborts the upload.
+/// chunks via [`write_chunk`](Self::write_chunk) and finalize with
+/// [`complete`](Self::complete); dropping the writer without calling `complete`
+/// aborts the upload.
 pub trait MultipartWriter: Send {
     /// Appends `data` to the in-flight upload.
     fn write_chunk(&mut self, data: Bytes) -> BoxFuture<'_, Result<()>>;

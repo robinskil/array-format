@@ -193,8 +193,8 @@ pub enum FillValue {
     UInt(u64),
     Float(f64),
     String(String),
-    /// Fill value for [`DType::TimestampNs`](crate::dtype::DType::TimestampNs)
-    /// arrays — interpreted as `i64` nanoseconds since the Unix epoch.
+    /// Fill value for [`DType::TimestampNs`] arrays — interpreted as `i64`
+    /// nanoseconds since the Unix epoch.
     TimestampNs(i64),
 }
 

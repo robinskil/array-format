@@ -2,7 +2,7 @@
 //!
 //! The [`CompressionCodec`] trait allows plugging in different compression
 //! algorithms. The footer records which codec was used per block via
-//! [`CodecId`](crate::block::CodecId), so the reader must be configured
+//! [`CodecId`], so the reader must be configured
 //! with a codec that can handle all codec ids present in the file.
 
 use crate::block::CodecId;
@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 ///
 /// Implement this trait to add support for custom compression algorithms
 /// (e.g. zstd, lz4, snappy). Register the codec by its
-/// [`CodecId::Named`](crate::block::CodecId::Named) identifier.
+/// [`CodecId::Named`] identifier.
 pub trait CompressionCodec: Send + Sync {
     /// Returns the [`CodecId`] that identifies this codec in the footer.
     fn id(&self) -> CodecId;

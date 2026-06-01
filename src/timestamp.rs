@@ -25,10 +25,12 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 pub struct TimestampNs(pub i64);
 
 impl TimestampNs {
+    /// Wraps a raw nanoseconds-since-epoch value.
     pub const fn new(nanos: i64) -> Self {
         Self(nanos)
     }
 
+    /// Returns the underlying nanoseconds-since-epoch value.
     pub const fn nanos(self) -> i64 {
         self.0
     }
