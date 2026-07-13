@@ -234,10 +234,18 @@ async fn binary_and_list_attributes_roundtrip() {
             .unwrap();
         file.define_array::<f32>("signal", vec!["x".into()], vec![3], None, None)
             .unwrap();
-        file.set_attribute("signal", "checksum", AttributeValue::Binary(vec![0xde, 0xad, 0xbe]))
-            .unwrap();
-        file.set_attribute("signal", "coeffs", AttributeValue::Float64List(vec![0.1, 0.2, 0.3]))
-            .unwrap();
+        file.set_attribute(
+            "signal",
+            "checksum",
+            AttributeValue::Binary(vec![0xde, 0xad, 0xbe]),
+        )
+        .unwrap();
+        file.set_attribute(
+            "signal",
+            "coeffs",
+            AttributeValue::Float64List(vec![0.1, 0.2, 0.3]),
+        )
+        .unwrap();
         file.set_attribute(
             "signal",
             "tags",

@@ -26,8 +26,12 @@ async fn main() {
     file.define_array::<u8>(FILE_META, vec![], vec![], None, None)
         .unwrap();
 
-    file.set_attribute(FILE_META, "title", AttributeValue::String("My Dataset".into()))
-        .unwrap();
+    file.set_attribute(
+        FILE_META,
+        "title",
+        AttributeValue::String("My Dataset".into()),
+    )
+    .unwrap();
     file.set_attribute(FILE_META, "schema_version", AttributeValue::Int32(3))
         .unwrap();
     file.set_attribute(

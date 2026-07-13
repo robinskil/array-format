@@ -41,7 +41,10 @@ async fn main() {
         .unwrap();
     let missing = file.get_attribute("pressure", "long_name").unwrap();
     let checksum = file.get_attribute("pressure", "checksum").unwrap().unwrap();
-    let range = file.get_attribute("pressure", "valid_range").unwrap().unwrap();
+    let range = file
+        .get_attribute("pressure", "valid_range")
+        .unwrap()
+        .unwrap();
 
     println!("units        = {units:?}");
     println!("scale_factor = {scale:?}");
