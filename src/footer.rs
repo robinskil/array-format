@@ -19,7 +19,7 @@ use crate::storage::Storage;
 pub const MAGIC: [u8; 4] = *b"ARRF";
 
 /// Current footer format version.
-pub const FOOTER_VERSION: u32 = 4;
+pub const FOOTER_VERSION: u32 = 5;
 
 /// Size of the trailer in bytes (`u64` footer size + 4-byte magic).
 pub const TRAILER_SIZE: usize = 12;

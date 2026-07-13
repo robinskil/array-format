@@ -35,6 +35,34 @@ pub enum AttributeValue {
     Float64(f64),
     /// UTF-8 string.
     String(String),
+    /// Variable-length binary data.
+    Binary(Vec<u8>),
+    /// List of boolean values.
+    BoolList(Vec<bool>),
+    /// List of signed 8-bit integers.
+    Int8List(Vec<i8>),
+    /// List of signed 16-bit integers.
+    Int16List(Vec<i16>),
+    /// List of signed 32-bit integers.
+    Int32List(Vec<i32>),
+    /// List of signed 64-bit integers.
+    Int64List(Vec<i64>),
+    /// List of unsigned 8-bit integers.
+    UInt8List(Vec<u8>),
+    /// List of unsigned 16-bit integers.
+    UInt16List(Vec<u16>),
+    /// List of unsigned 32-bit integers.
+    UInt32List(Vec<u32>),
+    /// List of unsigned 64-bit integers.
+    UInt64List(Vec<u64>),
+    /// List of 32-bit floating point values.
+    Float32List(Vec<f32>),
+    /// List of 64-bit floating point values.
+    Float64List(Vec<f64>),
+    /// List of UTF-8 strings.
+    StringList(Vec<String>),
+    /// List of variable-length binary values.
+    BinaryList(Vec<Vec<u8>>),
 }
 
 impl PartialEq for AttributeValue {
@@ -52,6 +80,26 @@ impl PartialEq for AttributeValue {
             (Self::Float32(a), Self::Float32(b)) => a.to_bits() == b.to_bits(),
             (Self::Float64(a), Self::Float64(b)) => a.to_bits() == b.to_bits(),
             (Self::String(a), Self::String(b)) => a == b,
+            (Self::Binary(a), Self::Binary(b)) => a == b,
+            (Self::BoolList(a), Self::BoolList(b)) => a == b,
+            (Self::Int8List(a), Self::Int8List(b)) => a == b,
+            (Self::Int16List(a), Self::Int16List(b)) => a == b,
+            (Self::Int32List(a), Self::Int32List(b)) => a == b,
+            (Self::Int64List(a), Self::Int64List(b)) => a == b,
+            (Self::UInt8List(a), Self::UInt8List(b)) => a == b,
+            (Self::UInt16List(a), Self::UInt16List(b)) => a == b,
+            (Self::UInt32List(a), Self::UInt32List(b)) => a == b,
+            (Self::UInt64List(a), Self::UInt64List(b)) => a == b,
+            // Compare floats by bit pattern so NaN == NaN, matching the scalar
+            // float variants and keeping value interning deduplication stable.
+            (Self::Float32List(a), Self::Float32List(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            (Self::Float64List(a), Self::Float64List(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            (Self::StringList(a), Self::StringList(b)) => a == b,
+            (Self::BinaryList(a), Self::BinaryList(b)) => a == b,
             _ => false,
         }
     }
@@ -298,6 +346,54 @@ mod tests {
             coord,
             address: sample_addr(block, offset, size),
         }
+    }
+
+    #[test]
+    fn attribute_value_binary_and_list_equality() {
+        assert_eq!(
+            AttributeValue::Binary(vec![1, 2, 3]),
+            AttributeValue::Binary(vec![1, 2, 3])
+        );
+        assert_ne!(
+            AttributeValue::Binary(vec![1, 2, 3]),
+            AttributeValue::Binary(vec![1, 2])
+        );
+        assert_eq!(
+            AttributeValue::Int32List(vec![1, 2, 3]),
+            AttributeValue::Int32List(vec![1, 2, 3])
+        );
+        assert_eq!(
+            AttributeValue::StringList(vec!["a".into(), "b".into()]),
+            AttributeValue::StringList(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            AttributeValue::BinaryList(vec![vec![0], vec![1, 2]]),
+            AttributeValue::BinaryList(vec![vec![0], vec![1, 2]])
+        );
+        // Different variants are never equal.
+        assert_ne!(
+            AttributeValue::Int32List(vec![1]),
+            AttributeValue::Int64List(vec![1])
+        );
+    }
+
+    #[test]
+    fn attribute_value_float_list_compares_by_bits() {
+        // NaN == NaN by bit pattern, matching the scalar float variants so
+        // interning deduplication stays stable.
+        assert_eq!(
+            AttributeValue::Float64List(vec![f64::NAN, 1.0]),
+            AttributeValue::Float64List(vec![f64::NAN, 1.0])
+        );
+        // +0.0 and -0.0 have different bit patterns, so they are not equal.
+        assert_ne!(
+            AttributeValue::Float32List(vec![0.0]),
+            AttributeValue::Float32List(vec![-0.0])
+        );
+        assert_ne!(
+            AttributeValue::Float64List(vec![1.0, 2.0]),
+            AttributeValue::Float64List(vec![1.0])
+        );
     }
 
     #[test]

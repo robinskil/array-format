@@ -400,6 +400,23 @@ impl ArrayFile {
         Ok(None)
     }
 
+    /// Returns attribute `key` for every visible array as `(array_name, value)`.
+    ///
+    /// The result is a full column over all non-deleted arrays: `Some(value)`
+    /// for arrays that carry the attribute, `None` for those that don't.
+    /// Intended for coarse pruning — scan the returned values to select arrays
+    /// without walking each one via [`get_attribute`](Self::get_attribute).
+    /// Logically deleted arrays are omitted entirely.
+    pub fn attribute_index(&self, key: &str) -> Vec<(String, Option<&AttributeValue>)> {
+        self.list_arrays()
+            .into_iter()
+            .map(|m| {
+                let value = self.get_attribute(&m.name, key).ok().flatten();
+                (m.name, value)
+            })
+            .collect()
+    }
+
     /// Sets attribute `key` on array `name` to `value`, inserting or replacing
     /// any existing entry. The change lands in the pending layer and is
     /// persisted on the next [`flush`](Self::flush). Errors if the array does
@@ -930,5 +947,106 @@ mod tests {
         let b = file_b.cache.as_ref().expect("file_b has cache");
         assert!(Arc::ptr_eq(a, &shared));
         assert!(Arc::ptr_eq(b, &shared));
+    }
+
+    /// Looks up `name` in an `attribute_index` result.
+    fn find<'a>(
+        index: &'a [(String, Option<&AttributeValue>)],
+        name: &str,
+    ) -> Option<&'a Option<&'a AttributeValue>> {
+        index.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+    }
+
+    #[tokio::test]
+    async fn attribute_index_returns_full_column() {
+        let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
+            .await
+            .unwrap();
+
+        file.define_array::<f32>("a", vec!["x".into()], vec![4], None, None)
+            .unwrap();
+        file.define_array::<f32>("b", vec!["x".into()], vec![4], None, None)
+            .unwrap();
+        file.define_array::<f32>("c", vec!["x".into()], vec![4], None, None)
+            .unwrap();
+
+        file.set_attribute("a", "units", AttributeValue::String("hPa".into()))
+            .unwrap();
+        file.set_attribute("b", "units", AttributeValue::String("Pa".into()))
+            .unwrap();
+        // "c" deliberately has no "units" attribute.
+
+        let index = file.attribute_index("units");
+        assert_eq!(index.len(), 3, "every visible array appears once");
+        assert_eq!(
+            find(&index, "a"),
+            Some(&Some(&AttributeValue::String("hPa".into())))
+        );
+        assert_eq!(
+            find(&index, "b"),
+            Some(&Some(&AttributeValue::String("Pa".into())))
+        );
+        assert_eq!(find(&index, "c"), Some(&None), "absent attribute -> None");
+    }
+
+    #[tokio::test]
+    async fn attribute_index_unknown_key_is_all_none() {
+        let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
+            .await
+            .unwrap();
+        file.define_array::<f32>("a", vec!["x".into()], vec![4], None, None)
+            .unwrap();
+        file.set_attribute("a", "units", AttributeValue::String("hPa".into()))
+            .unwrap();
+
+        let index = file.attribute_index("nonexistent");
+        assert_eq!(index.len(), 1);
+        assert_eq!(find(&index, "a"), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn attribute_index_omits_deleted_arrays() {
+        let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
+            .await
+            .unwrap();
+        file.define_array::<f32>("a", vec!["x".into()], vec![4], None, None)
+            .unwrap();
+        file.define_array::<f32>("b", vec!["x".into()], vec![4], None, None)
+            .unwrap();
+        file.set_attribute("a", "units", AttributeValue::String("hPa".into()))
+            .unwrap();
+        file.set_attribute("b", "units", AttributeValue::String("Pa".into()))
+            .unwrap();
+
+        file.delete("b").unwrap();
+
+        let index = file.attribute_index("units");
+        assert_eq!(index.len(), 1, "deleted array dropped from column");
+        assert_eq!(find(&index, "b"), None);
+        assert_eq!(
+            find(&index, "a"),
+            Some(&Some(&AttributeValue::String("hPa".into())))
+        );
+    }
+
+    #[tokio::test]
+    async fn attribute_index_survives_flush() {
+        let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
+            .await
+            .unwrap();
+        file.define_array::<f32>("a", vec!["x".into()], vec![4], None, None)
+            .unwrap();
+        file.set_attribute("a", "units", AttributeValue::String("hPa".into()))
+            .unwrap();
+
+        // After flush the attribute lives in a committed sidecar footer, not the
+        // pending layer — the query must still read it from the delta stack.
+        file.flush().await.unwrap();
+
+        let index = file.attribute_index("units");
+        assert_eq!(
+            find(&index, "a"),
+            Some(&Some(&AttributeValue::String("hPa".into())))
+        );
     }
 }

@@ -99,6 +99,7 @@ file.read_array::<T>(name, start, shape).await?   // vec![], vec![] for full arr
 // Attributes
 file.set_attribute(name, key, AttributeValue::String("m/s".into()))?
 file.get_attribute(name, key)?
+file.attribute_index(key)                 // Vec<(array_name, Option<&AttributeValue>)> — one attribute across all arrays, for pruning
 
 // Statistics (min/max/null_count/row_count, refreshed on flush & compact)
 file.array_stats(name)                    // Option<&ArrayStats>
@@ -236,7 +237,7 @@ When `chunk_shape` is `None`, the entire array is stored as a single chunk.
 
 **Footer contents:**
 
-- `version` — format version (currently `4`)
+- `version` — format version (currently `5`)
 - `overlay_index` — which layer this file represents (`0` = base)
 - `base_file_hint` — stem of the base file
 - `blocks` — `Vec<BlockMeta>`: id, file offset, compressed/uncompressed sizes, codec
@@ -284,6 +285,48 @@ file.flush().await?;
 file.compact().await?;
 assert_eq!(file.num_layers(), 1);
 ```
+
+## Attributes
+
+Each array carries user-defined key-value attributes (units, scale factors, provenance, …). Set and read them per array:
+
+```rust
+file.set_attribute("pressure", "units", AttributeValue::String("hPa".into()))?;
+file.get_attribute("pressure", "units")?;   // Option<&AttributeValue>
+```
+
+An `AttributeValue` is a scalar (`Bool`, the sized `Int*`/`UInt*`, `Float32`/`Float64`, `String`), raw `Binary(Vec<u8>)`, or a typed list of any of those (`Int32List`, `Float64List`, `StringList`, `BinaryList`, …):
+
+```rust
+file.set_attribute("pressure", "checksum", AttributeValue::Binary(vec![0xde, 0xad]))?;
+file.set_attribute("pressure", "valid_range", AttributeValue::Float32List(vec![0.0, 1100.0]))?;
+```
+
+Attributes live in the footer dictionaries and are fully in memory once the file is open, so there is no sidecar to maintain. To prune by attribute, `attribute_index` returns one attribute across every visible array in a single call — a full column with `None` where the attribute is absent — instead of walking arrays one by one:
+
+```rust
+// Select the arrays measured in hPa without a per-array loop.
+let hpa: Vec<String> = file
+    .attribute_index("units")               // Vec<(String, Option<&AttributeValue>)>
+    .into_iter()
+    .filter(|(_, v)| matches!(v, Some(AttributeValue::String(s)) if s == "hPa"))
+    .map(|(name, _)| name)
+    .collect();
+```
+
+Logically deleted arrays are omitted from the result.
+
+### File-level metadata
+
+Attributes attach to arrays, so to describe the *file* as a whole (title, provenance, schema version) — including a metadata-only file with no data — define a scalar placeholder array with an empty shape and hang the attributes on it. Nothing is ever written to it, so `flush` skips stats and it costs almost nothing:
+
+```rust
+file.define_array::<u8>("__file__", vec![], vec![], None, None)?;   // empty shape → no data
+file.set_attribute("__file__", "title", AttributeValue::String("My Dataset".into()))?;
+file.flush().await?;
+```
+
+The placeholder appears in `list_arrays()` like any array; filter out its name to show only real data arrays. See `examples/10_file_metadata.rs`.
 
 ## Statistics
 

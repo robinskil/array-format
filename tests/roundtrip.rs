@@ -222,6 +222,51 @@ async fn local_file_roundtrip() {
 }
 
 #[tokio::test]
+async fn binary_and_list_attributes_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()) as Arc<dyn ObjectStore>;
+    let path = object_store::path::Path::from("attrs.af");
+
+    {
+        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), small_config())
+            .await
+            .unwrap();
+        file.define_array::<f32>("signal", vec!["x".into()], vec![3], None, None)
+            .unwrap();
+        file.set_attribute("signal", "checksum", AttributeValue::Binary(vec![0xde, 0xad, 0xbe]))
+            .unwrap();
+        file.set_attribute("signal", "coeffs", AttributeValue::Float64List(vec![0.1, 0.2, 0.3]))
+            .unwrap();
+        file.set_attribute(
+            "signal",
+            "tags",
+            AttributeValue::StringList(vec!["a".into(), "b".into()]),
+        )
+        .unwrap();
+        file.flush().await.unwrap();
+    }
+
+    {
+        let file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config())
+            .await
+            .unwrap();
+        assert_eq!(
+            file.get_attribute("signal", "checksum").unwrap(),
+            Some(&AttributeValue::Binary(vec![0xde, 0xad, 0xbe]))
+        );
+        assert_eq!(
+            file.get_attribute("signal", "coeffs").unwrap(),
+            Some(&AttributeValue::Float64List(vec![0.1, 0.2, 0.3]))
+        );
+        assert_eq!(
+            file.get_attribute("signal", "tags").unwrap(),
+            Some(&AttributeValue::StringList(vec!["a".into(), "b".into()]))
+        );
+    }
+}
+
+#[tokio::test]
 async fn layered_flat_write() {
     let dir = tempfile::tempdir().unwrap();
     let store =
@@ -1088,9 +1133,9 @@ async fn stats_survive_compact() {
 #[tokio::test]
 async fn stats_loaded_on_open() {
     let dir = tempfile::tempdir().unwrap();
-    let path =
-        object_store::path::Path::from(dir.path().to_string_lossy().as_ref()).join("data.af");
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let path = object_store::path::Path::from("data.af");
 
     {
         let mut file = ArrayFile::create(store.clone(), path.clone(), small_config())
