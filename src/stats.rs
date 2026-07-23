@@ -56,15 +56,31 @@ impl ArrayStats {
     }
 }
 
+/// Current `.stats` sidecar format version. Bumped whenever the encoded shape
+/// changes, so a sidecar written by an older build is rejected with a clear
+/// error instead of being misread.
+pub const STATS_VERSION: u32 = 1;
+
 /// The stats file: one [`ArrayStats`] per array.
 ///
 /// Stored in `{stem}.stats` alongside the `.af` file using the same
 /// rkyv + trailer format as the footer:
 /// `[rkyv_bytes][size: u64 LE][MAGIC: b"ARST"]`
-#[derive(Debug, Clone, PartialEq, Default, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub struct StatsFile {
+    /// Format version; see [`STATS_VERSION`].
+    pub version: u32,
     /// Per-array statistics, one entry per array in the file.
     pub arrays: Vec<ArrayStats>,
+}
+
+impl Default for StatsFile {
+    fn default() -> Self {
+        Self {
+            version: STATS_VERSION,
+            arrays: Vec::new(),
+        }
+    }
 }
 
 impl StatsFile {
@@ -76,9 +92,31 @@ impl StatsFile {
         }
     }
 
+    /// Drops the statistics for `name`, if present. Returns whether an entry
+    /// was removed.
+    ///
+    /// Needed because a logically deleted array never re-enters the dirty set
+    /// (`mark_deleted` clears its chunk list), so without an explicit removal
+    /// its stale stats would survive every flush until the next compaction.
+    pub(crate) fn remove(&mut self, name: &str) -> bool {
+        let before = self.arrays.len();
+        self.arrays.retain(|a| a.name != name);
+        self.arrays.len() != before
+    }
+
     /// Returns the statistics for the array named `name`, if present.
     pub fn get_array(&self, name: &str) -> Option<&ArrayStats> {
         self.arrays.iter().find(|a| a.name == name)
+    }
+
+    /// All entries in the file, in storage order.
+    ///
+    /// The bulk counterpart to [`get_array`](Self::get_array): building a
+    /// column over N arrays via `get_array` is O(N²), since each call scans the
+    /// whole `Vec`. Callers assembling a cross-array index should iterate once
+    /// through this instead.
+    pub fn entries(&self) -> &[ArrayStats] {
+        &self.arrays
     }
 
     pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
@@ -108,8 +146,15 @@ impl StatsFile {
         let rkyv_start = size_start - size;
         let mut aligned: rkyv::util::AlignedVec = rkyv::util::AlignedVec::new();
         aligned.extend_from_slice(&data[rkyv_start..size_start]);
-        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
-            .map_err(|e| Error::Serialization(e.to_string()))
+        let decoded: Self = rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
+            .map_err(|e| Error::Serialization(e.to_string()))?;
+        if decoded.version != STATS_VERSION {
+            return Err(Error::InvalidFooter(format!(
+                "unsupported stats version {} (expected {STATS_VERSION})",
+                decoded.version
+            )));
+        }
+        Ok(decoded)
     }
 }
 
@@ -559,6 +604,7 @@ mod tests {
     #[test]
     fn statsfile_serialize_deserialize_roundtrip() {
         let sf = StatsFile {
+            version: STATS_VERSION,
             arrays: vec![ArrayStats {
                 name: "arr".into(),
                 min: Some(StatValue::Int(-1)),

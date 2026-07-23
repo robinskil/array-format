@@ -206,9 +206,17 @@ impl ArrayFile {
             );
         }
 
+        // A missing sidecar is normal (nothing has been flushed yet); a sidecar
+        // that exists but doesn't parse is not, and must not be swallowed.
+        // Silently falling back to `None` on a corrupt file would make the next
+        // flush start from an empty StatsFile and drop the stats of every array
+        // it doesn't happen to dirty.
         let stats = {
             let s_storage = ObjectStoreBackend::new(Arc::clone(&store), stats_path(&path));
-            read_stats_file(&s_storage).await.ok()
+            match s_storage.size().await {
+                Err(_) => None,
+                Ok(_) => Some(read_stats_file(&s_storage).await?),
+            }
         };
 
         Ok(ArrayFile {
@@ -359,6 +367,16 @@ impl ArrayFile {
         self.stats.as_ref()?.get_array(name)
     }
 
+    /// The whole statistics table, or `None` if nothing has been flushed yet.
+    ///
+    /// Use this — via [`StatsFile::entries`] — when building an index over many
+    /// arrays at once. [`array_stats`](Self::array_stats) scans the table on
+    /// every call, so looping it over N names is O(N²); one pass over
+    /// `entries()` is O(N).
+    pub fn stats(&self) -> Option<&StatsFile> {
+        self.stats.as_ref()
+    }
+
     /// Number of committed (immutable) delta layers.
     pub fn num_layers(&self) -> usize {
         self.deltas.len()
@@ -506,6 +524,14 @@ impl ArrayFile {
     pub fn delete(&mut self, name: &str) -> Result<()> {
         let meta = self.get_array(name)?.clone();
         self.pending_mut().mark_deleted(meta);
+        // Drop the stats entry too. `mark_deleted` clears the chunk list, so
+        // this array will never appear in `dirty_names` again — without an
+        // explicit removal here its stale min/max would be carried forward by
+        // every subsequent flush until the next `compact`, and `array_stats`
+        // would keep answering for a deleted array.
+        if let Some(stats) = self.stats.as_mut() {
+            stats.remove(name);
+        }
         Ok(())
     }
 }

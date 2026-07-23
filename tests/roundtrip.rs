@@ -1249,3 +1249,71 @@ async fn timestamp_ns_roundtrip_and_stats() {
     assert_eq!(stats.null_count, 2);
     assert_eq!(stats.row_count, values.len() as u64);
 }
+
+/// Deleting an array must drop its statistics, not leave them readable.
+///
+/// `mark_deleted` clears the chunk list, so a deleted array never re-enters the
+/// dirty set — before `StatsFile::remove` existed, its stale min/max survived
+/// every subsequent flush and only disappeared at the next `compact`.
+#[tokio::test]
+async fn delete_drops_array_stats() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    file.define_array::<i32>("gone", vec!["x".into()], vec![3], None, None)
+        .unwrap();
+    file.write_array(
+        "gone",
+        vec![0],
+        Array::from_vec(vec![7i32, 8, 9]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.define_array::<i32>("kept", vec!["x".into()], vec![3], None, None)
+        .unwrap();
+    file.write_array(
+        "kept",
+        vec![0],
+        Array::from_vec(vec![1i32, 2, 3]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+    file.flush().await.unwrap();
+    assert!(file.array_stats("gone").is_some(), "precondition");
+
+    file.delete("gone").unwrap();
+    assert!(
+        file.array_stats("gone").is_none(),
+        "stats must go as soon as the array is deleted"
+    );
+
+    // ...and must not come back after the flush that persists the tombstone.
+    file.flush().await.unwrap();
+    assert!(file.array_stats("gone").is_none(), "stale stats resurrected");
+    assert!(
+        file.array_stats("kept").is_some(),
+        "deleting one array must not disturb another"
+    );
+}
+
+/// `entries()` is the bulk accessor: one pass over every entry, instead of an
+/// O(n) `get_array` scan per name.
+#[tokio::test]
+async fn stats_entries_exposes_every_array() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    for name in ["a", "b", "c"] {
+        file.define_array::<i32>(name, vec!["x".into()], vec![2], None, None)
+            .unwrap();
+        file.write_array(
+            name,
+            vec![0],
+            Array::from_vec(vec![1i32, 2]).into_dyn().view(),
+        )
+        .await
+        .unwrap();
+    }
+    file.flush().await.unwrap();
+
+    let stats = file.stats().expect("stats after flush");
+    let mut names: Vec<&str> = stats.entries().iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["a", "b", "c"]);
+}
