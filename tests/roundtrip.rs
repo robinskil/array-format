@@ -1287,7 +1287,10 @@ async fn delete_drops_array_stats() {
 
     // ...and must not come back after the flush that persists the tombstone.
     file.flush().await.unwrap();
-    assert!(file.array_stats("gone").is_none(), "stale stats resurrected");
+    assert!(
+        file.array_stats("gone").is_none(),
+        "stale stats resurrected"
+    );
     assert!(
         file.array_stats("kept").is_some(),
         "deleting one array must not disturb another"
