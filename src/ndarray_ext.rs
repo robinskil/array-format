@@ -138,6 +138,9 @@ where
 
 /// Writes `data` into a chunked array at `offset`, performing
 /// read-modify-write for partial chunks.
+///
+/// A `data` view with no elements writes nothing and returns `Ok`. The
+/// bounds of the region are still checked.
 pub(crate) async fn write_nd<T>(
     file: &mut ArrayFile,
     name: &str,
@@ -182,6 +185,12 @@ where
                 offset[i], end, full_shape[i]
             )));
         }
+    }
+
+    // An empty region covers no chunk. This happens when an axis of the
+    // array has length 0, which NetCDF uses for absent records.
+    if data.is_empty() {
+        return Ok(());
     }
 
     let write_end: Vec<usize> = (0..ndim).map(|i| offset[i] + data.shape()[i]).collect();
