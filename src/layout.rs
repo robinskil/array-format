@@ -326,6 +326,20 @@ impl ArrayLayout {
     pub fn all_addresses(&self) -> Vec<&ChunkAddress> {
         self.storage.chunks.iter().map(|e| &e.address).collect()
     }
+
+    /// Returns the chunk shape with every zero extent raised to 1.
+    ///
+    /// An axis of length 0 makes the array empty. NetCDF declares such a
+    /// dimension when the records it holds are absent. Grid arithmetic
+    /// divides by the chunk extent, so a zero extent must never reach it.
+    /// The grid stays empty, because the axis holds no elements.
+    ///
+    /// A file written by an earlier version stores a zero extent for such an
+    /// axis. Use this method instead of the raw
+    /// [`chunk_shape`](StorageLayout::chunk_shape) on every read path.
+    pub fn effective_chunk_shape(&self) -> Vec<u32> {
+        self.storage.chunk_shape.iter().map(|&c| c.max(1)).collect()
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +443,26 @@ mod tests {
         assert_eq!(addr.offset, 2000);
 
         assert!(layout.get_chunk(&[1, 0]).is_none());
+    }
+
+    #[test]
+    fn effective_chunk_shape_raises_zero_extents() {
+        // An earlier version stored the shape as the chunk shape, so an empty
+        // axis carries a 0 extent. Reading must not divide by it.
+        let layout = ArrayLayout {
+            shape: vec![0, 3],
+            dimension_names: vec!["n_history".into(), "x".into()],
+            storage: StorageLayout {
+                chunk_shape: vec![0, 3],
+                chunks: vec![],
+            },
+        };
+        assert_eq!(layout.effective_chunk_shape(), vec![1, 3]);
+        // The grid stays empty, because the axis holds no elements.
+        assert_eq!(
+            layout.shape[0].div_ceil(layout.effective_chunk_shape()[0]),
+            0
+        );
     }
 
     #[test]

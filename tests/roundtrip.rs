@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use array_format::{
-    ArrayFile, AttributeValue, FileConfig, FillValue, NoCompression, StatValue, TimestampNs,
+    ArrayFile, AttributeValue, Error, FileConfig, FillValue, NoCompression, StatValue, TimestampNs,
 };
 use ndarray::{Array, IxDyn};
 use object_store::{ObjectStore, local::LocalFileSystem};
@@ -1319,4 +1319,229 @@ async fn stats_entries_exposes_every_array() {
     let mut names: Vec<&str> = stats.entries().iter().map(|s| s.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, vec!["a", "b", "c"]);
+}
+
+/// A zero-length axis makes the array empty. NetCDF declares such a dimension
+/// whenever the records it holds are absent — every Argo profile does so for
+/// `N_HISTORY`. The array survives a write, a flush and a compaction, and stays
+/// an empty array of the declared shape.
+#[tokio::test]
+async fn zero_length_dimension_roundtrip() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    file.define_array::<f32>(
+        "history",
+        vec!["n_history".into(), "x".into()],
+        vec![0, 3],
+        None,
+        None,
+    )
+    .unwrap();
+
+    // The chunk extent of an empty axis is stored as 1, never 0.
+    let meta = file
+        .list_arrays()
+        .into_iter()
+        .find(|m| m.name == "history")
+        .expect("array is visible");
+    assert_eq!(meta.shape, vec![0, 3]);
+    assert_eq!(meta.chunk_shape, vec![1, 3]);
+
+    let data = Array::from_shape_vec(IxDyn(&[0, 3]), Vec::<f32>::new()).unwrap();
+    file.write_array("history", vec![0, 0], data.view())
+        .await
+        .unwrap();
+
+    let before = file
+        .read_array::<f32>("history", vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(before.shape(), &[0, 3]);
+    assert_eq!(before.len(), 0);
+
+    file.flush().await.unwrap();
+    let after = file
+        .read_array::<f32>("history", vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(after.shape(), &[0, 3]);
+
+    file.compact().await.unwrap();
+    let compacted = file
+        .read_array::<f32>("history", vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(compacted.shape(), &[0, 3]);
+}
+
+/// A converter that mirrors the shape into the chunk shape passes a zero
+/// extent for the empty axis. That is accepted and normalized to 1.
+#[tokio::test]
+async fn zero_length_dimension_with_mirrored_chunk_shape() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    file.define_array::<i32>(
+        "history",
+        vec!["n_history".into(), "x".into()],
+        vec![0, 3],
+        Some(vec![0, 3]),
+        None,
+    )
+    .unwrap();
+
+    let data = Array::from_shape_vec(IxDyn(&[0, 3]), Vec::<i32>::new()).unwrap();
+    file.write_array("history", vec![0, 0], data.view())
+        .await
+        .unwrap();
+    file.flush().await.unwrap();
+
+    let out = file
+        .read_array::<i32>("history", vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(out.shape(), &[0, 3]);
+}
+
+/// An empty axis in the middle of a multi-dimensional array behaves the same.
+#[tokio::test]
+async fn zero_length_middle_axis_reads_back_empty() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    file.define_array::<f64>(
+        "mid",
+        vec!["a".into(), "b".into(), "c".into()],
+        vec![2, 0, 4],
+        Some(vec![1, 0, 2]),
+        None,
+    )
+    .unwrap();
+    file.flush().await.unwrap();
+
+    let out = file.read_array::<f64>("mid", vec![], vec![]).await.unwrap();
+    assert_eq!(out.shape(), &[2, 0, 4]);
+    assert_eq!(out.len(), 0);
+}
+
+/// An empty view is a no-op, even on an array that holds data.
+#[tokio::test]
+async fn empty_write_leaves_a_populated_array_untouched() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    file.define_array::<u8>("arr", vec!["x".into()], vec![4], Some(vec![2]), None)
+        .unwrap();
+    file.write_array(
+        "arr",
+        vec![0],
+        Array::from_vec(vec![1u8, 2, 3, 4]).into_dyn().view(),
+    )
+    .await
+    .unwrap();
+
+    let empty = Array::from_shape_vec(IxDyn(&[0]), Vec::<u8>::new()).unwrap();
+    file.write_array("arr", vec![2], empty.view())
+        .await
+        .unwrap();
+
+    let out = file.read_array::<u8>("arr", vec![], vec![]).await.unwrap();
+    assert_eq!(out.iter().copied().collect::<Vec<u8>>(), vec![1, 2, 3, 4]);
+}
+
+/// An empty array holds no elements, so any non-empty write is out of range.
+/// It reports an error instead of panicking.
+#[tokio::test]
+async fn write_to_zero_length_axis_reports_out_of_range() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    file.define_array::<f32>("history", vec!["n".into()], vec![0], None, None)
+        .unwrap();
+
+    let data = Array::from_vec(vec![1.0f32]).into_dyn();
+    let err = file
+        .write_array("history", vec![0], data.view())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds array size"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A zero chunk extent on a non-empty axis has no meaning. It is rejected at
+/// definition time, rather than dividing by zero on the first write.
+#[tokio::test]
+async fn zero_chunk_extent_on_a_non_empty_axis_is_rejected() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    let err = file
+        .define_array::<f32>("bad", vec!["x".into()], vec![4], Some(vec![0]), None)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidChunkShape { .. }));
+    assert!(file.list_arrays().is_empty(), "nothing was defined");
+}
+
+/// The chunk shape must have one extent per axis.
+#[tokio::test]
+async fn chunk_shape_with_wrong_axis_count_is_rejected() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    let err = file
+        .define_array::<f32>(
+            "bad",
+            vec!["x".into(), "y".into()],
+            vec![4, 4],
+            Some(vec![2]),
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidChunkShape { .. }));
+}
+
+/// The empty axis survives the footer: define, flush, close, reopen, read.
+#[tokio::test]
+async fn zero_length_dimension_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()) as Arc<dyn ObjectStore>;
+    let path = object_store::path::Path::from("history.af");
+
+    {
+        let mut file = ArrayFile::create(Arc::clone(&store), path.clone(), small_config())
+            .await
+            .unwrap();
+        file.define_array::<f32>(
+            "history",
+            vec!["n_history".into(), "x".into()],
+            vec![0, 3],
+            None,
+            None,
+        )
+        .unwrap();
+        let data = Array::from_shape_vec(IxDyn(&[0, 3]), Vec::<f32>::new()).unwrap();
+        file.write_array("history", vec![0, 0], data.view())
+            .await
+            .unwrap();
+        file.set_attribute("history", "units", AttributeValue::String("n/a".into()))
+            .unwrap();
+        file.flush().await.unwrap();
+    }
+
+    let file = ArrayFile::open(Arc::clone(&store), path.clone(), small_config())
+        .await
+        .unwrap();
+    let meta = file
+        .list_arrays()
+        .into_iter()
+        .find(|m| m.name == "history")
+        .expect("array survives the reopen");
+    assert_eq!(meta.shape, vec![0, 3]);
+    assert_eq!(meta.dimension_names, vec!["n_history", "x"]);
+    let out = file
+        .read_array::<f32>("history", vec![], vec![])
+        .await
+        .unwrap();
+    assert_eq!(out.shape(), &[0, 3]);
+    assert_eq!(
+        file.get_attribute("history", "units").unwrap(),
+        Some(&AttributeValue::String("n/a".into()))
+    );
 }

@@ -290,7 +290,7 @@ impl ArrayFile {
     pub(crate) fn get_chunked_schema(&self, name: &str) -> Result<ChunkedSchema> {
         let meta = self.get_array(name)?;
         let full_shape = meta.layout.shape.clone();
-        let chunk_shape = meta.layout.storage.chunk_shape.clone();
+        let chunk_shape = meta.layout.effective_chunk_shape();
         let dtype = meta.dtype.clone();
         // Collect existing chunk coords from all layers (newest wins, so just union).
         let mut existing: IndexMap<Vec<u32>, ()> = IndexMap::new();
@@ -332,7 +332,7 @@ impl ArrayFile {
                             name: a.name.clone(),
                             dtype: a.dtype.clone(),
                             shape: a.layout.shape.clone(),
-                            chunk_shape: a.layout.storage.chunk_shape.clone(),
+                            chunk_shape: a.layout.effective_chunk_shape(),
                             dimension_names: a.layout.dimension_names.clone(),
                             fill_value: a.fill_value.clone(),
                         },
@@ -351,7 +351,7 @@ impl ArrayFile {
                             name: a.name.clone(),
                             dtype: a.dtype.clone(),
                             shape: a.layout.shape.clone(),
-                            chunk_shape: a.layout.storage.chunk_shape.clone(),
+                            chunk_shape: a.layout.effective_chunk_shape(),
                             dimension_names: a.layout.dimension_names.clone(),
                             fill_value: a.fill_value.clone(),
                         },
@@ -472,9 +472,16 @@ impl ArrayFile {
     /// it is replaced with `dim0`, `dim1`, … . `fill_value` is returned for
     /// elements that are never written.
     ///
+    /// An axis of length 0 is allowed. The array then holds no elements, and
+    /// [`read_array`](Self::read_array) returns an empty array of that shape.
+    /// NetCDF declares such a dimension when the records it holds are absent.
+    /// The chunk extent of that axis is stored as 1, because an empty axis
+    /// yields no chunks either way.
+    ///
     /// Errors with [`Error::ArrayAlreadyExists`] if an array of this name is
-    /// already visible. The definition is persisted on the next
-    /// [`flush`](Self::flush).
+    /// already visible, or with [`Error::InvalidChunkShape`] if `chunk_shape`
+    /// has the wrong number of axes or a zero extent on a non-empty axis.
+    /// The definition is persisted on the next [`flush`](Self::flush).
     pub fn define_array<T: ArrayElement>(
         &mut self,
         name: impl Into<String>,
@@ -489,9 +496,33 @@ impl ArrayFile {
         }
         let shape_u32: Vec<u32> = shape.iter().map(|&s| s as u32).collect();
         let ndim = shape_u32.len();
-        let chunk_shape_u32: Vec<u32> = chunk_shape
-            .map(|cs| cs.iter().map(|&s| s as u32).collect())
-            .unwrap_or_else(|| shape_u32.clone());
+        let chunk_shape_u32: Vec<u32> = match chunk_shape {
+            None => shape_u32.iter().map(|&s| s.max(1)).collect(),
+            Some(cs) => {
+                if cs.len() != ndim {
+                    return Err(Error::InvalidChunkShape {
+                        name,
+                        reason: format!("{} axes, but the shape has {ndim}", cs.len()),
+                    });
+                }
+                // A zero extent on an empty axis mirrors the shape, which is
+                // what a NetCDF converter passes. Store 1 instead, so the grid
+                // arithmetic stays defined. On a non-empty axis a zero extent
+                // has no meaning, so reject it.
+                let mut out = Vec::with_capacity(ndim);
+                for (axis, (&c, &s)) in cs.iter().zip(&shape_u32).enumerate() {
+                    let c = c as u32;
+                    if c == 0 && s != 0 {
+                        return Err(Error::InvalidChunkShape {
+                            name,
+                            reason: format!("axis {axis} has extent 0, but its length is {s}"),
+                        });
+                    }
+                    out.push(c.max(1));
+                }
+                out
+            }
+        };
         let dim_names = if dimension_names.len() == ndim {
             dimension_names
         } else {
@@ -550,8 +581,7 @@ impl ArrayFile {
         let meta = self.get_array(name)?;
         let chunk_elems: usize = meta
             .layout
-            .storage
-            .chunk_shape
+            .effective_chunk_shape()
             .iter()
             .enumerate()
             .map(|(i, &cs)| {

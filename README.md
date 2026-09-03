@@ -219,6 +219,22 @@ file.define_array::<f32>(
 
 When `chunk_shape` is `None`, the entire array is stored as a single chunk.
 
+### Zero-length dimensions
+
+An axis may have length 0. The array then holds no elements. NetCDF declares such a dimension when the records it holds are absent, for example `N_HISTORY` in an Argo profile.
+
+```rust
+file.define_array::<f32>(
+    "history",
+    vec!["n_history".into(), "x".into()],
+    vec![0, 3],                 // an empty axis
+    None,
+    None,
+)?;
+```
+
+`write_array` with an empty view writes nothing and returns `Ok`. `read_array` returns an empty array of shape `[0, 3]`. A chunk extent of 0 on such an axis is stored as 1, because an empty axis yields no chunks. A chunk extent of 0 on a non-empty axis is rejected with `Error::InvalidChunkShape`.
+
 ## On-disk layout (per delta file)
 
 ```text

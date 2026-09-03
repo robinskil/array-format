@@ -54,6 +54,15 @@ pub enum Error {
         /// The dtype of the data being read or written.
         actual: DType,
     },
+
+    /// The chunk shape does not fit the array shape.
+    #[error("invalid chunk shape for '{name}': {reason}")]
+    InvalidChunkShape {
+        /// Name of the array.
+        name: String,
+        /// Why the chunk shape does not fit.
+        reason: String,
+    },
 }
 
 /// A specialized [`Result`] type for array-format operations.
