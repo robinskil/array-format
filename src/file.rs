@@ -14,8 +14,8 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use crate::{
     DType, Error, Result,
     address::ChunkAddress,
-    attr_index::AttrIndex,
     array::ArrayElement,
+    attr_index::AttrIndex,
     codec::CompressionCodec,
     delta::{
         Delta, DeltaAllocator, DeltaCache, DeltaImmutable, DeltaMutable, write_file_then_bytes,
@@ -912,7 +912,8 @@ impl ArrayFile {
         // that point at the wrong strings.
         let mut attr_keys: Vec<String> = Vec::new();
         let mut attr_values: Vec<crate::layout::AttributeValue> = Vec::new();
-        let mut key_ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut key_ids: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut value_ids: std::collections::HashMap<crate::layout::AttributeValue, usize> =
             std::collections::HashMap::new();
 
