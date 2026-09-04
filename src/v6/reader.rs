@@ -325,7 +325,11 @@ impl ArrayFile {
     }
 
     /// Raw bytes of the chunk at `coord`, or `None` if it was never written.
-    async fn read_raw_chunk(&self, info: &ArrayInfo, coord: &[u32]) -> Result<Option<Bytes>> {
+    pub(crate) async fn read_raw_chunk(
+        &self,
+        info: &ArrayInfo,
+        coord: &[u32],
+    ) -> Result<Option<Bytes>> {
         let Some(addr) = find_chunk(&info.chunks, coord) else {
             return Ok(None);
         };

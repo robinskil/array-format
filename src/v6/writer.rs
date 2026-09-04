@@ -123,7 +123,65 @@ impl ArrayWriter {
         chunk_shape: Option<Vec<usize>>,
         fill_value: Option<FillValue>,
     ) -> Result<()> {
-        let name = name.into();
+        self.define(
+            name.into(),
+            T::DTYPE,
+            dimension_names,
+            shape,
+            chunk_shape,
+            fill_value,
+        )
+    }
+
+    /// Copies array `name` from `source` into this writer: its definition,
+    /// every written chunk, and its attributes.
+    ///
+    /// Chunks are read decompressed and packed into this writer's blocks, so
+    /// the copy uses this writer's codec and block size. Statistics are
+    /// recomputed from the copied bytes.
+    ///
+    /// Errors with [`Error::ArrayNotFound`] if `source` has no such array, or
+    /// [`Error::ArrayAlreadyExists`] if this writer already has one.
+    pub async fn copy_array(&mut self, source: &ArrayFile, name: &str) -> Result<()> {
+        let info = source.array(name).ok_or_else(|| Error::ArrayNotFound {
+            name: name.to_string(),
+        })?;
+        self.define(
+            name.to_string(),
+            info.dtype.clone(),
+            info.dimension_names.clone(),
+            info.shape.iter().map(|&s| s as usize).collect(),
+            Some(info.chunk_shape.iter().map(|&c| c as usize).collect()),
+            info.fill_value.clone(),
+        )?;
+        for coord in info.written_chunks() {
+            if let Some(bytes) = source.read_raw_chunk(info, coord).await? {
+                self.write_chunk_raw(name, coord.to_vec(), &bytes)?;
+            }
+        }
+        if let Some(attrs) = source.attributes(name) {
+            // Sorted, so the footer does not depend on hash order.
+            let mut entries: Vec<(&EcoString, &AttributeValue)> = attrs.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let pending = self.array_mut(name)?;
+            for (key, value) in entries {
+                pending.attributes.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Defines an array from a runtime dtype. See
+    /// [`define_array`](Self::define_array) for the rules.
+    fn define(
+        &mut self,
+        name: String,
+        dtype: DType,
+        dimension_names: Vec<String>,
+        shape: Vec<usize>,
+        chunk_shape: Option<Vec<usize>>,
+        fill_value: Option<FillValue>,
+    ) -> Result<()> {
         if self.arrays.contains_key(&name) {
             return Err(Error::ArrayAlreadyExists { name });
         }
@@ -164,7 +222,7 @@ impl ArrayWriter {
         self.arrays.insert(
             name,
             PendingArray {
-                dtype: T::DTYPE,
+                dtype,
                 shape: shape_u32,
                 dimension_names,
                 chunk_shape: chunk_shape_u32,
@@ -667,6 +725,174 @@ mod tests {
         assert_eq!(meta.chunk_shape, vec![1, 3], "zero extent is stored as 1");
         assert!(meta.chunks.is_empty());
         assert_eq!(meta.stats.as_ref().unwrap().row_count, 0);
+    }
+
+    // ── copy_array ───────────────────────────────────────────────────
+
+    /// A source file with a partially written chunked array, attributes, a
+    /// fill value, and a second plain array.
+    async fn source_file() -> (ArrayFile, Arc<InMemoryStorage>) {
+        let mut w = writer();
+        w.define_array::<i32>(
+            "grid",
+            vec!["x".into()],
+            vec![10],
+            Some(vec![4]),
+            Some(FillValue::Int(-1)),
+        )
+        .unwrap();
+        // Chunk 0 full, chunk 1 untouched, chunk 2 clipped to two elements.
+        w.write_array(
+            "grid",
+            vec![0],
+            Array::from_vec(vec![1i32, 2, 3, 4]).into_dyn().view(),
+        )
+        .unwrap();
+        w.write_array(
+            "grid",
+            vec![8],
+            Array::from_vec(vec![9i32, 10]).into_dyn().view(),
+        )
+        .unwrap();
+        w.set_attribute("grid", "units", AttributeValue::String("m".into()))
+            .unwrap();
+        w.set_attribute(
+            "grid",
+            "levels",
+            AttributeValue::Int32List(Box::new([1, 2, 3])),
+        )
+        .unwrap();
+        w.define_array::<u8>("flags", vec![], vec![3], None, None)
+            .unwrap();
+        w.write_array(
+            "flags",
+            vec![0],
+            Array::from_vec(vec![7u8, 8, 9]).into_dyn().view(),
+        )
+        .unwrap();
+        w.define_array::<f64>("unused", vec![], vec![2], None, None)
+            .unwrap();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let file = w
+            .finish_to(storage.clone(), Arc::from("src"), None)
+            .await
+            .unwrap();
+        (file, storage)
+    }
+
+    #[tokio::test]
+    async fn copy_array_carries_definition_chunks_attributes_and_stats() {
+        let (source, _) = source_file().await;
+        let mut w = writer();
+        w.copy_array(&source, "grid").await.unwrap();
+        let dest_storage = Arc::new(InMemoryStorage::new());
+        let dest = w
+            .finish_to(dest_storage, Arc::from("dst"), None)
+            .await
+            .unwrap();
+
+        let (a, b) = (source.array("grid").unwrap(), dest.array("grid").unwrap());
+        assert_eq!(a.dtype, b.dtype);
+        assert_eq!(a.shape, b.shape);
+        assert_eq!(a.chunk_shape, b.chunk_shape);
+        assert_eq!(a.dimension_names, b.dimension_names);
+        assert_eq!(a.fill_value, b.fill_value);
+        assert_eq!(
+            a.written_chunks().collect::<Vec<_>>(),
+            b.written_chunks().collect::<Vec<_>>(),
+            "only written chunks are copied; the fill is not materialized"
+        );
+        assert_eq!(a.stats, b.stats, "recomputed stats match the source");
+        assert_eq!(source.attributes("grid"), dest.attributes("grid"));
+
+        let from_dest = dest
+            .read_array::<i32>("grid", vec![], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            from_dest.iter().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, -1, -1, -1, -1, 9, 10]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_workflow_keeps_some_arrays_and_adds_one() {
+        let (source, _) = source_file().await;
+        let mut w = writer();
+        for info in source.arrays() {
+            if info.name != "unused" {
+                w.copy_array(&source, &info.name).await.unwrap();
+            }
+        }
+        w.define_array::<u8>("added", vec![], vec![2], None, None)
+            .unwrap();
+        w.write_array(
+            "added",
+            vec![0],
+            Array::from_vec(vec![5u8, 6]).into_dyn().view(),
+        )
+        .unwrap();
+        let dest = w
+            .finish_to(Arc::new(InMemoryStorage::new()), Arc::from("dst"), None)
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = dest.arrays().iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["grid", "flags", "added"]);
+        assert!(dest.array("unused").is_none());
+        let flags = dest
+            .read_array::<u8>("flags", vec![], vec![])
+            .await
+            .unwrap();
+        assert_eq!(flags.iter().copied().collect::<Vec<_>>(), vec![7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn copied_chunks_are_repacked_with_the_writers_codec() {
+        let (source, _) = source_file().await;
+        let mut w = ArrayWriter::new(WriterConfig {
+            block_target_size: 64,
+            ..WriterConfig::new(ZstdCodec { level: 3 })
+        });
+        w.copy_array(&source, "grid").await.unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let dest = w
+            .finish_to(storage.clone(), Arc::from("dst"), None)
+            .await
+            .unwrap();
+        let footer = read_footer(&*storage).await.unwrap();
+        assert!(!footer.blocks.is_empty());
+        assert!(
+            footer
+                .blocks
+                .iter()
+                .all(|b| b.codec == crate::block::CodecId::Named("zstd".into())),
+            "blocks carry the destination codec"
+        );
+        let grid = dest
+            .read_array::<i32>("grid", vec![], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            grid.iter().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, -1, -1, -1, -1, 9, 10]
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_array_errors() {
+        let (source, _) = source_file().await;
+        let mut w = writer();
+        assert!(matches!(
+            w.copy_array(&source, "missing").await,
+            Err(Error::ArrayNotFound { .. })
+        ));
+        w.copy_array(&source, "grid").await.unwrap();
+        assert!(matches!(
+            w.copy_array(&source, "grid").await,
+            Err(Error::ArrayAlreadyExists { .. })
+        ));
     }
 
     #[test]
