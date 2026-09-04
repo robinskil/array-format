@@ -2,9 +2,13 @@
 //!
 //! [`ArrayFile::open`] reads the footer once, validates it, and walks the
 //! archived form straight into the in-memory one: one [`ArrayInfo`] per
-//! array in file order, a name index, and one sorted attribute list per
-//! array. No owned copy of the footer is made on the way. Data blocks are
-//! read on demand through an optional cache.
+//! array in file order, a name index, and one attribute column per distinct
+//! key. No owned copy of the footer is made on the way. Data blocks are read
+//! on demand through an optional cache.
+//!
+//! Attributes are stored key-major: `columns[key][array]`. One attribute
+//! across every array is a slice borrow, and one attribute of one array is
+//! two lookups and an index.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -130,10 +134,14 @@ pub struct ArrayFile {
     blocks: Vec<BlockMeta>,
     /// Every array, in file order.
     arrays: Vec<ArrayInfo>,
-    /// Attributes of `arrays[i]` are `attrs[i]`, sorted by key.
-    attrs: Vec<Vec<(EcoString, AttributeValue)>>,
     /// Array name to position in `arrays`.
     by_name: HashMap<EcoString, usize>,
+    /// Every distinct attribute key, in order of first use.
+    keys: Vec<EcoString>,
+    /// Key to position in `keys`.
+    key_ids: HashMap<EcoString, usize>,
+    /// `columns[k][i]` is the value of `keys[k]` on `arrays[i]`.
+    columns: Vec<Vec<Option<AttributeValue>>>,
 }
 
 impl std::fmt::Debug for ArrayFile {
@@ -173,8 +181,8 @@ impl ArrayFile {
     /// Builds the in-memory form from footer bytes (trailer included).
     ///
     /// The archive is validated once and then walked in place. The two pools
-    /// are decoded once; each array's attributes are then pairs of clones
-    /// from them, so a value shared by many arrays is one allocation.
+    /// are decoded once; every attribute cell is then a clone from the value
+    /// pool, so a value shared by many arrays is one allocation.
     pub(crate) fn from_footer_bytes(
         data: &[u8],
         storage: Arc<dyn Storage>,
@@ -205,31 +213,39 @@ impl ArrayFile {
 
         let n = footer.arrays.len();
         let mut arrays = Vec::with_capacity(n);
-        let mut attrs = Vec::with_capacity(n);
         let mut by_name = HashMap::with_capacity(n);
+        // A column is created the first time a key is seen. `col_of` maps a
+        // string-pool index to its column, so the hot loop never hashes.
+        let mut col_of: Vec<Option<usize>> = vec![None; strings.len()];
+        let mut keys: Vec<EcoString> = Vec::new();
+        let mut columns: Vec<Vec<Option<AttributeValue>>> = Vec::new();
 
         for (i, meta) in footer.arrays.iter().enumerate() {
-            let mut list: Vec<(EcoString, AttributeValue)> =
-                Vec::with_capacity(meta.attributes.len());
             for pair in meta.attributes.iter() {
                 let (k, v) = (pair.0.to_native() as usize, pair.1.to_native() as usize);
-                let key = strings.get(k).cloned().ok_or_else(|| {
+                let slot = col_of.get_mut(k).ok_or_else(|| {
                     Error::InvalidFooter(format!(
                         "attribute key index {k} out of range, pool has {} strings",
                         strings.len()
                     ))
                 })?;
+                let c = match *slot {
+                    Some(c) => c,
+                    None => {
+                        let c = columns.len();
+                        *slot = Some(c);
+                        keys.push(strings[k].clone());
+                        columns.push(vec![None; n]);
+                        c
+                    }
+                };
                 let value = values.get(v).cloned().ok_or_else(|| {
                     Error::InvalidFooter(format!(
                         "attribute value index {v} out of range, pool has {} values",
                         values.len()
                     ))
                 })?;
-                list.push((key, value));
-            }
-            // The writer sorts by key; another writer might not.
-            if !list.is_sorted_by(|a, b| a.0 <= b.0) {
-                list.sort_by(|a, b| a.0.cmp(&b.0));
+                columns[c][i] = Some(value);
             }
 
             let name = EcoString::from(meta.name.as_str());
@@ -259,17 +275,23 @@ impl ArrayFile {
                 chunks: deserialize_using::<_, _, rkyv::rancor::Error>(&meta.chunks, &mut pool)
                     .map_err(de)?,
             });
-            attrs.push(list);
         }
 
+        let key_ids = keys
+            .iter()
+            .enumerate()
+            .map(|(c, k)| (k.clone(), c))
+            .collect();
         Ok(Self {
             storage,
             path,
             cache,
             blocks,
             arrays,
-            attrs,
             by_name,
+            keys,
+            key_ids,
+            columns,
         })
     }
 }
@@ -287,41 +309,55 @@ impl ArrayFile {
         self.by_name.get(name).map(|&i| &self.arrays[i])
     }
 
-    /// All attributes of array `name` as `(key, value)` pairs sorted by key,
-    /// or `None` if the array does not exist.
-    pub fn attributes(&self, name: &str) -> Option<&[(EcoString, AttributeValue)]> {
-        self.by_name.get(name).map(|&i| self.attrs[i].as_slice())
+    /// Every distinct attribute key in the file, in order of first use.
+    pub fn keys(&self) -> &[EcoString] {
+        &self.keys
+    }
+
+    /// All attributes of array `name` as `(key, value)` pairs, in the order
+    /// of [`keys`](Self::keys). `None` if the array does not exist.
+    pub fn attributes(
+        &self,
+        name: &str,
+    ) -> Option<impl Iterator<Item = (&EcoString, &AttributeValue)>> {
+        let i = *self.by_name.get(name)?;
+        Some(
+            self.keys
+                .iter()
+                .zip(&self.columns)
+                .filter_map(move |(key, column)| column[i].as_ref().map(|v| (key, v))),
+        )
     }
 
     /// Attribute `key` of array `name`. `None` if either does not exist.
     pub fn get_attribute(&self, name: &str, key: &str) -> Option<&AttributeValue> {
-        lookup(self.attributes(name)?, key)
+        let i = *self.by_name.get(name)?;
+        let c = *self.key_ids.get(key)?;
+        self.columns[c][i].as_ref()
+    }
+
+    /// The column of attribute `key`: one cell per array, in file order and
+    /// aligned with [`arrays`](Self::arrays). `None` if no array carries
+    /// the key at all.
+    ///
+    /// This is a borrow of what the file holds in memory; it costs nothing.
+    pub fn attribute_column(&self, key: &str) -> Option<&[Option<AttributeValue>]> {
+        self.key_ids.get(key).map(|&c| self.columns[c].as_slice())
     }
 
     /// Attribute `key` for every array, in file order: `Some(value)` where
     /// the array carries it, `None` where it does not.
     ///
     /// Use this to select arrays by attribute without a call per array.
-    /// Names and values borrow from the open file.
+    /// Names and values borrow from the open file; the call allocates one
+    /// vector. [`attribute_column`](Self::attribute_column) avoids even that.
     pub fn attribute_index(&self, key: &str) -> Vec<(&str, Option<&AttributeValue>)> {
-        // Arrays in one file usually share a schema, so `key` tends to sit
-        // at the same sorted position in every list. Check the position the
-        // previous array had it at before searching.
-        let mut guess = 0usize;
+        let column = self.attribute_column(key);
         self.arrays
             .iter()
-            .zip(&self.attrs)
-            .map(|(info, list)| {
-                let value = match list.get(guess) {
-                    Some((k, v)) if k.as_str() == key => Some(v),
-                    _ => list
-                        .binary_search_by(|(k, _)| k.as_str().cmp(key))
-                        .ok()
-                        .map(|i| {
-                            guess = i;
-                            &list[i].1
-                        }),
-                };
+            .enumerate()
+            .map(|(i, info)| {
+                let value = column.and_then(|c| c[i].as_ref());
                 (info.name.as_str(), value)
             })
             .collect()
@@ -342,13 +378,6 @@ impl ArrayFile {
             name: name.to_string(),
         })
     }
-}
-
-/// Binary search over one array's attributes, which are sorted by key.
-fn lookup<'a>(list: &'a [(EcoString, AttributeValue)], key: &str) -> Option<&'a AttributeValue> {
-    list.binary_search_by(|(k, _)| k.as_str().cmp(key))
-        .ok()
-        .map(|i| &list[i].1)
 }
 
 // ── Reading ──────────────────────────────────────────────────────────
@@ -597,14 +626,30 @@ mod tests {
     #[tokio::test]
     async fn attributes_decode_into_per_array_maps() {
         let (file, _) = finish(sample()).await;
-        let temp = file.attributes("temp").unwrap();
-        assert_eq!(temp.len(), 2);
-        let keys: Vec<&str> = temp.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["scale", "units"], "sorted by key");
+        let mut temp: Vec<(&str, &AttributeValue)> = file
+            .attributes("temp")
+            .unwrap()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        temp.sort_by_key(|(k, _)| *k);
+        assert_eq!(
+            temp,
+            vec![
+                ("scale", &AttributeValue::Float64(0.5)),
+                ("units", &AttributeValue::String("K".into())),
+            ]
+        );
         assert_eq!(
             file.get_attribute("temp", "scale"),
             Some(&AttributeValue::Float64(0.5))
         );
+        let mut keys: Vec<&str> = file.keys().iter().map(|k| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["scale", "units"]);
+        let column = file.attribute_column("units").unwrap();
+        assert_eq!(column.len(), 2);
+        assert_eq!(column[1], Some(AttributeValue::String("n".into())));
+        assert!(file.attribute_column("nope").is_none());
         assert_eq!(file.get_attribute("count", "scale"), None);
         assert_eq!(file.get_attribute("missing", "units"), None);
         assert!(file.attributes("missing").is_none());
@@ -627,9 +672,8 @@ mod tests {
         );
     }
 
-    /// `attribute_index` first tries the position the previous array had the
-    /// key at. Here the key sits at a different position in every array and
-    /// is missing from one, so every guess misses and the search takes over.
+    /// Arrays with different attribute sets share one column per key; a
+    /// missing attribute is a `None` cell.
     #[tokio::test]
     async fn attribute_index_handles_mixed_schemas() {
         let mut w = writer();
@@ -657,8 +701,10 @@ mod tests {
                 ("d", Some(&AttributeValue::Int64(3))),
             ]
         );
-        assert_eq!(file.attributes("d").unwrap().len(), 4);
+        assert_eq!(file.attributes("d").unwrap().count(), 4);
         assert_eq!(file.get_attribute("c", "m"), None);
+        let m = file.attribute_column("m").unwrap();
+        assert_eq!(m.iter().filter(|v| v.is_some()).count(), 3);
     }
 
     #[tokio::test]

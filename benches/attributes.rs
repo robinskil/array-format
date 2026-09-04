@@ -70,8 +70,11 @@ fn bench_attributes(c: &mut Criterion) {
     group.bench_function("get_attribute", |b| {
         b.iter(|| file.get_attribute("array_050000", "key_09"))
     });
-    group.bench_function("attributes_map", |b| {
-        b.iter(|| file.attributes("array_050000").map(|m| m.len()))
+    group.bench_function("attributes_of_one_array", |b| {
+        b.iter(|| file.attributes("array_050000").map(|it| it.count()))
+    });
+    group.bench_function("attribute_column", |b| {
+        b.iter(|| file.attribute_column("key_09").map(|c| c.len()))
     });
     group.finish();
 }

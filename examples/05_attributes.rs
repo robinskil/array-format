@@ -83,8 +83,12 @@ async fn main() {
     // All attributes of one array, as a map.
     println!(
         "\npressure has {} attributes",
-        file.attributes("pressure").unwrap().len()
+        file.attributes("pressure").unwrap().count()
     );
+
+    // One attribute across every array as a plain slice, aligned with arrays().
+    let units = file.attribute_column("units").unwrap();
+    assert_eq!(units.len(), file.arrays().len());
 
     // attribute_index gives the value of one attribute across every array in a
     // single call — a full column, with None where the attribute is absent.

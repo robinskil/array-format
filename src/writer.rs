@@ -836,7 +836,16 @@ mod tests {
             "only written chunks are copied; the fill is not materialized"
         );
         assert_eq!(a.stats, b.stats, "recomputed stats match the source");
-        assert_eq!(source.attributes("grid"), dest.attributes("grid"));
+        let collect = |file: &ArrayFile| -> Vec<(EcoString, AttributeValue)> {
+            let mut v: Vec<_> = file
+                .attributes("grid")
+                .unwrap()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(collect(&source), collect(&dest));
 
         let from_dest = dest
             .read_array::<i32>("grid", vec![], vec![])

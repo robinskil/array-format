@@ -268,7 +268,7 @@ async fn binary_and_list_attributes_roundtrip() {
             "b".into()
         ])))
     );
-    assert_eq!(file.attributes("signal").unwrap().len(), 3);
+    assert_eq!(file.attributes("signal").unwrap().count(), 3);
 }
 
 // ── write_array / read_array nd tests ───────────────────────────────

@@ -94,8 +94,10 @@ file.read_array::<T>(name, start, shape).await?   // vec![], vec![] for the whol
 
 // Attributes (in memory from open)
 file.get_attribute(name, key)       // Option<&AttributeValue>
-file.attributes(name)               // Option<&[(EcoString, AttributeValue)]>, sorted by key
-file.attribute_index(key)           // Vec<(&str, Option<&AttributeValue>)>, one attribute across all arrays
+file.attributes(name)               // iterator of (&EcoString, &AttributeValue) for one array
+file.keys()                         // &[EcoString], every distinct key in the file
+file.attribute_column(key)          // Option<&[Option<AttributeValue>]>, one attribute across all arrays, a borrow
+file.attribute_index(key)           // Vec<(&str, Option<&AttributeValue>)>, the same paired with names
 
 // Statistics (in the footer, available on open)
 file.array_stats(name)              // Option<&ArrayStats>
@@ -294,7 +296,7 @@ Each array carries user-defined key-value attributes (units, scale factors, prov
 writer.set_attribute("pressure", "units", AttributeValue::String("hPa".into()))?;
 // ...
 file.get_attribute("pressure", "units");   // Option<&AttributeValue>
-file.attributes("pressure");               // Option<&[(EcoString, AttributeValue)]>, sorted by key
+file.attributes("pressure");               // iterator of (&EcoString, &AttributeValue)
 ```
 
 An `AttributeValue` is a scalar (`Bool`, the sized `Int*`/`UInt*`, `Float32`/`Float64`, `String`), raw `Binary`, or a typed list of any of those (`Int32List`, `Float64List`, `StringList`, `BinaryList`, …). Strings are `EcoString` and lists are boxed slices:
@@ -304,7 +306,7 @@ writer.set_attribute("pressure", "checksum", AttributeValue::Binary(Box::new([0x
 writer.set_attribute("pressure", "valid_range", AttributeValue::Float32List(Box::new([0.0, 1100.0])))?;
 ```
 
-Attributes are in memory from the moment a file opens: one list per array, sorted by key, built straight from the archived footer. `get_attribute` is a name lookup and a binary search over that array's keys. `attribute_index` returns one attribute across every array in a single pass — a full column with `None` where the attribute is absent — so you can select arrays by attribute without a call per array:
+Attributes are in memory from the moment a file opens, stored key-major: one column per distinct key, with one cell per array. `get_attribute` is two lookups and an index. `attribute_column` returns one attribute across every array as a plain slice aligned with `arrays()` — a borrow that costs nothing. `attribute_index` returns the same column paired with array names, so you can select arrays by attribute without a call per array:
 
 ```rust
 // Select the arrays measured in hPa.
@@ -316,9 +318,9 @@ let hpa: Vec<&str> = file
     .collect();
 ```
 
-Names and values borrow from the open file; the call allocates one vector. At 100K arrays it takes about 2 ms; see [Performance](#performance).
+Names and values borrow from the open file; the call allocates one vector. At 100K arrays it takes about 0.15 ms; see [Performance](#performance).
 
-The memory layout is deliberate. `EcoString` is 16 bytes and keeps up to 15 bytes inline, so a key like `units` or a value like `m/s` costs no allocation. Longer strings are one allocation shared by every array that carries the same value, because the footer stores each distinct key, string and value once and the reader hands out clones. Lists are `Box<[T]>`, 16 bytes, which keeps the whole `AttributeValue` at 24 bytes. Each array's attributes are one `Vec` of `(key, value)` pairs, 40 bytes per attribute and no hash table.
+The memory layout is deliberate. `EcoString` is 16 bytes and keeps up to 15 bytes inline, so a key like `units` or a value like `m/s` costs no allocation. Longer strings are one allocation shared by every array that carries the same value, because the footer stores each distinct key, string and value once and the reader hands out clones. Lists are `Box<[T]>`, 16 bytes, which keeps the whole `AttributeValue` at 24 bytes, and so does `Option<AttributeValue>`. A column is one `Vec` of those cells, so an attribute costs 24 bytes per array and its key is stored once per file. Columns are dense: a key that only some arrays carry still has a cell for every array.
 
 ### File-level metadata
 
@@ -374,13 +376,14 @@ Measured with `cargo bench` on an Apple M3 Pro (12 cores, 18 GiB RAM), Rust 1.98
 
 | Operation | Time |
 | --------- | ---- |
-| `open()` | 43 ms |
-| `attribute_index(key)`, every array carries the key | 2.2 ms |
-| `attribute_index(key)`, no array carries the key | 6.9 ms |
-| `get_attribute(name, key)` | 31 ns |
-| `attributes(name)` | 11 ns |
+| `open()` | 39 ms |
+| `attribute_column(key)` | 11 ns |
+| `attribute_index(key)`, every array carries the key | 0.14 ms |
+| `attribute_index(key)`, no array carries the key | 0.11 ms |
+| `get_attribute(name, key)` | 20 ns |
+| `attributes(name)`, all 20 of one array | 150 ns |
 
-`open` validates the 45 MB footer once and walks it in place, building one sorted attribute list per array, so its cost grows with the total number of attributes in the file. After that every query is in memory. `attribute_index` checks the position the previous array had the key at, which is a hit whenever arrays share a schema, and falls back to a binary search.
+`open` validates the 45 MB footer once and walks it in place, filling one column per key, so its cost grows with the total number of attributes in the file. After that every query is in memory. `attribute_column` is a slice borrow; `attribute_index` only pairs that slice with the array names.
 
 ### Chunk reads (`benches/read_chunks.rs`, `benches/read_file.rs`)
 
