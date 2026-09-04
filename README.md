@@ -315,7 +315,7 @@ let hpa: Vec<&str> = file
     .collect();
 ```
 
-Names and values borrow from the open file; the call allocates one vector.
+Names and values borrow from the open file; the call allocates one vector. At 100K arrays it takes about 8 ms; see [Performance](#performance).
 
 The memory layout is deliberate. `EcoString` is 16 bytes and keeps up to 15 bytes inline, so a key like `units` or a value like `m/s` costs no allocation. Longer strings are one allocation shared by every array that carries the same value, because the on-disk pool stores each string once and the reader hands out clones. Lists are `Box<[T]>`, 16 bytes, which keeps the whole `AttributeValue` at 24 bytes.
 
@@ -362,6 +362,45 @@ pub enum StatValue {
     TimestampNs(i64),
 }
 ```
+
+## Performance
+
+Measured with `cargo bench` on an Apple M3 Pro (12 cores, 18 GiB RAM), Rust 1.98, release build. Times are criterion medians. Treat them as indicative and run the benches on your own hardware.
+
+### Attributes at scale (`benches/attributes.rs`)
+
+100K arrays with 20 attributes each, 2M attributes in total, on the local filesystem:
+
+| Operation | Time |
+| --------- | ---- |
+| `open()` | 100 ms |
+| `attribute_index(key)`, every array carries the key | 7.8 ms |
+| `attribute_index(key)`, no array carries the key | 4.4 ms |
+| `get_attribute(name, key)` | 30 ns |
+| `attributes(name)` | 11 ns |
+
+`open` reads the footer once and builds one attribute map per array, so its cost grows with the total number of attributes in the file. After that every query is in memory. `attribute_index` is one hash lookup per array.
+
+### Chunk reads (`benches/read_chunks.rs`, `benches/read_file.rs`)
+
+One array of 64 chunks × 64 KiB (4 MiB). The on-disk figures include an `open()` per iteration.
+
+| Read | In memory | From disk |
+| ---- | --------- | --------- |
+| All 64 chunks, any codec | 0.47 ms (8.3 GiB/s) | 0.75–1.0 ms (3.8–5.2 GiB/s) |
+| One chunk, cached | 7.3 µs | — |
+| One chunk, uncached | — | 122–141 µs |
+
+### Many arrays in parallel (`benches/read_parallel.rs`)
+
+25K arrays × 10K `i32` (1 GB), each read as a whole array:
+
+| | In memory | From disk |
+| - | --------- | --------- |
+| Sequential, no compression | 81 ms (11.5 GiB/s) | 244 ms (3.8 GiB/s) |
+| Sequential, LZ4 | 328 ms (2.8 GiB/s) | — |
+| 32 tasks × 32 concurrent, no compression | 52 ms (17.9 GiB/s) | 91 ms (10.3 GiB/s) |
+| 32 tasks × 32 concurrent, LZ4 | 81 ms (11.5 GiB/s) | 94 ms (9.9 GiB/s) |
 
 ## In-memory usage
 

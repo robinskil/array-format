@@ -64,6 +64,15 @@
 //! [`object_store`]-compatible backend, passed to [`ArrayWriter::finish`] and
 //! [`ArrayFile::open`].
 //!
+//! ## Performance
+//!
+//! On an Apple M3 Pro, a file with 100K arrays and 2M attributes opens in
+//! about 100 ms. After that, [`attribute_index`](ArrayFile::attribute_index)
+//! across all 100K arrays takes about 8 ms and one
+//! [`get_attribute`](ArrayFile::get_attribute) about 30 ns. Reading 25K whole
+//! arrays (1 GB) with 32 concurrent tasks reaches 10–18 GiB/s. The README has
+//! the full tables; `cargo bench` reproduces them.
+//!
 //! [`ChunkAddress`]: address::ChunkAddress
 //! [`BlockId`]: address::BlockId
 //! [`object_store`]: https://docs.rs/object_store

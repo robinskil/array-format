@@ -35,6 +35,10 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 rand = "0.9"
 
 [[bench]]
+name = "attributes"
+harness = false
+
+[[bench]]
 name = "read_chunks"
 harness = false
 
