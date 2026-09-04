@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use crate::{
     address::{BlockAllocAddress, ChunkAddress},
     array::ArrayElement,
-    attr::{AttributeValue, DiskValue, StringPool},
+    attr::{AttributeValue, StringPool, ValuePool},
     block_cache::BlockCache,
     block_writer::{BlockWriter, BlockWriterOutput},
     codec::CompressionCodec,
@@ -157,11 +157,8 @@ impl ArrayWriter {
             }
         }
         if let Some(attrs) = source.attributes(name) {
-            // Sorted, so the footer does not depend on hash order.
-            let mut entries: Vec<(&EcoString, &AttributeValue)> = attrs.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
             let pending = self.array_mut(name)?;
-            for (key, value) in entries {
+            for (key, value) in attrs {
                 pending.attributes.insert(key.clone(), value.clone());
             }
         }
@@ -287,7 +284,8 @@ impl ArrayWriter {
             blocks,
         } = blocks.commit().await;
 
-        let mut pool = StringPool::default();
+        let mut strings = StringPool::default();
+        let mut values = ValuePool::default();
         let mut metas = Vec::with_capacity(arrays.len());
         for (name, array) in arrays {
             // Every unwritten element counts as a null, so the total is the
@@ -313,10 +311,12 @@ impl ArrayWriter {
             stats.row_count = shape_product;
             stats.null_count = shape_product - written_non_null;
 
-            let attributes = array
-                .attributes
-                .iter()
-                .map(|(key, value)| (pool.intern(key), DiskValue::encode(value, &mut pool)))
+            // Sorted by key, so the reader can binary search without a sort.
+            let mut entries: Vec<(&EcoString, &AttributeValue)> = array.attributes.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let attributes = entries
+                .into_iter()
+                .map(|(key, value)| (strings.intern(key), values.intern(value)))
                 .collect();
 
             metas.push(ArrayMeta {
@@ -332,15 +332,20 @@ impl ArrayWriter {
             });
         }
 
+        // Values first: encoding them interns their strings.
+        let values = values.into_disk(&mut strings);
         let footer = Footer {
             version: FOOTER_VERSION,
             blocks,
-            strings: pool.into_strings(),
+            strings: strings.into_strings(),
+            values,
             arrays: metas,
         };
         let footer_bytes = footer.serialize()?;
         write_file_then_bytes(&mut file, output_size, &footer_bytes, &*storage).await?;
-        ArrayFile::from_footer(footer, storage, path, cache)
+        // The reader is built from the bytes just written: one construction
+        // path for finish and open.
+        ArrayFile::from_footer_bytes(&footer_bytes, storage, path, cache)
     }
 
     fn array(&self, name: &str) -> Result<&PendingArray> {
@@ -426,6 +431,7 @@ mod tests {
     use ndarray::{Array, IxDyn};
 
     use super::*;
+    use crate::attr::DiskValue;
     use crate::codec::decompress_by_id;
     use crate::footer::{find_chunk, read_footer};
     use crate::stats::StatValue;
@@ -618,7 +624,7 @@ mod tests {
                 .attributes
                 .iter()
                 .find(|(k, _)| strings[*k as usize] == key)
-                .map(|(_, v)| v.decode(&strings).unwrap())
+                .map(|(_, v)| footer.values[*v as usize].decode(&strings).unwrap())
         };
         assert_eq!(get(0, "units"), Some(AttributeValue::String("m/s".into())));
         assert_eq!(get(1, "units"), Some(AttributeValue::String("m/s".into())));
@@ -642,7 +648,36 @@ mod tests {
         w.set_attribute("a", "k", AttributeValue::Int64(2)).unwrap();
         let (_, footer) = finish(w).await;
         assert_eq!(footer.arrays[0].attributes.len(), 1);
-        assert_eq!(footer.arrays[0].attributes[0].1, DiskValue::Int64(2));
+        let value = footer.arrays[0].attributes[0].1 as usize;
+        assert_eq!(footer.values[value], DiskValue::Int64(2));
+    }
+
+    #[tokio::test]
+    async fn equal_values_share_one_pool_entry_and_keys_come_out_sorted() {
+        let mut w = writer();
+        for name in ["a", "b", "c"] {
+            w.define_array::<u8>(name, vec![], vec![1], None, None)
+                .unwrap();
+            w.set_attribute(name, "zeta", AttributeValue::Int64(1))
+                .unwrap();
+            w.set_attribute(name, "alpha", AttributeValue::Int64(1))
+                .unwrap();
+        }
+        let (_, footer) = finish(w).await;
+        assert_eq!(
+            footer.values,
+            vec![DiskValue::Int64(1)],
+            "one value, three arrays"
+        );
+        let strings = strings(&footer);
+        for meta in &footer.arrays {
+            let keys: Vec<&str> = meta
+                .attributes
+                .iter()
+                .map(|(k, _)| strings[*k as usize].as_str())
+                .collect();
+            assert_eq!(keys, vec!["alpha", "zeta"]);
+        }
     }
 
     #[tokio::test]

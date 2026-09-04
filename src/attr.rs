@@ -5,8 +5,9 @@
 //! Lists are boxed slices. Together that keeps the enum at 24 bytes.
 //!
 //! [`DiskValue`] is the same enum as stored in the footer. Its strings are
-//! indices into the footer's string pool, so a value that many arrays share is
-//! written once. Every other variant is stored inline.
+//! indices into the footer's string pool. Every distinct value is written
+//! once, into the footer's value pool; an array's attributes are `(key
+//! index, value index)` pairs into the two pools.
 
 use ecow::EcoString;
 use indexmap::IndexSet;
@@ -220,6 +221,39 @@ impl StringPool {
     /// Consumes the pool and returns the strings in index order.
     pub(crate) fn into_strings(self) -> Vec<String> {
         self.strings.into_iter().collect()
+    }
+}
+
+/// Interns attribute values while a footer is built. Insertion order is the
+/// on-disk index order.
+#[derive(Debug, Default)]
+pub(crate) struct ValuePool {
+    values: IndexSet<AttributeValue>,
+}
+
+impl ValuePool {
+    /// Returns the index of `value`, adding it to the pool if absent.
+    pub(crate) fn intern(&mut self, value: &AttributeValue) -> u32 {
+        if let Some(i) = self.values.get_index_of(value) {
+            return i as u32;
+        }
+        let (i, _) = self.values.insert_full(value.clone());
+        i as u32
+    }
+
+    /// Number of distinct values in the pool.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Consumes the pool and encodes every value, in index order, interning
+    /// their strings into `strings`.
+    pub(crate) fn into_disk(self, strings: &mut StringPool) -> Vec<DiskValue> {
+        self.values
+            .iter()
+            .map(|v| DiskValue::encode(v, strings))
+            .collect()
     }
 }
 
@@ -452,6 +486,22 @@ mod tests {
             pool.into_strings(),
             vec!["units".to_string(), "m/s".to_string()]
         );
+    }
+
+    #[test]
+    fn value_pool_stores_each_value_once() {
+        let mut values = ValuePool::default();
+        let a = values.intern(&AttributeValue::Int64(7));
+        let b = values.intern(&AttributeValue::String("m/s".into()));
+        let again = values.intern(&AttributeValue::Int64(7));
+        assert_eq!(a, again);
+        assert_ne!(a, b);
+        assert_eq!(values.len(), 2);
+
+        let mut strings = StringPool::default();
+        let disk = values.into_disk(&mut strings);
+        assert_eq!(disk, vec![DiskValue::Int64(7), DiskValue::String(0)]);
+        assert_eq!(strings.into_strings(), vec!["m/s".to_string()]);
     }
 
     #[test]

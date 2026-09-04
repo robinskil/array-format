@@ -94,7 +94,7 @@ file.read_array::<T>(name, start, shape).await?   // vec![], vec![] for the whol
 
 // Attributes (in memory from open)
 file.get_attribute(name, key)       // Option<&AttributeValue>
-file.attributes(name)               // Option<&HashMap<EcoString, AttributeValue>>
+file.attributes(name)               // Option<&[(EcoString, AttributeValue)]>, sorted by key
 file.attribute_index(key)           // Vec<(&str, Option<&AttributeValue>)>, one attribute across all arrays
 
 // Statistics (in the footer, available on open)
@@ -252,9 +252,10 @@ writer.define_array::<f32>(
 - `version` — format version (currently `6`; files from version 5 and below are rejected)
 - `blocks` — `Vec<BlockMeta>`: id, file offset, compressed/uncompressed sizes, codec. Ids are dense, so `blocks[id]` is the block.
 - `strings` — the string pool: every attribute key and string value, stored once
-- `arrays` — `Vec<ArrayMeta>`, in definition order: name, dtype, shape, dimension names, chunk shape, fill value, the chunk table (coordinate → `ChunkAddress`, sorted by coordinate), attributes as `(key index, value)` pairs, and statistics
+- `values` — the value pool: every distinct attribute value, stored once; its string variants index `strings`
+- `arrays` — `Vec<ArrayMeta>`, in definition order: name, dtype, shape, dimension names, chunk shape, fill value, the chunk table (coordinate → `ChunkAddress`, sorted by coordinate), attributes as `(key index, value index)` pairs sorted by key, and statistics
 
-Only strings are interned. An attribute value's `String` and `StringList` variants hold indices into the pool; every other value is stored inline.
+An array's attribute list is 8 bytes per attribute. 100K arrays with 20 attributes each make a 45 MB footer.
 
 **`ChunkAddress`:**
 
@@ -264,7 +265,7 @@ Only strings are interned. An attribute value's `String` and `StringList` varian
 
 Find the block by id, decompress, slice `[offset..offset+size]`. The chunk table is sorted, so a coordinate is found by binary search.
 
-The footer is serialized with `rkyv`. Reading it is a two-pass operation: first read the 12-byte trailer to get `footer_size`, then read the footer payload. Nothing else is read until a chunk is requested.
+The footer is serialized with `rkyv`. Reading it is a two-pass operation: first read the 12-byte trailer to get `footer_size`, then read the footer payload. The reader validates the archive once and walks it in place; no owned copy of the footer is built. Nothing else is read until a chunk is requested.
 
 ## Storage
 
@@ -293,7 +294,7 @@ Each array carries user-defined key-value attributes (units, scale factors, prov
 writer.set_attribute("pressure", "units", AttributeValue::String("hPa".into()))?;
 // ...
 file.get_attribute("pressure", "units");   // Option<&AttributeValue>
-file.attributes("pressure");               // Option<&HashMap<EcoString, AttributeValue>>
+file.attributes("pressure");               // Option<&[(EcoString, AttributeValue)]>, sorted by key
 ```
 
 An `AttributeValue` is a scalar (`Bool`, the sized `Int*`/`UInt*`, `Float32`/`Float64`, `String`), raw `Binary`, or a typed list of any of those (`Int32List`, `Float64List`, `StringList`, `BinaryList`, …). Strings are `EcoString` and lists are boxed slices:
@@ -303,7 +304,7 @@ writer.set_attribute("pressure", "checksum", AttributeValue::Binary(Box::new([0x
 writer.set_attribute("pressure", "valid_range", AttributeValue::Float32List(Box::new([0.0, 1100.0])))?;
 ```
 
-Attributes are in memory from the moment a file opens: one map per array, built straight from the footer. `get_attribute` is two hash lookups. `attribute_index` returns one attribute across every array in a single pass — a full column with `None` where the attribute is absent — so you can select arrays by attribute without a call per array:
+Attributes are in memory from the moment a file opens: one list per array, sorted by key, built straight from the archived footer. `get_attribute` is a name lookup and a binary search over that array's keys. `attribute_index` returns one attribute across every array in a single pass — a full column with `None` where the attribute is absent — so you can select arrays by attribute without a call per array:
 
 ```rust
 // Select the arrays measured in hPa.
@@ -315,9 +316,9 @@ let hpa: Vec<&str> = file
     .collect();
 ```
 
-Names and values borrow from the open file; the call allocates one vector. At 100K arrays it takes about 8 ms; see [Performance](#performance).
+Names and values borrow from the open file; the call allocates one vector. At 100K arrays it takes about 2 ms; see [Performance](#performance).
 
-The memory layout is deliberate. `EcoString` is 16 bytes and keeps up to 15 bytes inline, so a key like `units` or a value like `m/s` costs no allocation. Longer strings are one allocation shared by every array that carries the same value, because the on-disk pool stores each string once and the reader hands out clones. Lists are `Box<[T]>`, 16 bytes, which keeps the whole `AttributeValue` at 24 bytes.
+The memory layout is deliberate. `EcoString` is 16 bytes and keeps up to 15 bytes inline, so a key like `units` or a value like `m/s` costs no allocation. Longer strings are one allocation shared by every array that carries the same value, because the footer stores each distinct key, string and value once and the reader hands out clones. Lists are `Box<[T]>`, 16 bytes, which keeps the whole `AttributeValue` at 24 bytes. Each array's attributes are one `Vec` of `(key, value)` pairs, 40 bytes per attribute and no hash table.
 
 ### File-level metadata
 
@@ -373,13 +374,13 @@ Measured with `cargo bench` on an Apple M3 Pro (12 cores, 18 GiB RAM), Rust 1.98
 
 | Operation | Time |
 | --------- | ---- |
-| `open()` | 100 ms |
-| `attribute_index(key)`, every array carries the key | 7.8 ms |
-| `attribute_index(key)`, no array carries the key | 4.4 ms |
-| `get_attribute(name, key)` | 30 ns |
+| `open()` | 43 ms |
+| `attribute_index(key)`, every array carries the key | 2.2 ms |
+| `attribute_index(key)`, no array carries the key | 6.9 ms |
+| `get_attribute(name, key)` | 31 ns |
 | `attributes(name)` | 11 ns |
 
-`open` reads the footer once and builds one attribute map per array, so its cost grows with the total number of attributes in the file. After that every query is in memory. `attribute_index` is one hash lookup per array.
+`open` validates the 45 MB footer once and walks it in place, building one sorted attribute list per array, so its cost grows with the total number of attributes in the file. After that every query is in memory. `attribute_index` checks the position the previous array had the key at, which is a hit whenever arrays share a schema, and falls back to a binary search.
 
 ### Chunk reads (`benches/read_chunks.rs`, `benches/read_file.rs`)
 

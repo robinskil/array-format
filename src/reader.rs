@@ -1,9 +1,10 @@
 //! Read-only view of a finished file.
 //!
-//! [`ArrayFile::open`] reads the footer once and turns it into the in-memory
-//! form: one [`ArrayInfo`] per array in file order, a name index, and one
-//! attribute map per array. Data blocks are read on demand through an
-//! optional cache.
+//! [`ArrayFile::open`] reads the footer once, validates it, and walks the
+//! archived form straight into the in-memory one: one [`ArrayInfo`] per
+//! array in file order, a name index, and one sorted attribute list per
+//! array. No owned copy of the footer is made on the way. Data blocks are
+//! read on demand through an optional cache.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -11,16 +12,18 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ecow::EcoString;
+use rkyv::api::deserialize_using;
+use rkyv::de::Pool;
 
 use crate::{
     array::ArrayElement,
-    attr::AttributeValue,
+    attr::{AttributeValue, DiskValue},
     block::BlockMeta,
     block_cache::BlockCache,
     codec::decompress_by_id,
     dtype::DType,
     error::{Error, Result},
-    footer::{Footer, find_chunk, read_footer},
+    footer::{access_footer, aligned_footer_bytes, find_chunk, read_footer_bytes},
     layout::{ChunkEntry, FillValue},
     nd,
     stats::ArrayStats,
@@ -127,8 +130,8 @@ pub struct ArrayFile {
     blocks: Vec<BlockMeta>,
     /// Every array, in file order.
     arrays: Vec<ArrayInfo>,
-    /// Attributes of `arrays[i]` are `attrs[i]`.
-    attrs: Vec<HashMap<EcoString, AttributeValue>>,
+    /// Attributes of `arrays[i]` are `attrs[i]`, sorted by key.
+    attrs: Vec<Vec<(EcoString, AttributeValue)>>,
     /// Array name to position in `arrays`.
     by_name: HashMap<EcoString, usize>,
 }
@@ -163,37 +166,73 @@ impl ArrayFile {
         path: Arc<str>,
         cache: Option<Arc<BlockCache>>,
     ) -> Result<Self> {
-        let footer = read_footer(&*storage).await?;
-        Self::from_footer(footer, storage, path, cache)
+        let bytes = read_footer_bytes(&*storage).await?;
+        Self::from_footer_bytes(&bytes, storage, path, cache)
     }
 
-    /// Builds the in-memory form from a footer. Moves every field out of the
-    /// footer; only the string pool is converted, once.
-    pub(crate) fn from_footer(
-        footer: Footer,
+    /// Builds the in-memory form from footer bytes (trailer included).
+    ///
+    /// The archive is validated once and then walked in place. The two pools
+    /// are decoded once; each array's attributes are then pairs of clones
+    /// from them, so a value shared by many arrays is one allocation.
+    pub(crate) fn from_footer_bytes(
+        data: &[u8],
         storage: Arc<dyn Storage>,
         path: Arc<str>,
         cache: Option<Arc<BlockCache>>,
     ) -> Result<Self> {
-        let strings: Vec<EcoString> = footer.strings.into_iter().map(EcoString::from).collect();
+        let aligned = aligned_footer_bytes(data)?;
+        let footer = access_footer(&aligned)?;
+        // One deserializer for every nested field; it is only bookkeeping
+        // for shared pointers, which these types do not use.
+        let mut pool = Pool::new();
+        let de = |e: rkyv::rancor::Error| Error::Serialization(e.to_string());
+
+        let strings: Vec<EcoString> = footer
+            .strings
+            .iter()
+            .map(|s| EcoString::from(s.as_str()))
+            .collect();
+        let values: Vec<AttributeValue> =
+            deserialize_using::<Vec<DiskValue>, _, rkyv::rancor::Error>(&footer.values, &mut pool)
+                .map_err(de)?
+                .iter()
+                .map(|v| v.decode(&strings))
+                .collect::<Result<_>>()?;
+        let blocks: Vec<BlockMeta> =
+            deserialize_using::<_, _, rkyv::rancor::Error>(&footer.blocks, &mut pool)
+                .map_err(de)?;
+
         let n = footer.arrays.len();
         let mut arrays = Vec::with_capacity(n);
         let mut attrs = Vec::with_capacity(n);
         let mut by_name = HashMap::with_capacity(n);
 
-        for (i, meta) in footer.arrays.into_iter().enumerate() {
-            let mut map = HashMap::with_capacity(meta.attributes.len());
-            for (key, value) in meta.attributes {
-                let key = strings.get(key as usize).cloned().ok_or_else(|| {
+        for (i, meta) in footer.arrays.iter().enumerate() {
+            let mut list: Vec<(EcoString, AttributeValue)> =
+                Vec::with_capacity(meta.attributes.len());
+            for pair in meta.attributes.iter() {
+                let (k, v) = (pair.0.to_native() as usize, pair.1.to_native() as usize);
+                let key = strings.get(k).cloned().ok_or_else(|| {
                     Error::InvalidFooter(format!(
-                        "attribute key index {key} out of range, pool has {} strings",
+                        "attribute key index {k} out of range, pool has {} strings",
                         strings.len()
                     ))
                 })?;
-                map.insert(key, value.decode(&strings)?);
+                let value = values.get(v).cloned().ok_or_else(|| {
+                    Error::InvalidFooter(format!(
+                        "attribute value index {v} out of range, pool has {} values",
+                        values.len()
+                    ))
+                })?;
+                list.push((key, value));
+            }
+            // The writer sorts by key; another writer might not.
+            if !list.is_sorted_by(|a, b| a.0 <= b.0) {
+                list.sort_by(|a, b| a.0.cmp(&b.0));
             }
 
-            let name = EcoString::from(meta.name);
+            let name = EcoString::from(meta.name.as_str());
             if by_name.insert(name.clone(), i).is_some() {
                 return Err(Error::InvalidFooter(format!(
                     "array '{name}' is defined twice"
@@ -201,22 +240,33 @@ impl ArrayFile {
             }
             arrays.push(ArrayInfo {
                 name,
-                dtype: meta.dtype,
-                shape: meta.shape,
-                dimension_names: meta.dimension_names,
-                chunk_shape: meta.chunk_shape,
-                fill_value: meta.fill_value,
-                stats: meta.stats,
-                chunks: meta.chunks,
+                dtype: deserialize_using::<_, _, rkyv::rancor::Error>(&meta.dtype, &mut pool)
+                    .map_err(de)?,
+                shape: meta.shape.iter().map(|x| x.to_native()).collect(),
+                dimension_names: meta
+                    .dimension_names
+                    .iter()
+                    .map(|s| s.as_str().to_owned())
+                    .collect(),
+                chunk_shape: meta.chunk_shape.iter().map(|x| x.to_native()).collect(),
+                fill_value: deserialize_using::<_, _, rkyv::rancor::Error>(
+                    &meta.fill_value,
+                    &mut pool,
+                )
+                .map_err(de)?,
+                stats: deserialize_using::<_, _, rkyv::rancor::Error>(&meta.stats, &mut pool)
+                    .map_err(de)?,
+                chunks: deserialize_using::<_, _, rkyv::rancor::Error>(&meta.chunks, &mut pool)
+                    .map_err(de)?,
             });
-            attrs.push(map);
+            attrs.push(list);
         }
 
         Ok(Self {
             storage,
             path,
             cache,
-            blocks: footer.blocks,
+            blocks,
             arrays,
             attrs,
             by_name,
@@ -237,14 +287,15 @@ impl ArrayFile {
         self.by_name.get(name).map(|&i| &self.arrays[i])
     }
 
-    /// All attributes of array `name`, or `None` if the array does not exist.
-    pub fn attributes(&self, name: &str) -> Option<&HashMap<EcoString, AttributeValue>> {
-        self.by_name.get(name).map(|&i| &self.attrs[i])
+    /// All attributes of array `name` as `(key, value)` pairs sorted by key,
+    /// or `None` if the array does not exist.
+    pub fn attributes(&self, name: &str) -> Option<&[(EcoString, AttributeValue)]> {
+        self.by_name.get(name).map(|&i| self.attrs[i].as_slice())
     }
 
     /// Attribute `key` of array `name`. `None` if either does not exist.
     pub fn get_attribute(&self, name: &str, key: &str) -> Option<&AttributeValue> {
-        self.attributes(name)?.get(key)
+        lookup(self.attributes(name)?, key)
     }
 
     /// Attribute `key` for every array, in file order: `Some(value)` where
@@ -253,10 +304,26 @@ impl ArrayFile {
     /// Use this to select arrays by attribute without a call per array.
     /// Names and values borrow from the open file.
     pub fn attribute_index(&self, key: &str) -> Vec<(&str, Option<&AttributeValue>)> {
+        // Arrays in one file usually share a schema, so `key` tends to sit
+        // at the same sorted position in every list. Check the position the
+        // previous array had it at before searching.
+        let mut guess = 0usize;
         self.arrays
             .iter()
             .zip(&self.attrs)
-            .map(|(info, map)| (info.name.as_str(), map.get(key)))
+            .map(|(info, list)| {
+                let value = match list.get(guess) {
+                    Some((k, v)) if k.as_str() == key => Some(v),
+                    _ => list
+                        .binary_search_by(|(k, _)| k.as_str().cmp(key))
+                        .ok()
+                        .map(|i| {
+                            guess = i;
+                            &list[i].1
+                        }),
+                };
+                (info.name.as_str(), value)
+            })
             .collect()
     }
 
@@ -275,6 +342,13 @@ impl ArrayFile {
             name: name.to_string(),
         })
     }
+}
+
+/// Binary search over one array's attributes, which are sorted by key.
+fn lookup<'a>(list: &'a [(EcoString, AttributeValue)], key: &str) -> Option<&'a AttributeValue> {
+    list.binary_search_by(|(k, _)| k.as_str().cmp(key))
+        .ok()
+        .map(|i| &list[i].1)
 }
 
 // ── Reading ──────────────────────────────────────────────────────────
@@ -376,7 +450,7 @@ mod tests {
 
     use super::*;
     use crate::address::{BlockId, ChunkAddress};
-    use crate::footer::{ArrayMeta, FOOTER_VERSION};
+    use crate::footer::{ArrayMeta, FOOTER_VERSION, Footer};
     use crate::stats::StatValue;
     use crate::storage::InMemoryStorage;
     use crate::writer::{ArrayWriter, WriterConfig};
@@ -525,7 +599,12 @@ mod tests {
         let (file, _) = finish(sample()).await;
         let temp = file.attributes("temp").unwrap();
         assert_eq!(temp.len(), 2);
-        assert_eq!(temp.get("scale"), Some(&AttributeValue::Float64(0.5)));
+        let keys: Vec<&str> = temp.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["scale", "units"], "sorted by key");
+        assert_eq!(
+            file.get_attribute("temp", "scale"),
+            Some(&AttributeValue::Float64(0.5))
+        );
         assert_eq!(file.get_attribute("count", "scale"), None);
         assert_eq!(file.get_attribute("missing", "units"), None);
         assert!(file.attributes("missing").is_none());
@@ -546,6 +625,40 @@ mod tests {
                 .iter()
                 .all(|(_, v)| v.is_none())
         );
+    }
+
+    /// `attribute_index` first tries the position the previous array had the
+    /// key at. Here the key sits at a different position in every array and
+    /// is missing from one, so every guess misses and the search takes over.
+    #[tokio::test]
+    async fn attribute_index_handles_mixed_schemas() {
+        let mut w = writer();
+        let schemas: [(&str, &[&str]); 4] = [
+            ("a", &["a", "m", "z"]),
+            ("b", &["m"]),
+            ("c", &["a", "z"]),
+            ("d", &["a", "b", "c", "m"]),
+        ];
+        for (i, (name, keys)) in schemas.iter().enumerate() {
+            w.define_array::<u8>(*name, vec![], vec![1], None, None)
+                .unwrap();
+            for key in keys.iter() {
+                w.set_attribute(name, key, AttributeValue::Int64(i as i64))
+                    .unwrap();
+            }
+        }
+        let (file, _) = finish(w).await;
+        assert_eq!(
+            file.attribute_index("m"),
+            vec![
+                ("a", Some(&AttributeValue::Int64(0))),
+                ("b", Some(&AttributeValue::Int64(1))),
+                ("c", None),
+                ("d", Some(&AttributeValue::Int64(3))),
+            ]
+        );
+        assert_eq!(file.attributes("d").unwrap().len(), 4);
+        assert_eq!(file.get_attribute("c", "m"), None);
     }
 
     #[tokio::test]
@@ -661,6 +774,7 @@ mod tests {
             version: FOOTER_VERSION,
             blocks: vec![],
             strings: vec![],
+            values: vec![],
             arrays: vec![meta.clone(), meta],
         };
         let storage = Arc::new(InMemoryStorage::from_bytes(footer.serialize().unwrap()));
