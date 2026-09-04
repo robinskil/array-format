@@ -14,6 +14,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use crate::{
     DType, Error, Result,
     address::ChunkAddress,
+    attr_index::AttrIndex,
     array::ArrayElement,
     codec::CompressionCodec,
     delta::{
@@ -142,6 +143,9 @@ pub struct ArrayFile {
     store_dir: StoreDir,
     /// Per-array aggregate statistics; `None` until first flush or open.
     stats: Option<StatsFile>,
+    /// Attributes of the committed layers, resolved and interned on open.
+    /// Rebuilt whenever `deltas` changes. Does not cover the pending layer.
+    attr_index: AttrIndex,
 }
 
 // ── Constructors ────────────────────────────────────────────────────
@@ -164,7 +168,7 @@ impl ArrayFile {
             Arc::new(ObjectStoreBackend::new(Arc::clone(&store), path.clone())) as Arc<dyn Storage>;
         write_empty_base(&*storage).await?;
         let base_delta = Delta::<DeltaImmutable>::open(storage, delta_path, cache.clone()).await?;
-        Ok(ArrayFile {
+        let mut file = ArrayFile {
             deltas: vec![base_delta],
             pending: None,
             codec: Arc::new(config.codec),
@@ -175,7 +179,10 @@ impl ArrayFile {
                 base_path: path,
             },
             stats: None,
-        })
+            attr_index: AttrIndex::build(&[]),
+        };
+        file.attr_index = AttrIndex::build(&file.deltas);
+        Ok(file)
     }
 
     /// Opens an existing file from `store`, discovering the base and all
@@ -219,7 +226,7 @@ impl ArrayFile {
             }
         };
 
-        Ok(ArrayFile {
+        let mut file = ArrayFile {
             deltas,
             pending: None,
             codec: Arc::new(config.codec),
@@ -230,7 +237,10 @@ impl ArrayFile {
                 base_path: path,
             },
             stats,
-        })
+            attr_index: AttrIndex::build(&[]),
+        };
+        file.attr_index = AttrIndex::build(&file.deltas);
+        Ok(file)
     }
 
     /// Creates a new empty in-memory file.
@@ -248,6 +258,39 @@ impl ArrayFile {
 
 // ── Schema & attribute access ────────────────────────────────────────
 
+/// An array's metadata paired with the attribute dictionaries of its layer.
+///
+/// Attribute entries are `(key_index, value_index)` pairs into the dictionaries
+/// of the layer that stores the array. A scope keeps the two together so a
+/// lookup never resolves an index against a foreign layer.
+struct AttrScope<'a> {
+    meta: &'a ArrayMeta,
+    keys: &'a [String],
+    values: &'a [AttributeValue],
+}
+
+impl<'a> AttrScope<'a> {
+    /// Returns the value of `key`, or `None` if this array has no such
+    /// attribute.
+    fn lookup(&self, key: &str) -> Option<&'a AttributeValue> {
+        let key_idx = self.keys.iter().position(|k| k == key)?;
+        let val_idx = self.meta.attributes.get(key_idx)?;
+        self.values.get(val_idx)
+    }
+
+    /// Returns the attributes as owned `(key, value)` pairs.
+    ///
+    /// Callers that move an array into another layer need this form, because
+    /// the indices do not survive the move.
+    fn entries(&self) -> Vec<(String, AttributeValue)> {
+        self.meta
+            .attributes
+            .iter_entries()
+            .filter_map(|(k, v)| Some((self.keys.get(k)?.clone(), self.values.get(v)?.clone())))
+            .collect()
+    }
+}
+
 impl ArrayFile {
     /// Returns a reference to the merged array metadata for `name`,
     /// searching from the newest layer towards the oldest.
@@ -259,15 +302,42 @@ impl ArrayFile {
     }
 
     fn resolve_array_meta(&self, name: &str) -> Option<&ArrayMeta> {
+        self.resolve_attr_scope(name).map(|scope| scope.meta)
+    }
+
+    /// Returns the visible metadata for `name` together with the attribute
+    /// dictionaries of the layer that stores it.
+    ///
+    /// Every layer interns its own keys and values, so the indices in
+    /// [`ArrayMeta::attributes`] only mean anything against the dictionaries
+    /// returned here. Reading them against another layer yields a value that
+    /// belongs to a different array.
+    fn resolve_attr_scope(&self, name: &str) -> Option<AttrScope<'_>> {
         if let Some(p) = self.pending.as_ref()
             && let Some(m) = p.inner.array_meta.get(name)
         {
-            return if m.deleted { None } else { Some(m) };
+            return if m.deleted {
+                None
+            } else {
+                Some(AttrScope {
+                    meta: m,
+                    keys: &p.inner.attr_keys,
+                    values: &p.inner.attr_values,
+                })
+            };
         }
         for delta in self.deltas.iter().rev() {
             if let Some(&i) = delta.inner.array_index.get(name) {
                 let m = &delta.inner.footer.arrays[i];
-                return if m.deleted { None } else { Some(m) };
+                return if m.deleted {
+                    None
+                } else {
+                    Some(AttrScope {
+                        meta: m,
+                        keys: &delta.inner.footer.attr_keys,
+                        values: &delta.inner.footer.attr_values,
+                    })
+                };
             }
         }
         None
@@ -385,37 +455,12 @@ impl ArrayFile {
     /// Returns the value of attribute `key` on array `name`, or `None` if the
     /// array has no such attribute. Errors if the array does not exist.
     pub fn get_attribute(&self, name: &str, key: &str) -> Result<Option<&AttributeValue>> {
-        let meta = self.get_array(name)?;
-        let key_idx = match self
-            .pending
-            .as_ref()
-            .and_then(|p| p.inner.attr_keys.iter().position(|k| k == key))
-            .or_else(|| {
-                // Check global dicts in most-recent delta
-                self.deltas
-                    .iter()
-                    .rev()
-                    .find_map(|d| d.inner.footer.attr_keys.iter().position(|k| k == key))
-            }) {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        let val_idx = match meta.attributes.get(key_idx) {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        // Look up in pending first, then deltas
-        if let Some(p) = self.pending.as_ref()
-            && val_idx < p.inner.attr_values.len()
-        {
-            return Ok(Some(&p.inner.attr_values[val_idx]));
-        }
-        for delta in self.deltas.iter().rev() {
-            if val_idx < delta.inner.footer.attr_values.len() {
-                return Ok(Some(&delta.inner.footer.attr_values[val_idx]));
-            }
-        }
-        Ok(None)
+        let scope = self
+            .resolve_attr_scope(name)
+            .ok_or_else(|| Error::ArrayNotFound {
+                name: name.to_string(),
+            })?;
+        Ok(scope.lookup(key))
     }
 
     /// Returns attribute `key` for every visible array as `(array_name, value)`.
@@ -425,14 +470,55 @@ impl ArrayFile {
     /// Intended for coarse pruning — scan the returned values to select arrays
     /// without walking each one via [`get_attribute`](Self::get_attribute).
     /// Logically deleted arrays are omitted entirely.
-    pub fn attribute_index(&self, key: &str) -> Vec<(String, Option<&AttributeValue>)> {
-        self.list_arrays()
+    ///
+    /// Names and values borrow from the open file, so the call allocates one
+    /// vector and copies nothing else.
+    ///
+    /// On a file with no unflushed changes this reads a prebuilt column and
+    /// costs one pass over the arrays. Pending changes force the slower walk
+    /// that resolves each array through its own layer, so
+    /// [`flush`](Self::flush) before a run of these calls.
+    pub fn attribute_index(&self, key: &str) -> Vec<(&str, Option<&AttributeValue>)> {
+        if self.pending.is_none() {
+            let values = self.attr_index.column(key);
+            debug_assert_eq!(values.len(), self.attr_index.len());
+            return self.attr_index.names(&self.deltas).zip(values).collect();
+        }
+        // The pending layer is not in the index, so fall back to the walk.
+        self.visible_names_with_pending()
             .into_iter()
-            .map(|m| {
-                let value = self.get_attribute(&m.name, key).ok().flatten();
-                (m.name, value)
+            .map(|name| {
+                let value = self
+                    .resolve_attr_scope(name)
+                    .and_then(|scope| scope.lookup(key));
+                (name, value)
             })
             .collect()
+    }
+
+    /// Names of every visible array, including the pending layer, in the same
+    /// order as [`list_arrays`](Self::list_arrays).
+    fn visible_names_with_pending(&self) -> Vec<&str> {
+        let mut seen: IndexMap<&str, ()> = IndexMap::new();
+        for delta in &self.deltas {
+            for a in &delta.inner.footer.arrays {
+                if a.deleted {
+                    seen.shift_remove(a.name.as_str());
+                } else {
+                    seen.insert(a.name.as_str(), ());
+                }
+            }
+        }
+        if let Some(p) = self.pending.as_ref() {
+            for (name, a) in &p.inner.array_meta {
+                if a.deleted {
+                    seen.shift_remove(name.as_str());
+                } else {
+                    seen.insert(name.as_str(), ());
+                }
+            }
+        }
+        seen.into_keys().collect()
     }
 
     /// Sets attribute `key` on array `name` to `value`, inserting or replacing
@@ -440,21 +526,41 @@ impl ArrayFile {
     /// persisted on the next [`flush`](Self::flush). Errors if the array does
     /// not exist.
     pub fn set_attribute(&mut self, name: &str, key: &str, value: AttributeValue) -> Result<()> {
-        // Ensure the array exists (in deltas or pending), and snapshot its meta
-        // in case we need to copy it down into the pending mutable delta.
-        // Clear the cloned chunks list so we don't carry stale block addresses
-        // from a lower layer into this delta's footer.
-        let mut existing_meta = self.get_array(name)?.clone();
-        existing_meta.layout.storage.chunks.clear();
+        // The array must move into the pending layer before it can change. If
+        // it is not there yet, snapshot its meta and its attributes. The
+        // attributes travel as (key, value) pairs, because their indices belong
+        // to the dictionaries of the layer they come from. Clear the cloned
+        // chunks list so no stale block address reaches this delta's footer.
+        let carried = match self.pending.as_ref() {
+            Some(p) if p.inner.array_meta.get(name).is_some_and(|m| !m.deleted) => None,
+            _ => {
+                let scope = self
+                    .resolve_attr_scope(name)
+                    .ok_or_else(|| Error::ArrayNotFound {
+                        name: name.to_string(),
+                    })?;
+                let mut meta = scope.meta.clone();
+                meta.layout.storage.chunks.clear();
+                Some((meta, scope.entries()))
+            }
+        };
 
         let pending = self.pending_mut();
+        if let Some((mut meta, entries)) = carried {
+            // Re-intern every carried attribute against the pending dictionaries.
+            let mut attributes = Attributes::empty(meta.attributes.index_kind());
+            for (k, v) in entries {
+                let key_idx = pending.intern_attr_key(&k);
+                let val_idx = pending.intern_attr_value(v);
+                attributes.upsert(key_idx, val_idx);
+            }
+            meta.attributes = attributes;
+            pending.upsert_array_meta(meta);
+        }
+
         let key_idx = pending.intern_attr_key(key);
         let val_idx = pending.intern_attr_value(value);
-
-        // Update the array meta in pending (copy from lower layer if absent).
-        if pending.array_meta_mut(name).is_none() {
-            pending.upsert_array_meta(existing_meta);
-        }
+        // The array is in pending now, either carried down above or already there.
         let meta = pending.array_meta_mut(name).unwrap();
         meta.attributes.upsert(key_idx, val_idx);
         Ok(())
@@ -778,6 +884,7 @@ impl ArrayFile {
             .commit(storage, delta_path, self.cache.clone(), base_file_hint)
             .await?;
         self.deltas.push(immutable);
+        self.attr_index = AttrIndex::build(&self.deltas);
         Ok(dirty_names)
     }
 }
@@ -799,11 +906,20 @@ impl ArrayFile {
         let mut arrays: Vec<ArrayMeta> = Vec::new();
         let mut per_array_stats: Vec<ArrayStats> = Vec::new();
 
+        // Attribute indices are relative to the layer that stores the array, so
+        // the merged footer needs one dictionary rebuilt from the surviving
+        // entries. A blind union of the layer dictionaries would keep indices
+        // that point at the wrong strings.
+        let mut attr_keys: Vec<String> = Vec::new();
+        let mut attr_values: Vec<crate::layout::AttributeValue> = Vec::new();
+
         for name in &merged_names {
-            let meta = self
-                .resolve_array_meta(name)
-                .ok_or_else(|| Error::ArrayNotFound { name: name.clone() })?
-                .clone();
+            let (meta, attr_entries) = {
+                let scope = self
+                    .resolve_attr_scope(name)
+                    .ok_or_else(|| Error::ArrayNotFound { name: name.clone() })?;
+                (scope.meta.clone(), scope.entries())
+            };
 
             // Collect all chunk coords across all layers for this array.
             let mut all_coords: indexmap::IndexSet<Vec<u32>> = indexmap::IndexSet::new();
@@ -839,6 +955,13 @@ impl ArrayFile {
 
             let mut new_meta = meta;
             new_meta.layout.storage.chunks = new_chunks;
+            let mut attributes = Attributes::empty(new_meta.attributes.index_kind());
+            for (k, v) in attr_entries {
+                let key_idx = intern(&mut attr_keys, k);
+                let val_idx = intern(&mut attr_values, v);
+                attributes.upsert(key_idx, val_idx);
+            }
+            new_meta.attributes = attributes;
             arrays.push(new_meta);
         }
 
@@ -847,22 +970,6 @@ impl ArrayFile {
             output_size,
             blocks,
         } = allocator.commit().await;
-
-        // Build attr dictionaries from all layers (simple union).
-        let mut attr_keys: Vec<String> = Vec::new();
-        let mut attr_values: Vec<crate::layout::AttributeValue> = Vec::new();
-        for delta in &self.deltas {
-            for k in &delta.inner.footer.attr_keys {
-                if !attr_keys.contains(k) {
-                    attr_keys.push(k.clone());
-                }
-            }
-            for v in &delta.inner.footer.attr_values {
-                if !attr_values.contains(v) {
-                    attr_values.push(v.clone());
-                }
-            }
-        }
 
         let footer = Footer {
             version: FOOTER_VERSION,
@@ -895,6 +1002,7 @@ impl ArrayFile {
             Delta::<DeltaImmutable>::open(base_storage, base_delta_path, self.cache.clone())
                 .await?;
         self.deltas = vec![new_base];
+        self.attr_index = AttrIndex::build(&self.deltas);
 
         let mut new_stats = StatsFile::default();
         for s in per_array_stats {
@@ -924,6 +1032,17 @@ fn resolve_cache<C: CompressionCodec>(config: &FileConfig<C>) -> Option<Arc<Delt
             config.cache_capacity as u64,
             config.io_cache_capacity as u64,
         )))
+    }
+}
+
+/// Returns the index of `item` in `dict`, appending it if absent.
+fn intern<T: PartialEq>(dict: &mut Vec<T>, item: T) -> usize {
+    match dict.iter().position(|d| *d == item) {
+        Some(i) => i,
+        None => {
+            dict.push(item);
+            dict.len() - 1
+        }
     }
 }
 
@@ -1007,10 +1126,10 @@ mod tests {
 
     /// Looks up `name` in an `attribute_index` result.
     fn find<'a>(
-        index: &'a [(String, Option<&AttributeValue>)],
+        index: &'a [(&str, Option<&'a AttributeValue>)],
         name: &str,
     ) -> Option<&'a Option<&'a AttributeValue>> {
-        index.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+        index.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
     }
 
     #[tokio::test]

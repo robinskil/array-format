@@ -72,6 +72,7 @@ pub mod dtype;
 pub mod error;
 
 // ── Layer 1: Metadata ───────────────────────────────────────────────
+mod attr_index;
 pub mod block;
 mod footer;
 pub mod layout;

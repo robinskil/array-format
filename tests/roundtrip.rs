@@ -1545,3 +1545,184 @@ async fn zero_length_dimension_survives_reopen() {
         Some(&AttributeValue::String("n/a".into()))
     );
 }
+
+/// Each layer owns its attribute dictionaries, so index 0 in one layer means
+/// something else in the next. A read must use the layer that holds the array.
+#[tokio::test]
+async fn attributes_resolve_against_their_own_layer() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    file.define_array::<f64>("a", vec!["t".into()], vec![4], None, None)
+        .unwrap();
+    file.set_attribute("a", "x", AttributeValue::Int64(100))
+        .unwrap();
+    file.flush().await.unwrap();
+
+    // "x" lands at index 0 of this layer's dictionary too, with another value.
+    file.define_array::<f64>("b", vec!["t".into()], vec![4], None, None)
+        .unwrap();
+    file.set_attribute("b", "x", AttributeValue::Int64(999))
+        .unwrap();
+    file.flush().await.unwrap();
+
+    assert_eq!(
+        file.get_attribute("a", "x").unwrap(),
+        Some(&AttributeValue::Int64(100))
+    );
+    assert_eq!(
+        file.get_attribute("b", "x").unwrap(),
+        Some(&AttributeValue::Int64(999))
+    );
+    let column = file.attribute_index("x");
+    assert_eq!(
+        column,
+        vec![
+            ("a", Some(&AttributeValue::Int64(100))),
+            ("b", Some(&AttributeValue::Int64(999))),
+        ]
+    );
+}
+
+/// A new attribute copies the array meta into the pending layer. The older
+/// attributes must move to the new dictionary, not keep the old indices.
+#[tokio::test]
+async fn existing_attributes_survive_a_later_set_in_a_new_layer() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    file.define_array::<f64>("a", vec!["t".into()], vec![4], None, None)
+        .unwrap();
+    file.set_attribute("a", "units", AttributeValue::String("m/s".into()))
+        .unwrap();
+    file.set_attribute("a", "scale", AttributeValue::Int64(7))
+        .unwrap();
+    file.flush().await.unwrap();
+
+    file.set_attribute("a", "source", AttributeValue::String("radar".into()))
+        .unwrap();
+    file.flush().await.unwrap();
+
+    assert_eq!(
+        file.get_attribute("a", "units").unwrap(),
+        Some(&AttributeValue::String("m/s".into()))
+    );
+    assert_eq!(
+        file.get_attribute("a", "scale").unwrap(),
+        Some(&AttributeValue::Int64(7))
+    );
+    assert_eq!(
+        file.get_attribute("a", "source").unwrap(),
+        Some(&AttributeValue::String("radar".into()))
+    );
+}
+
+/// Compaction merges every layer dictionary into one. Each array's indices
+/// must be remapped onto the merged dictionary.
+#[tokio::test]
+async fn attributes_survive_compaction_across_layers() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    file.define_array::<f64>("a", vec!["t".into()], vec![4], None, None)
+        .unwrap();
+    file.set_attribute("a", "x", AttributeValue::Int64(100))
+        .unwrap();
+    file.flush().await.unwrap();
+
+    file.define_array::<f64>("b", vec!["t".into()], vec![4], None, None)
+        .unwrap();
+    file.set_attribute("b", "y", AttributeValue::Int64(999))
+        .unwrap();
+    file.flush().await.unwrap();
+
+    file.compact().await.unwrap();
+
+    assert_eq!(file.num_layers(), 1, "compaction leaves a single layer");
+    assert_eq!(
+        file.get_attribute("a", "x").unwrap(),
+        Some(&AttributeValue::Int64(100))
+    );
+    assert_eq!(
+        file.get_attribute("b", "y").unwrap(),
+        Some(&AttributeValue::Int64(999))
+    );
+    assert_eq!(file.get_attribute("a", "y").unwrap(), None);
+    assert_eq!(file.get_attribute("b", "x").unwrap(), None);
+}
+
+/// `attribute_index` has a fast path for a flushed file and a slower walk
+/// while a pending layer exists. Both must report the same column.
+#[tokio::test]
+async fn attribute_index_agrees_across_the_pending_boundary() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+
+    for i in 0..8 {
+        file.define_array::<f64>(&format!("a{i}"), vec!["t".into()], vec![4], None, None)
+            .unwrap();
+        file.set_attribute(&format!("a{i}"), "units", AttributeValue::Int64(i))
+            .unwrap();
+    }
+    file.flush().await.unwrap();
+
+    // A second layer overrides one array, deletes another and adds a third.
+    file.set_attribute("a2", "units", AttributeValue::Int64(222))
+        .unwrap();
+    file.delete("a5").unwrap();
+    file.define_array::<f64>("a8", vec!["t".into()], vec![4], None, None)
+        .unwrap();
+    file.set_attribute("a8", "units", AttributeValue::Int64(888))
+        .unwrap();
+
+    // Pending is live here, so this is the walk.
+    let pending_view: Vec<(String, Option<AttributeValue>)> = file
+        .attribute_index("units")
+        .into_iter()
+        .map(|(n, v)| (n.to_string(), v.cloned()))
+        .collect();
+
+    file.flush().await.unwrap();
+
+    // Flushed, so this is the prebuilt column.
+    let indexed_view: Vec<(String, Option<AttributeValue>)> = file
+        .attribute_index("units")
+        .into_iter()
+        .map(|(n, v)| (n.to_string(), v.cloned()))
+        .collect();
+
+    assert_eq!(pending_view, indexed_view);
+    assert_eq!(indexed_view.len(), 8, "a5 is gone, a8 is new");
+    let get = |name: &str| {
+        indexed_view
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(get("a2"), Some(Some(AttributeValue::Int64(222))));
+    assert_eq!(get("a8"), Some(Some(AttributeValue::Int64(888))));
+    assert_eq!(get("a5"), None, "deleted arrays are omitted");
+    assert_eq!(get("a0"), Some(Some(AttributeValue::Int64(0))));
+
+    // Compaction rebuilds the index from one merged dictionary.
+    file.compact().await.unwrap();
+    let compacted_view: Vec<(String, Option<AttributeValue>)> = file
+        .attribute_index("units")
+        .into_iter()
+        .map(|(n, v)| (n.to_string(), v.cloned()))
+        .collect();
+    assert_eq!(compacted_view, indexed_view);
+}
+
+/// A key that no array carries yields a column of `None`, one per array.
+#[tokio::test]
+async fn attribute_index_unknown_key_spans_every_array() {
+    let mut file = ArrayFile::create_memory(small_config()).await.unwrap();
+    for i in 0..3 {
+        file.define_array::<f64>(&format!("a{i}"), vec!["t".into()], vec![4], None, None)
+            .unwrap();
+        file.set_attribute(&format!("a{i}"), "units", AttributeValue::Int64(i))
+            .unwrap();
+    }
+    file.flush().await.unwrap();
+
+    let column = file.attribute_index("no_such_key");
+    assert_eq!(column.len(), 3);
+    assert!(column.iter().all(|(_, v)| v.is_none()));
+}

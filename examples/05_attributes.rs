@@ -70,7 +70,7 @@ async fn main() {
     // single call — a full column, with None where the attribute is absent.
     // Use it to prune (select arrays by attribute) without walking each one.
     println!("\nunits across all arrays:");
-    let pressure_arrays: Vec<String> = file
+    let pressure_arrays: Vec<&str> = file
         .attribute_index("units")
         .into_iter()
         .inspect(|(name, value)| println!("  {name:<12} = {value:?}"))
@@ -79,5 +79,5 @@ async fn main() {
         .collect();
 
     println!("arrays measured in hPa: {pressure_arrays:?}");
-    assert_eq!(pressure_arrays, vec!["pressure".to_string()]);
+    assert_eq!(pressure_arrays, vec!["pressure"]);
 }

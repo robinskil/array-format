@@ -105,6 +105,56 @@ impl PartialEq for AttributeValue {
     }
 }
 
+/// Bit-exact equality, so a value can key a hash map.
+///
+/// `PartialEq` compares floats by bit pattern, which makes it reflexive even
+/// for NaN. That is what `Eq` requires.
+impl Eq for AttributeValue {}
+
+impl std::hash::Hash for AttributeValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Hash the discriminant first so variants with equal payloads differ.
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Bool(v) => v.hash(state),
+            Self::Int8(v) => v.hash(state),
+            Self::Int16(v) => v.hash(state),
+            Self::Int32(v) => v.hash(state),
+            Self::Int64(v) => v.hash(state),
+            Self::UInt8(v) => v.hash(state),
+            Self::UInt16(v) => v.hash(state),
+            Self::UInt32(v) => v.hash(state),
+            Self::UInt64(v) => v.hash(state),
+            // Floats hash by bit pattern, to match how they compare.
+            Self::Float32(v) => v.to_bits().hash(state),
+            Self::Float64(v) => v.to_bits().hash(state),
+            Self::String(v) => v.hash(state),
+            Self::Binary(v) => v.hash(state),
+            Self::BoolList(v) => v.hash(state),
+            Self::Int8List(v) => v.hash(state),
+            Self::Int16List(v) => v.hash(state),
+            Self::Int32List(v) => v.hash(state),
+            Self::Int64List(v) => v.hash(state),
+            Self::UInt8List(v) => v.hash(state),
+            Self::UInt16List(v) => v.hash(state),
+            Self::UInt32List(v) => v.hash(state),
+            Self::UInt64List(v) => v.hash(state),
+            Self::Float32List(v) => {
+                for x in v {
+                    x.to_bits().hash(state);
+                }
+            }
+            Self::Float64List(v) => {
+                for x in v {
+                    x.to_bits().hash(state);
+                }
+            }
+            Self::StringList(v) => v.hash(state),
+            Self::BinaryList(v) => v.hash(state),
+        }
+    }
+}
+
 /// Controls the integer width used for attribute key/value dictionary indices.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Archive, Serialize, Deserialize)]
 pub enum AttrIndexKind {
@@ -193,6 +243,15 @@ impl Attributes {
             Self::U16(v) => Box::new(v.iter().map(|&(k, v)| (k as usize, v as usize))),
             Self::U32(v) => Box::new(v.iter().map(|&(k, v)| (k as usize, v as usize))),
             Self::U64(v) => Box::new(v.iter().map(|&(k, v)| (k as usize, v as usize))),
+        }
+    }
+
+    /// Returns the index width this attribute set uses.
+    pub fn index_kind(&self) -> AttrIndexKind {
+        match self {
+            Self::U16(_) => AttrIndexKind::U16,
+            Self::U32(_) => AttrIndexKind::U32,
+            Self::U64(_) => AttrIndexKind::U64,
         }
     }
 
