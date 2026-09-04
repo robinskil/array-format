@@ -15,25 +15,22 @@ use indexmap::IndexMap;
 use crate::{
     address::{BlockAllocAddress, ChunkAddress},
     array::ArrayElement,
+    attr::{AttributeValue, DiskValue, StringPool},
+    block_cache::BlockCache,
+    block_writer::{BlockWriter, BlockWriterOutput},
     codec::CompressionCodec,
-    // The allocator is the block packer of the old delta layer. It moves here
-    // under this name once the delta modules are removed.
-    delta::{
-        AllocatorOutput, DeltaAllocator as BlockWriter, DeltaCache as BlockCache,
-        write_file_then_bytes,
-    },
     dtype::DType,
     error::{Error, Result},
-    file::DEFAULT_BLOCK_TARGET_SIZE,
+    footer::{ArrayMeta, FOOTER_VERSION, Footer},
     layout::{ChunkEntry, FillValue},
+    nd,
+    reader::{ArrayFile, ReadConfig},
     stats::{ArrayStats, StatValue, compute_chunk_partial, merge_partial},
-    storage::{ObjectStoreBackend, Storage},
+    storage::{ObjectStoreBackend, Storage, write_file_then_bytes},
 };
 
-use super::{
-    ArrayFile, ArrayMeta, AttributeValue, DiskValue, FOOTER_VERSION, Footer, ReadConfig,
-    StringPool, nd,
-};
+/// Default target size of a data block before it is compressed (8 MiB).
+pub const DEFAULT_BLOCK_TARGET_SIZE: usize = 8 * 1024 * 1024;
 
 /// Options for an [`ArrayWriter`].
 pub struct WriterConfig<C: CompressionCodec> {
@@ -284,7 +281,7 @@ impl ArrayWriter {
         cache: Option<Arc<BlockCache>>,
     ) -> Result<ArrayFile> {
         let ArrayWriter { blocks, arrays } = self;
-        let AllocatorOutput {
+        let BlockWriterOutput {
             mut file,
             output_size,
             blocks,
@@ -430,9 +427,9 @@ mod tests {
 
     use super::*;
     use crate::codec::decompress_by_id;
+    use crate::footer::{find_chunk, read_footer};
     use crate::stats::StatValue;
     use crate::storage::{InMemoryStorage, Storage};
-    use crate::v6::read_footer;
     use crate::{NoCompression, ZstdCodec};
 
     fn writer() -> ArrayWriter {
@@ -588,7 +585,7 @@ mod tests {
             .map(|e| e.coord.clone())
             .collect();
         assert_eq!(coords, vec![vec![0], vec![1], vec![2]]);
-        assert!(footer.arrays[0].chunk(&[2]).is_some());
+        assert!(find_chunk(&footer.arrays[0].chunks, &[2]).is_some());
     }
 
     #[tokio::test]

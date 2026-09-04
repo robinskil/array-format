@@ -1,5 +1,7 @@
-//! Block allocator for a pending layer: compresses chunks and spills them to a
-//! backing temp file, tracking each block's location for later positional reads.
+//! Packs chunk bytes into compressed blocks while a file is written.
+//!
+//! Completed blocks spill to a backing temp file; each block's location is
+//! tracked so a chunk can be read back before the file is finished.
 
 use std::sync::Arc;
 
@@ -44,13 +46,13 @@ fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> s
 /// Packs raw chunk bytes into compressed blocks.
 ///
 /// The current (unflushed) block is held in memory; completed blocks are
-/// compressed and written to a single backing tempfile. [`fetch`](DeltaAllocator::fetch)
+/// compressed and written to a single backing tempfile. [`fetch`](BlockWriter::fetch)
 /// serves the current block from memory and decompresses completed blocks
 /// from that file on demand — no second file is needed.
 ///
-/// Call [`commit`](DeltaAllocator::commit) to flush the final block and
+/// Call [`commit`](BlockWriter::commit) to flush the final block and
 /// retrieve the compressed output file plus block metadata.
-pub struct DeltaAllocator {
+pub struct BlockWriter {
     codec: Arc<dyn CompressionCodec>,
     block_target_size: usize,
     // Current (not-yet-flushed) block — kept in memory for cheap fetch().
@@ -63,10 +65,10 @@ pub struct DeltaAllocator {
     file_offset: u64,
 }
 
-/// The output of [`DeltaAllocator::commit`]: a file handle to the compressed
+/// The output of [`BlockWriter::commit`]: a file handle to the compressed
 /// block bytes (seeked to the start), the total byte count, and the block
 /// metadata table.
-pub struct AllocatorOutput {
+pub struct BlockWriterOutput {
     /// Compressed block data, seeked to position 0 and ready to read.
     pub file: tokio::fs::File,
     /// Total number of bytes in `file`.
@@ -75,12 +77,12 @@ pub struct AllocatorOutput {
     pub blocks: Vec<BlockMeta>,
 }
 
-impl DeltaAllocator {
+impl BlockWriter {
     /// Creates an allocator that compresses with `codec` and starts a new block
     /// once the current one reaches `block_target_size` bytes.
     pub fn new(codec: Arc<dyn CompressionCodec>, block_target_size: usize) -> Self {
         let output_file =
-            tempfile::tempfile().expect("DeltaAllocator: failed to create output tempfile");
+            tempfile::tempfile().expect("BlockWriter: failed to create output tempfile");
         Self {
             codec,
             block_target_size,
@@ -165,7 +167,7 @@ impl DeltaAllocator {
     /// Flushes the remaining partial block and returns a file handle to the
     /// compressed output (seeked to position 0), the total output size, and
     /// the block metadata table.
-    pub async fn commit(mut self) -> AllocatorOutput {
+    pub async fn commit(mut self) -> BlockWriterOutput {
         use tokio::io::AsyncSeekExt;
         self.flush_block();
         let output_size = self.file_offset;
@@ -173,7 +175,7 @@ impl DeltaAllocator {
         file.seek(std::io::SeekFrom::Start(0))
             .await
             .expect("output_file seek failed");
-        AllocatorOutput {
+        BlockWriterOutput {
             file,
             output_size,
             blocks: self.completed_blocks,
@@ -194,7 +196,7 @@ mod tests {
 
     #[test]
     fn allocator_address_reflects_block_and_offset() {
-        let mut alloc = DeltaAllocator::new(codec(), 1024);
+        let mut alloc = BlockWriter::new(codec(), 1024);
         let a = alloc.allocate(&[1, 2, 3, 4]);
         assert_eq!(a.id(), BlockId(0));
         assert_eq!(a.offset(), 0);
@@ -208,7 +210,7 @@ mod tests {
 
     #[test]
     fn allocator_fetch_from_current_block() {
-        let mut alloc = DeltaAllocator::new(codec(), 1024);
+        let mut alloc = BlockWriter::new(codec(), 1024);
         let addr = alloc.allocate(&[10, 20, 30]);
         let bytes = alloc.fetch(&addr).expect("fetch returned None");
         assert_eq!(bytes.as_ref(), &[10, 20, 30]);
@@ -216,7 +218,7 @@ mod tests {
 
     #[test]
     fn allocator_fetch_second_slice_in_current_block() {
-        let mut alloc = DeltaAllocator::new(codec(), 1024);
+        let mut alloc = BlockWriter::new(codec(), 1024);
         alloc.allocate(&[0u8; 8]);
         let addr = alloc.allocate(&[42, 43, 44, 45]);
         let bytes = alloc.fetch(&addr).unwrap();
@@ -225,7 +227,7 @@ mod tests {
 
     #[test]
     fn allocator_flush_triggered_at_target_size() {
-        let mut alloc = DeltaAllocator::new(codec(), 8);
+        let mut alloc = BlockWriter::new(codec(), 8);
         let addr = alloc.allocate(&[1u8; 8]);
         assert_eq!(
             alloc.current_block_id, 1,
@@ -237,7 +239,7 @@ mod tests {
     #[test]
     fn allocator_fetch_from_completed_block() {
         let payload = [0xABu8; 8];
-        let mut alloc = DeltaAllocator::new(codec(), 8);
+        let mut alloc = BlockWriter::new(codec(), 8);
         let addr = alloc.allocate(&payload);
         alloc.allocate(&[0u8; 4]);
         let bytes = alloc
@@ -248,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn allocator_commit_captures_all_blocks() {
-        let mut alloc = DeltaAllocator::new(codec(), 8);
+        let mut alloc = BlockWriter::new(codec(), 8);
         alloc.allocate(&[1u8; 8]); // fills block 0 → flush
         alloc.allocate(&[2u8; 6]); // partial block 1
 
@@ -263,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn allocator_commit_output_decompresses_to_original() {
         let data: Vec<u8> = (0u8..=127).collect();
-        let mut alloc = DeltaAllocator::new(codec(), 64);
+        let mut alloc = BlockWriter::new(codec(), 64);
         let addr = alloc.allocate(&data[..64]); // block 0
         alloc.allocate(&data[64..]); // block 1
 

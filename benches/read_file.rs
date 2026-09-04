@@ -6,7 +6,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rand::Rng;
 use tokio::runtime::Runtime;
 
-use array_format::{ArrayFile, FileConfig, Lz4Codec, NoCompression, ZstdCodec};
+use array_format::{
+    ArrayFile, ArrayWriter, Lz4Codec, NoCompression, ReadConfig, WriterConfig, ZstdCodec,
+};
 use object_store::{ObjectStore, local::LocalFileSystem};
 
 const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB per chunk
@@ -22,37 +24,41 @@ fn patterned_chunk() -> Vec<u8> {
     (0..CHUNK_SIZE).map(|i| (i % 256) as u8).collect()
 }
 
-async fn prepare_file_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
+async fn prepare_file_on_disk<C: array_format::CompressionCodec + 'static>(
     store: Arc<dyn ObjectStore>,
     path: object_store::path::Path,
     codec: C,
     chunk_data: &[u8],
 ) {
-    let config = FileConfig {
+    let mut writer = ArrayWriter::new(WriterConfig {
         block_target_size: BLOCK_TARGET,
-        ..FileConfig::new(codec)
-    };
-    let mut file = ArrayFile::create(Arc::clone(&store), path, config)
-        .await
+        ..WriterConfig::new(codec)
+    });
+    writer
+        .define_array::<u8>(
+            "data",
+            vec!["x".into(), "y".into()],
+            vec![NUM_CHUNKS as usize, CHUNK_SIZE],
+            Some(vec![1, CHUNK_SIZE]),
+            None,
+        )
         .unwrap();
-    file.define_array::<u8>(
-        "data",
-        vec!["x".into(), "y".into()],
-        vec![NUM_CHUNKS as usize, CHUNK_SIZE],
-        Some(vec![1, CHUNK_SIZE]),
-        None,
-    )
-    .unwrap();
     for i in 0..NUM_CHUNKS as usize {
         let chunk =
             ndarray::Array::from_shape_vec(ndarray::IxDyn(&[1, CHUNK_SIZE]), chunk_data.to_vec())
                 .unwrap();
-        file.write_array("data", vec![i, 0], chunk.view())
-            .await
+        writer
+            .write_array("data", vec![i, 0], chunk.view())
             .unwrap();
     }
-    file.flush().await.unwrap();
-    file.compact().await.unwrap();
+    writer.finish(store, path).await.unwrap();
+}
+
+fn uncached() -> ReadConfig {
+    ReadConfig {
+        cache_capacity: 0,
+        ..ReadConfig::default()
+    }
 }
 
 fn bench_file_read_all_chunks(c: &mut Criterion) {
@@ -85,8 +91,9 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
                     let store = Arc::clone(&store);
                     let path = path.clone();
                     async move {
-                        let cfg = FileConfig::new(NoCompression);
-                        let file = ArrayFile::open(store, path, cfg).await.unwrap();
+                        let file = ArrayFile::open(store, path, ReadConfig::default())
+                            .await
+                            .unwrap();
                         for i in 0..NUM_CHUNKS as usize {
                             file.read_array::<u8>("data", vec![i, 0], vec![1, CHUNK_SIZE])
                                 .await
@@ -116,7 +123,7 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression))
+                let file = ArrayFile::open(store, path, ReadConfig::default())
                     .await
                     .unwrap();
                 for i in 0..NUM_CHUNKS as usize {
@@ -142,7 +149,7 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression))
+                let file = ArrayFile::open(store, path, ReadConfig::default())
                     .await
                     .unwrap();
                 for i in 0..NUM_CHUNKS as usize {
@@ -168,7 +175,7 @@ fn bench_file_read_all_chunks(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let file = ArrayFile::open(store, path, FileConfig::new(NoCompression))
+                let file = ArrayFile::open(store, path, ReadConfig::default())
                     .await
                     .unwrap();
                 for i in 0..NUM_CHUNKS as usize {
@@ -208,11 +215,7 @@ fn bench_file_single_chunk_read(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let cfg = FileConfig {
-                    cache_capacity: 0,
-                    ..FileConfig::new(NoCompression)
-                };
-                let file = ArrayFile::open(store, path, cfg).await.unwrap();
+                let file = ArrayFile::open(store, path, uncached()).await.unwrap();
                 file.read_array::<u8>("data", vec![0, 0], vec![1, CHUNK_SIZE])
                     .await
                     .unwrap();
@@ -234,11 +237,7 @@ fn bench_file_single_chunk_read(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let cfg = FileConfig {
-                    cache_capacity: 0,
-                    ..FileConfig::new(NoCompression)
-                };
-                let file = ArrayFile::open(store, path, cfg).await.unwrap();
+                let file = ArrayFile::open(store, path, uncached()).await.unwrap();
                 file.read_array::<u8>("data", vec![0, 0], vec![1, CHUNK_SIZE])
                     .await
                     .unwrap();
@@ -260,11 +259,7 @@ fn bench_file_single_chunk_read(c: &mut Criterion) {
             let store = Arc::clone(&store);
             let path = path.clone();
             async move {
-                let cfg = FileConfig {
-                    cache_capacity: 0,
-                    ..FileConfig::new(NoCompression)
-                };
-                let file = ArrayFile::open(store, path, cfg).await.unwrap();
+                let file = ArrayFile::open(store, path, uncached()).await.unwrap();
                 file.read_array::<u8>("data", vec![0, 0], vec![1, CHUNK_SIZE])
                     .await
                     .unwrap();

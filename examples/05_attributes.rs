@@ -4,47 +4,70 @@
 //! cargo run --example 05_attributes
 //! ```
 
-use array_format::{ArrayFile, AttributeValue, FileConfig, NoCompression};
+use std::sync::Arc;
+
+use array_format::{ArrayWriter, AttributeValue, NoCompression, WriterConfig};
+use object_store::memory::InMemory;
 
 #[tokio::main]
 async fn main() {
-    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
+    let mut writer = ArrayWriter::new(WriterConfig::new(NoCompression));
+
+    writer
+        .define_array::<f32>("pressure", vec!["z".into()], vec![10], None, None)
+        .unwrap();
+    writer
+        .set_attribute("pressure", "units", AttributeValue::String("hPa".into()))
+        .unwrap();
+    writer
+        .set_attribute("pressure", "scale_factor", AttributeValue::Float64(0.01))
+        .unwrap();
+    writer
+        .set_attribute("pressure", "valid_min", AttributeValue::Float32(0.0))
+        .unwrap();
+    // Attribute values can also be raw bytes or a list of values.
+    writer
+        .set_attribute(
+            "pressure",
+            "checksum",
+            AttributeValue::Binary(Box::new([0xde, 0xad, 0xbe, 0xef])),
+        )
+        .unwrap();
+    writer
+        .set_attribute(
+            "pressure",
+            "valid_range",
+            AttributeValue::Float32List(Box::new([0.0, 1100.0])),
+        )
+        .unwrap();
+
+    // More arrays, with and without the same "units" attribute.
+    writer
+        .define_array::<f32>("temperature", vec!["z".into()], vec![10], None, None)
+        .unwrap();
+    writer
+        .set_attribute("temperature", "units", AttributeValue::String("K".into()))
+        .unwrap();
+    writer
+        .define_array::<f32>("humidity", vec!["z".into()], vec![10], None, None)
+        .unwrap();
+    // "humidity" deliberately has no "units" attribute.
+
+    let file = writer
+        .finish(
+            Arc::new(InMemory::new()),
+            object_store::path::Path::from("attrs.af"),
+        )
         .await
         .unwrap();
 
-    file.define_array::<f32>("pressure", vec!["z".into()], vec![10], None, None)
-        .unwrap();
-    file.set_attribute("pressure", "units", AttributeValue::String("hPa".into()))
-        .unwrap();
-    file.set_attribute("pressure", "scale_factor", AttributeValue::Float64(0.01))
-        .unwrap();
-    file.set_attribute("pressure", "valid_min", AttributeValue::Float32(0.0))
-        .unwrap();
-    // Attribute values can also be raw bytes or a list of values.
-    file.set_attribute(
-        "pressure",
-        "checksum",
-        AttributeValue::Binary(vec![0xde, 0xad, 0xbe, 0xef]),
-    )
-    .unwrap();
-    file.set_attribute(
-        "pressure",
-        "valid_range",
-        AttributeValue::Float32List(vec![0.0, 1100.0]),
-    )
-    .unwrap();
-
-    let units = file.get_attribute("pressure", "units").unwrap().unwrap();
-    let scale = file
-        .get_attribute("pressure", "scale_factor")
-        .unwrap()
-        .unwrap();
-    let missing = file.get_attribute("pressure", "long_name").unwrap();
-    let checksum = file.get_attribute("pressure", "checksum").unwrap().unwrap();
-    let range = file
-        .get_attribute("pressure", "valid_range")
-        .unwrap()
-        .unwrap();
+    // Attributes are in memory from the moment the file opens: a lookup is
+    // two hash probes, no I/O.
+    let units = file.get_attribute("pressure", "units").unwrap();
+    let scale = file.get_attribute("pressure", "scale_factor").unwrap();
+    let missing = file.get_attribute("pressure", "long_name");
+    let checksum = file.get_attribute("pressure", "checksum").unwrap();
+    let range = file.get_attribute("pressure", "valid_range").unwrap();
 
     println!("units        = {units:?}");
     println!("scale_factor = {scale:?}");
@@ -54,17 +77,14 @@ async fn main() {
 
     assert!(matches!(units, AttributeValue::String(s) if s == "hPa"));
     assert!(missing.is_none());
-    assert!(matches!(checksum, AttributeValue::Binary(b) if b == &[0xde, 0xad, 0xbe, 0xef]));
-    assert!(matches!(range, AttributeValue::Float32List(v) if v == &[0.0, 1100.0]));
+    assert!(matches!(checksum, AttributeValue::Binary(b) if b[..] == [0xde, 0xad, 0xbe, 0xef]));
+    assert!(matches!(range, AttributeValue::Float32List(v) if v[..] == [0.0, 1100.0]));
 
-    // Define more arrays with (and without) the same "units" attribute.
-    file.define_array::<f32>("temperature", vec!["z".into()], vec![10], None, None)
-        .unwrap();
-    file.set_attribute("temperature", "units", AttributeValue::String("K".into()))
-        .unwrap();
-    file.define_array::<f32>("humidity", vec!["z".into()], vec![10], None, None)
-        .unwrap();
-    // "humidity" deliberately has no "units" attribute.
+    // All attributes of one array, as a map.
+    println!(
+        "\npressure has {} attributes",
+        file.attributes("pressure").unwrap().len()
+    );
 
     // attribute_index gives the value of one attribute across every array in a
     // single call — a full column, with None where the attribute is absent.

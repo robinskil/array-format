@@ -6,8 +6,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use futures::stream::{self, StreamExt};
 use rand::Rng;
 
-use array_format::{ArrayFile, FileConfig, Lz4Codec, NoCompression};
-use object_store::{ObjectStore, local::LocalFileSystem};
+use array_format::{ArrayFile, ArrayWriter, Lz4Codec, NoCompression, ReadConfig, WriterConfig};
+use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 
 const MANY_ARRAYS_COUNT: usize = 25_000;
 const ELEMENTS_PER_ARRAY: usize = 10_000;
@@ -18,53 +18,23 @@ fn total_bytes() -> u64 {
     (MANY_ARRAYS_COUNT * ELEMENTS_PER_ARRAY * std::mem::size_of::<i32>()) as u64
 }
 
-async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
-    codec: C,
-) -> (ArrayFile, Vec<String>) {
-    let config = FileConfig {
-        block_target_size: BLOCK_TARGET,
+fn read_config() -> ReadConfig {
+    ReadConfig {
         cache_capacity: CACHE_SIZE,
-        ..FileConfig::new(codec)
-    };
-    let mut file = ArrayFile::create_memory(config).await.unwrap();
-
-    let mut rng = rand::rng();
-    let mut names = Vec::with_capacity(MANY_ARRAYS_COUNT);
-    for i in 0..MANY_ARRAYS_COUNT {
-        let name = format!("arr_{i:05}");
-        let values: Vec<i32> = (0..ELEMENTS_PER_ARRAY)
-            .map(|_| rng.random_range(0..10))
-            .collect();
-        let nd = ndarray::Array::from_vec(values).into_dyn();
-        file.define_array::<i32>(
-            &name,
-            vec!["x".into()],
-            vec![ELEMENTS_PER_ARRAY],
-            None,
-            None,
-        )
-        .unwrap();
-        file.write_array(&name, vec![0], nd.view()).await.unwrap();
-        names.push(name);
+        ..ReadConfig::default()
     }
-    file.flush().await.unwrap();
-    (file, names)
 }
 
-async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
+/// Writes MANY_ARRAYS_COUNT random arrays to `path` in `store`.
+async fn prepare_many_arrays<C: array_format::CompressionCodec + 'static>(
     store: Arc<dyn ObjectStore>,
     path: object_store::path::Path,
     codec: C,
 ) -> Vec<String> {
-    let config = FileConfig {
+    let mut writer = ArrayWriter::new(WriterConfig {
         block_target_size: BLOCK_TARGET,
-        cache_capacity: CACHE_SIZE,
-        ..FileConfig::new(codec)
-    };
-    let mut file = ArrayFile::create(Arc::clone(&store), path, config)
-        .await
-        .unwrap();
-
+        ..WriterConfig::new(codec)
+    });
     let mut rng = rand::rng();
     let mut names = Vec::with_capacity(MANY_ARRAYS_COUNT);
     for i in 0..MANY_ARRAYS_COUNT {
@@ -73,20 +43,30 @@ async fn prepare_many_arrays_on_disk<C: array_format::CompressionCodec + Clone +
             .map(|_| rng.random_range(0..10))
             .collect();
         let nd = ndarray::Array::from_vec(values).into_dyn();
-        file.define_array::<i32>(
-            &name,
-            vec!["x".into()],
-            vec![ELEMENTS_PER_ARRAY],
-            None,
-            None,
-        )
-        .unwrap();
-        file.write_array(&name, vec![0], nd.view()).await.unwrap();
+        writer
+            .define_array::<i32>(
+                &name,
+                vec!["x".into()],
+                vec![ELEMENTS_PER_ARRAY],
+                None,
+                None,
+            )
+            .unwrap();
+        writer.write_array(&name, vec![0], nd.view()).unwrap();
         names.push(name);
     }
-    file.flush().await.unwrap();
-    file.compact().await.unwrap();
+    writer.finish(store, path).await.unwrap();
     names
+}
+
+async fn prepare_many_arrays_in_memory<C: array_format::CompressionCodec + 'static>(
+    codec: C,
+) -> (ArrayFile, Vec<String>) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = object_store::path::Path::from("many.af");
+    let names = prepare_many_arrays(Arc::clone(&store), path.clone(), codec).await;
+    let file = ArrayFile::open(store, path, read_config()).await.unwrap();
+    (file, names)
 }
 
 async fn read_sequential(file: &ArrayFile, names: &[String]) {
@@ -220,23 +200,16 @@ fn bench_many_arrays_file(c: &mut Criterion) {
     group.sample_size(10);
 
     let path_lz4 = object_store::path::Path::from("many_lz4.af");
-    let names_lz4 = rt.block_on(prepare_many_arrays_on_disk(
+    let names_lz4 = rt.block_on(prepare_many_arrays(
         Arc::clone(&store),
         path_lz4.clone(),
         Lz4Codec,
     ));
     let file_lz4 = rt.block_on(async {
         Arc::new(
-            ArrayFile::open(
-                Arc::clone(&store),
-                path_lz4,
-                FileConfig {
-                    cache_capacity: CACHE_SIZE,
-                    ..FileConfig::new(NoCompression)
-                },
-            )
-            .await
-            .unwrap(),
+            ArrayFile::open(Arc::clone(&store), path_lz4, read_config())
+                .await
+                .unwrap(),
         )
     });
 
@@ -259,23 +232,16 @@ fn bench_many_arrays_file(c: &mut Criterion) {
     }
 
     let path_none = object_store::path::Path::from("many_none.af");
-    let names_none = rt.block_on(prepare_many_arrays_on_disk(
+    let names_none = rt.block_on(prepare_many_arrays(
         Arc::clone(&store),
         path_none.clone(),
         NoCompression,
     ));
     let file_none = rt.block_on(async {
         Arc::new(
-            ArrayFile::open(
-                Arc::clone(&store),
-                path_none,
-                FileConfig {
-                    cache_capacity: CACHE_SIZE,
-                    ..FileConfig::new(NoCompression)
-                },
-            )
-            .await
-            .unwrap(),
+            ArrayFile::open(Arc::clone(&store), path_none, read_config())
+                .await
+                .unwrap(),
         )
     });
 

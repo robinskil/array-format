@@ -2,9 +2,12 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::Rng;
+use std::sync::Arc;
+
 use tokio::runtime::Runtime;
 
-use array_format::{ArrayFile, FileConfig, Lz4Codec, NoCompression, ZstdCodec};
+use array_format::{ArrayFile, ArrayWriter, Lz4Codec, NoCompression, WriterConfig, ZstdCodec};
+use object_store::memory::InMemory;
 
 const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB per chunk
 const NUM_CHUNKS: u32 = 64;
@@ -19,33 +22,38 @@ fn patterned_chunk() -> Vec<u8> {
     (0..CHUNK_SIZE).map(|i| (i % 256) as u8).collect()
 }
 
-async fn prepare_file<C: array_format::CompressionCodec + Clone + 'static>(
+async fn prepare_file<C: array_format::CompressionCodec + 'static>(
     codec: C,
     chunk_data: &[u8],
 ) -> ArrayFile {
-    let config = FileConfig {
+    let mut writer = ArrayWriter::new(WriterConfig {
         block_target_size: BLOCK_TARGET,
-        ..FileConfig::new(codec)
-    };
-    let mut file = ArrayFile::create_memory(config).await.unwrap();
-    file.define_array::<u8>(
-        "data",
-        vec!["x".into(), "y".into()],
-        vec![NUM_CHUNKS as usize, CHUNK_SIZE],
-        Some(vec![1, CHUNK_SIZE]),
-        None,
-    )
-    .unwrap();
+        ..WriterConfig::new(codec)
+    });
+    writer
+        .define_array::<u8>(
+            "data",
+            vec!["x".into(), "y".into()],
+            vec![NUM_CHUNKS as usize, CHUNK_SIZE],
+            Some(vec![1, CHUNK_SIZE]),
+            None,
+        )
+        .unwrap();
     for i in 0..NUM_CHUNKS as usize {
         let chunk =
             ndarray::Array::from_shape_vec(ndarray::IxDyn(&[1, CHUNK_SIZE]), chunk_data.to_vec())
                 .unwrap();
-        file.write_array("data", vec![i, 0], chunk.view())
-            .await
+        writer
+            .write_array("data", vec![i, 0], chunk.view())
             .unwrap();
     }
-    file.flush().await.unwrap();
-    file
+    writer
+        .finish(
+            Arc::new(InMemory::new()),
+            object_store::path::Path::from("bench.af"),
+        )
+        .await
+        .unwrap()
 }
 
 fn bench_read_all_chunks(c: &mut Criterion) {

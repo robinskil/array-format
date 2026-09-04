@@ -14,20 +14,24 @@ use ecow::EcoString;
 
 use crate::{
     array::ArrayElement,
+    attr::AttributeValue,
     block::BlockMeta,
+    block_cache::BlockCache,
     codec::decompress_by_id,
-    // The block cache of the old delta layer. It moves here under this name
-    // once the delta modules are removed.
-    delta::DeltaCache as BlockCache,
     dtype::DType,
     error::{Error, Result},
-    file::{DEFAULT_CACHE_CAPACITY, DEFAULT_IO_CACHE_CAPACITY},
+    footer::{Footer, find_chunk, read_footer},
     layout::{ChunkEntry, FillValue},
+    nd,
     stats::ArrayStats,
     storage::{ObjectStoreBackend, Storage},
 };
 
-use super::{AttributeValue, Footer, footer::find_chunk, nd, read_footer};
+/// Default byte budget for the decompressed-block cache (256 MiB).
+pub const DEFAULT_CACHE_CAPACITY: usize = 256 * 1024 * 1024;
+/// Default byte budget for the raw I/O slab cache (64 MiB). Useful for
+/// object-store workloads, where a round trip is expensive.
+pub const DEFAULT_IO_CACHE_CAPACITY: usize = 64 * 1024 * 1024;
 
 /// Options for opening an [`ArrayFile`].
 ///
@@ -372,9 +376,10 @@ mod tests {
 
     use super::*;
     use crate::address::{BlockId, ChunkAddress};
+    use crate::footer::{ArrayMeta, FOOTER_VERSION};
     use crate::stats::StatValue;
     use crate::storage::InMemoryStorage;
-    use crate::v6::{ArrayMeta, ArrayWriter, FOOTER_VERSION, WriterConfig};
+    use crate::writer::{ArrayWriter, WriterConfig};
     use crate::{Lz4Codec, NoCompression};
 
     fn writer() -> ArrayWriter {

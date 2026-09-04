@@ -25,9 +25,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use array_format::{ArrayFile, FileConfig, Lz4Codec, NoCompression};
+use array_format::{ArrayFile, ArrayWriter, Lz4Codec, NoCompression, ReadConfig, WriterConfig};
 use futures::stream::{self, StreamExt};
-use object_store::{ObjectStore, local::LocalFileSystem};
+use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 
 const ARRAY_COUNT: usize = 25_000;
 const ELEMENTS_PER_ARRAY: usize = 10_000;
@@ -68,38 +68,50 @@ async fn read_parallel_concurrent(
     }
 }
 
-async fn prepare_in_memory<C: array_format::CompressionCodec + Clone + 'static>(
+fn read_config() -> ReadConfig {
+    ReadConfig {
+        cache_capacity: CACHE_SIZE,
+        ..ReadConfig::default()
+    }
+}
+
+async fn prepare_in_memory<C: array_format::CompressionCodec + 'static>(
     codec: C,
 ) -> (ArrayFile, Vec<String>) {
-    let config = FileConfig {
+    let mut writer = ArrayWriter::new(WriterConfig {
         block_target_size: BLOCK_TARGET,
-        cache_capacity: CACHE_SIZE,
-        ..FileConfig::new(codec)
-    };
-    let mut file = ArrayFile::create_memory(config).await.unwrap();
+        ..WriterConfig::new(codec)
+    });
     let mut names = Vec::with_capacity(ARRAY_COUNT);
     for i in 0..ARRAY_COUNT {
         let name = format!("arr_{i:05}");
         let values: Vec<i32> = vec![1; ELEMENTS_PER_ARRAY];
         let nd = ndarray::Array::from_vec(values).into_dyn();
-        file.define_array::<i32>(
-            &name,
-            vec!["x".into()],
-            vec![ELEMENTS_PER_ARRAY],
-            None,
-            None,
-        )
-        .unwrap();
-        file.write_array(&name, vec![0], nd.view()).await.unwrap();
+        writer
+            .define_array::<i32>(
+                &name,
+                vec!["x".into()],
+                vec![ELEMENTS_PER_ARRAY],
+                None,
+                None,
+            )
+            .unwrap();
+        writer.write_array(&name, vec![0], nd.view()).unwrap();
         names.push(name);
     }
-    file.flush().await.unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = object_store::path::Path::from("profile.af");
+    writer
+        .finish(Arc::clone(&store), path.clone())
+        .await
+        .unwrap();
+    let file = ArrayFile::open(store, path, read_config()).await.unwrap();
     (file, names)
 }
 
 /// Creates the file at `disk_path / obj_name` if it doesn't already exist.
 /// Returns the list of array names.
-async fn ensure_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
+async fn ensure_on_disk<C: array_format::CompressionCodec + 'static>(
     store: Arc<dyn ObjectStore>,
     obj_path: object_store::path::Path,
     disk_path: &std::path::Path,
@@ -118,24 +130,19 @@ async fn ensure_on_disk<C: array_format::CompressionCodec + Clone + 'static>(
         humanize(ELEMENTS_PER_ARRAY * 4),
     );
 
-    let config = FileConfig {
+    let mut writer = ArrayWriter::new(WriterConfig {
         block_target_size: BLOCK_TARGET,
-        cache_capacity: CACHE_SIZE,
-        ..FileConfig::new(codec)
-    };
-    let mut file = ArrayFile::create(Arc::clone(&store), obj_path, config)
-        .await
-        .unwrap();
-
+        ..WriterConfig::new(codec)
+    });
     for name in &names {
         let values: Vec<i32> = vec![1; ELEMENTS_PER_ARRAY];
         let nd = ndarray::Array::from_vec(values).into_dyn();
-        file.define_array::<i32>(name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY], None, None)
+        writer
+            .define_array::<i32>(name, vec!["x".into()], vec![ELEMENTS_PER_ARRAY], None, None)
             .unwrap();
-        file.write_array(name, vec![0], nd.view()).await.unwrap();
+        writer.write_array(name, vec![0], nd.view()).unwrap();
     }
-    file.flush().await.unwrap();
-    file.compact().await.unwrap();
+    writer.finish(store, obj_path).await.unwrap();
 
     eprintln!(
         "Write complete ({}).",
@@ -233,12 +240,8 @@ fn main() {
                     .await
                 };
 
-                let cfg = FileConfig {
-                    cache_capacity: CACHE_SIZE,
-                    ..FileConfig::new(NoCompression)
-                };
                 let file = Arc::new(
-                    ArrayFile::open(Arc::clone(&store), obj_path, cfg)
+                    ArrayFile::open(Arc::clone(&store), obj_path, read_config())
                         .await
                         .unwrap(),
                 );

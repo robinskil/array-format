@@ -212,6 +212,7 @@ impl StringPool {
     }
 
     /// Number of distinct strings in the pool.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.strings.len()
     }

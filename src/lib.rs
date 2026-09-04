@@ -1,41 +1,47 @@
 //! # array-format
 //!
 //! A block-backed, footer-indexed container for storing many n-dimensional
-//! arrays in a single file.
+//! arrays in a single immutable file.
 //!
-//! The format uses a **delta/overlay architecture**: each flush produces a
-//! self-describing sidecar file that stacks on top of the base, recording only
-//! the chunks that changed. Reads fall through to older layers for unchanged
-//! chunks, and layers can be merged back into a single file with
-//! [`compact`](ArrayFile::compact).
+//! A file is written once by an [`ArrayWriter`] and then only read, through
+//! an [`ArrayFile`]. To change a file, open it, copy the arrays to keep into
+//! a new writer with [`ArrayWriter::copy_array`], add the rest, and finish
+//! to a new path.
 //!
 //! ## Features
 //!
-//! - Store many arrays in one object (or a small set of related sidecar files).
-//! - Append arrays and update individual chunks without rewriting the whole file.
-//! - Per-block compression (LZ4, Zstd, or none) recorded in the block table, so
-//!   readers need no configuration to decode a file.
+//! - Store many arrays in one object.
+//! - Per-block compression (LZ4, Zstd, or none) recorded in the block table,
+//!   so readers need no configuration to decode a file.
 //! - Chunked or single-chunk layouts with coordinate-addressed reads.
-//! - Logical deletes with periodic compaction to reclaim space.
+//! - Per-array key-value attributes, in memory from the moment the file
+//!   opens. One attribute across every array is a single call.
+//! - Per-array statistics (min, max, null count, row count) computed while
+//!   the file is written and stored in the footer.
 //! - Works with any [`object_store`]-compatible backend (local filesystem,
 //!   S3, GCS, Azure).
 //!
 //! ## Quick start
 //!
 //! ```
-//! use array_format::{ArrayFile, FileConfig, Lz4Codec};
+//! use std::sync::Arc;
+//!
+//! use array_format::{ArrayWriter, Lz4Codec, WriterConfig};
 //! use ndarray::Array;
+//! use object_store::memory::InMemory;
 //!
 //! # async fn example() -> array_format::Result<()> {
-//! // An in-memory file; use `ArrayFile::create(store, path, config)` for on-disk.
-//! let mut file = ArrayFile::create_memory(FileConfig::new(Lz4Codec)).await?;
+//! let store = Arc::new(InMemory::new());
+//! let path = object_store::path::Path::from("signal.af");
 //!
-//! // Define and write a 1-D f32 array.
-//! file.define_array::<f32>("signal", vec!["t".into()], vec![4], None, None)?;
+//! // Define and write a 1-D f32 array, then finish the file.
+//! let mut writer = ArrayWriter::new(WriterConfig::new(Lz4Codec));
+//! writer.define_array::<f32>("signal", vec!["t".into()], vec![4], None, None)?;
 //! let data = Array::from_vec(vec![1.0f32, 2.0, 3.0, 4.0]).into_dyn();
-//! file.write_array("signal", vec![0], data.view()).await?;
+//! writer.write_array("signal", vec![0], data.view())?;
+//! let file = writer.finish(store, path).await?;
 //!
-//! // Read it back — `vec![], vec![]` means "the whole array".
+//! // `finish` returns the file open for reading. `vec![], vec![]` reads it all.
 //! let out = file.read_array::<f32>("signal", vec![], vec![]).await?;
 //! assert_eq!(out.len(), 4);
 //! # Ok(())
@@ -49,15 +55,14 @@
 //! | Layer | Purpose | Key types |
 //! |-------|---------|-----------|
 //! | 0 — Core | Primitives | [`DType`], [`ChunkAddress`], [`BlockId`], [`Error`] |
-//! | 1 — Metadata | Array description | [`MergedArrayMeta`], [`FillValue`] |
+//! | 1 — Metadata | Array description | [`ArrayInfo`], [`AttributeValue`], [`FillValue`], [`ArrayStats`] |
 //! | 2 — Codecs | Compression extension point | [`CompressionCodec`] |
-//! | 3 — Runtime | Read / write / compact | [`ArrayFile`] |
+//! | 3 — Runtime | Write / read | [`ArrayWriter`], [`ArrayFile`], [`BlockCache`] |
 //!
 //! [`CompressionCodec`] is the extension point: implement it to plug in custom
 //! compression algorithms. Storage is provided through any
-//! [`object_store`]-compatible backend (passed to [`ArrayFile::create`]); for
-//! tests and ephemeral use, [`ArrayFile::create_memory`] uses `object_store`'s
-//! in-memory backend.
+//! [`object_store`]-compatible backend, passed to [`ArrayWriter::finish`] and
+//! [`ArrayFile::open`].
 //!
 //! [`ChunkAddress`]: address::ChunkAddress
 //! [`BlockId`]: address::BlockId
@@ -67,18 +72,15 @@
 
 // ── Layer 0: Core types ─────────────────────────────────────────────
 pub mod address;
-mod delta;
 pub mod dtype;
 pub mod error;
 
 // ── Layer 1: Metadata ───────────────────────────────────────────────
-mod attr_index;
+pub mod attr;
 pub mod block;
 mod footer;
 pub mod layout;
-// The immutable format. Replaces the delta modules once its writer and reader
-// land; crate-private until then.
-mod v6;
+pub mod stats;
 
 // ── Layer 2: Codec extension trait ──────────────────────────────────
 pub mod codec;
@@ -86,22 +88,25 @@ mod storage;
 
 // ── Layer 3: Runtime ────────────────────────────────────────────────
 pub mod array;
-pub mod file;
-pub mod stats;
-
-mod ndarray_ext;
+mod block_cache;
+mod block_writer;
+mod nd;
+pub mod reader;
 pub mod timestamp;
+pub mod writer;
 
 // ── Public re-exports ───────────────────────────────────────────────
 pub use array::ArrayElement;
+pub use attr::AttributeValue;
+pub use block_cache::BlockCache;
 pub use codec::{CompressionCodec, Lz4Codec, NoCompression, ZstdCodec};
-pub use delta::DeltaCache;
 pub use dtype::DType;
+pub use ecow::EcoString;
 pub use error::{Error, Result};
-pub use file::{
-    ArrayFile, DEFAULT_BLOCK_TARGET_SIZE, DEFAULT_CACHE_CAPACITY, DEFAULT_IO_CACHE_CAPACITY,
-    FileConfig, MergedArrayMeta,
+pub use layout::FillValue;
+pub use reader::{
+    ArrayFile, ArrayInfo, DEFAULT_CACHE_CAPACITY, DEFAULT_IO_CACHE_CAPACITY, ReadConfig,
 };
-pub use layout::{AttributeValue, FillValue};
-pub use stats::{ArrayStats, StatValue, StatsFile};
+pub use stats::{ArrayStats, StatValue};
 pub use timestamp::TimestampNs;
+pub use writer::{ArrayWriter, DEFAULT_BLOCK_TARGET_SIZE, WriterConfig};

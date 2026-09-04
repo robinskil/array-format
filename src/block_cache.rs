@@ -1,6 +1,6 @@
-//! Two-level read cache shared across the delta layers of a file.
+//! Two-level read cache for data blocks, shareable across files.
 //!
-//! [`DeltaCache`] holds decompressed blocks (level 1) on top of an internal
+//! [`BlockCache`] holds decompressed blocks (level 1) on top of an internal
 //! raw-bytes slab cache (level 2), so repeated reads avoid both storage round
 //! trips and redundant decompression.
 
@@ -21,12 +21,12 @@ const IO_SLAB_SIZE: u64 = 1024 * 1024; // 1 MiB
 
 /// Raw I/O cache: caches compressed file bytes in 1 MiB aligned slabs.
 ///
-/// Key: `(delta_path, slab_index)`. Concurrent requests for the same slab are
+/// Key: `(file_path, slab_index)`. Concurrent requests for the same slab are
 /// coalesced — only one task performs the actual storage read.
 #[derive(Clone)]
 struct IoCache {
     inner: Cache<(Arc<str>, u64), Bytes>,
-    /// File sizes cached per path so `storage.size()` is only called once per delta.
+    /// File sizes cached per path so `storage.size()` is only called once per file.
     file_sizes: Cache<Arc<str>, u64>,
 }
 
@@ -92,7 +92,7 @@ impl IoCache {
     }
 }
 
-/// Two-level cache shared across all delta layers in an [`ArrayFile`](crate::file::ArrayFile).
+/// Two-level cache for the blocks of one or more [`ArrayFile`](crate::reader::ArrayFile)s.
 ///
 /// Level 1 — block cache: decompressed block bytes, keyed by `(path, block_id)`.
 /// Level 2 — I/O slab cache: raw compressed bytes in 1 MiB slabs, keyed by `(path, slab_index)`.
@@ -100,12 +100,12 @@ impl IoCache {
 /// On a block cache miss, raw bytes are fetched via the I/O slab cache (if enabled),
 /// then decompressed and stored in the block cache.
 #[derive(Clone)]
-pub struct DeltaCache {
+pub struct BlockCache {
     block_cache: Cache<(Arc<str>, u32), Bytes>,
     io_cache: Option<IoCache>,
 }
 
-impl DeltaCache {
+impl BlockCache {
     /// Creates a new cache.
     ///
     /// `block_capacity` is the byte budget for decompressed blocks.
@@ -193,7 +193,7 @@ mod tests {
     async fn block_cache_miss_loads_block() {
         let data = vec![0xAA; 100];
         let storage = InMemoryStorage::from_bytes(data.clone());
-        let cache = DeltaCache::new(1024, 0);
+        let cache = BlockCache::new(1024, 0);
         let meta = make_block_meta(0, 0, 100);
 
         let result = cache
@@ -207,7 +207,7 @@ mod tests {
     async fn block_cache_hit_returns_same_bytes() {
         let data = vec![0xBB; 200];
         let storage = InMemoryStorage::from_bytes(data.clone());
-        let cache = DeltaCache::new(4096, 0);
+        let cache = BlockCache::new(4096, 0);
         let meta = make_block_meta(0, 0, 200);
 
         let first = cache
@@ -279,7 +279,7 @@ mod tests {
     async fn block_cache_with_io_tier_returns_correct_bytes() {
         let data = vec![0xDE; 300];
         let storage = InMemoryStorage::from_bytes(data.clone());
-        let cache = DeltaCache::new(4096, 2 * 1024 * 1024);
+        let cache = BlockCache::new(4096, 2 * 1024 * 1024);
         let meta = make_block_meta(0, 0, 300);
 
         let result = cache

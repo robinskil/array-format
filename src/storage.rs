@@ -40,9 +40,6 @@ pub(crate) trait Storage: Send + Sync {
     /// Reads the byte range `range` from the file.
     fn read_range(&self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>>;
 
-    /// Replaces the entire file content with `data`.
-    fn write(&self, data: Bytes) -> BoxFuture<'_, Result<()>>;
-
     /// Returns the total size of the file in bytes.
     fn size(&self) -> BoxFuture<'_, Result<u64>>;
 
@@ -105,14 +102,6 @@ impl Storage for InMemoryStorage {
                 )));
             }
             Ok(Bytes::copy_from_slice(&data[start..end]))
-        })
-    }
-
-    fn write(&self, bytes: Bytes) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let mut data = self.data.write().await;
-            *data = bytes.to_vec();
-            Ok(())
         })
     }
 
@@ -187,17 +176,6 @@ impl Storage for ObjectStoreBackend {
         })
     }
 
-    fn write(&self, data: Bytes) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            use object_store::ObjectStoreExt;
-            self.store
-                .put(&self.path, data.into())
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            Ok(())
-        })
-    }
-
     fn size(&self) -> BoxFuture<'_, Result<u64>> {
         Box::pin(async move {
             use object_store::ObjectStoreExt;
@@ -249,15 +227,41 @@ impl MultipartWriter for ObjectStoreMultipart {
     }
 }
 
+// ── Streaming helper ─────────────────────────────────────────────────
+
+const STREAM_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+
+/// Streams `file` in 1 MiB chunks to `storage`, then appends `suffix`.
+/// The file must already be seeked to position 0.
+pub(crate) async fn write_file_then_bytes(
+    file: &mut tokio::fs::File,
+    file_size: u64,
+    suffix: &[u8],
+    storage: &dyn Storage,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut writer = storage.write_multipart().await?;
+    let mut remaining = file_size as usize;
+    while remaining > 0 {
+        let to_read = remaining.min(STREAM_CHUNK_SIZE);
+        let mut chunk = vec![0u8; to_read];
+        file.read_exact(&mut chunk).await.map_err(Error::Io)?;
+        writer.write_chunk(Bytes::from(chunk)).await?;
+        remaining -= to_read;
+    }
+    if !suffix.is_empty() {
+        writer.write_chunk(Bytes::copy_from_slice(suffix)).await?;
+    }
+    writer.complete().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn in_memory_write_read() {
-        let storage = InMemoryStorage::new();
-        let payload = Bytes::from_static(b"hello world");
-        storage.write(payload.clone()).await.unwrap();
+    async fn in_memory_size_and_range_read() {
+        let storage = InMemoryStorage::from_bytes(b"hello world".to_vec());
 
         let size = storage.size().await.unwrap();
         assert_eq!(size, 11);
@@ -271,17 +275,6 @@ mod tests {
         let storage = InMemoryStorage::from_bytes(vec![1, 2, 3]);
         let result = storage.read_range(0..10).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn in_memory_overwrite() {
-        let storage = InMemoryStorage::new();
-        storage.write(Bytes::from_static(b"first")).await.unwrap();
-        storage.write(Bytes::from_static(b"second")).await.unwrap();
-        let size = storage.size().await.unwrap();
-        assert_eq!(size, 6);
-        let data = storage.read_range(0..6).await.unwrap();
-        assert_eq!(&data[..], b"second");
     }
 
     #[tokio::test]

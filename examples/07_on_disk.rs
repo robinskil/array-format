@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use array_format::{ArrayFile, FileConfig, Lz4Codec};
+use array_format::{ArrayFile, ArrayWriter, Lz4Codec, ReadConfig, WriterConfig};
 use ndarray::Array;
 use object_store::local::LocalFileSystem;
 
@@ -17,34 +17,31 @@ async fn main() {
         as Arc<dyn object_store::ObjectStore>;
     let path = object_store::path::Path::from("data.af");
 
-    // Create and write
+    // Write. The codec is chosen here; every block records which one it used.
     {
-        let mut file =
-            ArrayFile::create(Arc::clone(&store), path.clone(), FileConfig::new(Lz4Codec))
-                .await
-                .unwrap();
-
-        file.define_array::<f32>(
-            "matrix",
-            vec!["r".into(), "c".into()],
-            vec![4, 4],
-            None,
-            None,
-        )
-        .unwrap();
+        let mut writer = ArrayWriter::new(WriterConfig::new(Lz4Codec));
+        writer
+            .define_array::<f32>(
+                "matrix",
+                vec!["r".into(), "c".into()],
+                vec![4, 4],
+                None,
+                None,
+            )
+            .unwrap();
         let data: Vec<f32> = (0..16).map(|x| x as f32 * 0.5).collect();
         let nd = Array::from_shape_vec(ndarray::IxDyn(&[4, 4]), data).unwrap();
-        file.write_array("matrix", vec![0, 0], nd.view())
+        writer.write_array("matrix", vec![0, 0], nd.view()).unwrap();
+        let file = writer
+            .finish(Arc::clone(&store), path.clone())
             .await
             .unwrap();
-        file.flush().await.unwrap();
-
-        println!("wrote {} array(s)", file.list_arrays().len());
+        println!("wrote {} array(s)", file.arrays().len());
     }
 
-    // Re-open and read
+    // Re-open and read. No codec is needed to open a file.
     {
-        let file = ArrayFile::open(Arc::clone(&store), path, FileConfig::new(Lz4Codec))
+        let file = ArrayFile::open(Arc::clone(&store), path, ReadConfig::default())
             .await
             .unwrap();
         let out = file

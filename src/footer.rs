@@ -1,84 +1,94 @@
-//! File footer: the index that maps array names to block addresses.
+//! File footer: the index at the end of an immutable file.
 //!
-//! The footer is appended at the end of the file. A 12-byte trailer
-//! (`footer_size: u64 LE` + `MAGIC`) allows the reader to locate and
-//! validate the footer from the tail of the file.
+//! A 12-byte trailer (`footer_size: u64 LE` + `MAGIC`) lets a reader locate
+//! and validate the footer from the tail of the file.
 //!
 //! ```text
-//! [footer_bytes][footer_size: u64 LE][MAGIC b"ARRF"]
+//! [block 0][block 1]...[footer_bytes][footer_size: u64 LE][MAGIC b"ARRF"]
 //! ```
 
 use rkyv::{Archive, Deserialize, Serialize};
 
+use crate::address::ChunkAddress;
 use crate::block::BlockMeta;
+use crate::dtype::DType;
 use crate::error::{Error, Result};
-use crate::layout::ArrayMeta;
+use crate::layout::{ChunkEntry, FillValue};
+use crate::stats::ArrayStats;
 use crate::storage::Storage;
 
-/// Magic bytes written at the very end of the file.
-pub const MAGIC: [u8; 4] = *b"ARRF";
+use crate::attr::DiskValue;
 
-/// Current footer format version.
-pub const FOOTER_VERSION: u32 = 5;
+/// Magic bytes written at the very end of the file.
+pub(crate) const MAGIC: [u8; 4] = *b"ARRF";
+
+/// Footer format version. Version 5 and below are delta-layer files, which
+/// this reader rejects.
+pub(crate) const FOOTER_VERSION: u32 = 6;
 
 /// Size of the trailer in bytes (`u64` footer size + 4-byte magic).
-pub const TRAILER_SIZE: usize = 12;
+pub(crate) const TRAILER_SIZE: usize = 12;
 
-/// The file footer containing the block table and array table.
-///
-/// Serialized with [`rkyv`] for zero-copy access to the archived form.
+/// The file footer: block table, string pool and array table.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub(crate) struct Footer {
-    /// Format version.
+    /// Format version, see [`FOOTER_VERSION`].
     pub version: u32,
-    /// Block table: metadata for every block in the data region.
+    /// Every block in the data region, in file order. Block ids are dense, so
+    /// `blocks[id]` is the block with that id.
     pub blocks: Vec<BlockMeta>,
-    /// Array table: metadata for every array stored in the file.
+    /// Attribute keys and string values, each stored once.
+    /// [`DiskValue`] and [`ArrayMeta::attributes`] index into this.
+    pub strings: Vec<String>,
+    /// Every array in the file, in definition order.
     pub arrays: Vec<ArrayMeta>,
-    /// Global dictionary of attribute key strings.
-    ///
-    /// Array attributes reference keys by index into this vec, so each
-    /// unique key string is stored exactly once regardless of how many
-    /// arrays carry that attribute.
-    pub attr_keys: Vec<String>,
-    /// Global dictionary of attribute values.
-    ///
-    /// Array attributes reference values by index into this vec, so each
-    /// distinct value is stored exactly once across all arrays. Together with
-    /// `attr_keys` this means each `ArrayMeta::attributes` entry is just 4
-    /// bytes (two `u16` indices).
-    pub attr_values: Vec<crate::layout::AttributeValue>,
-    /// Position of this file in the overlay stack.
-    ///
-    /// `0` = base file. `N > 0` = the Nth sidecar (`{stem}.N.arrf`).
-    /// A sidecar footer's `arrays` list contains only the delta — arrays
-    /// and chunks that changed relative to lower layers.
-    pub overlay_index: u32,
-    /// Stem of the base `.af` file this sidecar belongs to.
-    ///
-    /// Empty for base files. Used to validate that a sidecar was created
-    /// for the correct base file when opening a layered file.
-    pub base_file_hint: String,
+}
+
+/// Metadata for one array.
+#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
+pub(crate) struct ArrayMeta {
+    /// Unique name within the file.
+    pub name: String,
+    /// Element type.
+    pub dtype: DType,
+    /// Length of each dimension.
+    pub shape: Vec<u32>,
+    /// Name of each dimension.
+    pub dimension_names: Vec<String>,
+    /// Extent of one chunk along each dimension. Never zero.
+    pub chunk_shape: Vec<u32>,
+    /// Written chunks, sorted by coordinate. A coordinate absent here was
+    /// never written and reads as the fill value.
+    pub chunks: Vec<ChunkEntry>,
+    /// Fill value for unwritten elements. `None` means zero or empty.
+    pub fill_value: Option<FillValue>,
+    /// `(key, value)` pairs. The key is an index into [`Footer::strings`].
+    pub attributes: Vec<(u32, DiskValue)>,
+    /// Aggregate statistics over every chunk, if the writer computed them.
+    pub stats: Option<ArrayStats>,
+}
+
+/// Binary search over a chunk table sorted by coordinate.
+pub(crate) fn find_chunk<'a>(chunks: &'a [ChunkEntry], coord: &[u32]) -> Option<&'a ChunkAddress> {
+    chunks
+        .binary_search_by(|e| e.coord.as_slice().cmp(coord))
+        .ok()
+        .map(|i| &chunks[i].address)
 }
 
 impl Footer {
-    /// Creates a new empty base-file footer.
-    pub fn new() -> Self {
+    /// Creates an empty footer at the current version.
+    pub(crate) fn new() -> Self {
         Self {
             version: FOOTER_VERSION,
             blocks: Vec::new(),
+            strings: Vec::new(),
             arrays: Vec::new(),
-            attr_keys: Vec::new(),
-            attr_values: Vec::new(),
-            overlay_index: 0,
-            base_file_hint: String::new(),
         }
     }
 
-    /// Serializes the footer to bytes, appending the trailer.
-    ///
-    /// Layout: `[rkyv_bytes][footer_size: u64 LE][MAGIC]`
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    /// Serializes the footer and appends the trailer.
+    pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
         let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(self)
             .map_err(|e| Error::Serialization(e.to_string()))?;
 
@@ -90,10 +100,8 @@ impl Footer {
         Ok(out)
     }
 
-    /// Deserializes a footer from bytes that include the trailer.
-    ///
-    /// `data` must contain at least the trailer and the footer payload.
-    pub fn deserialize(data: &[u8]) -> Result<Self> {
+    /// Deserializes a footer from bytes that end with the trailer.
+    pub(crate) fn deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < TRAILER_SIZE {
             return Err(Error::InvalidFooter("data too short for trailer".into()));
         }
@@ -116,8 +124,8 @@ impl Footer {
         let rkyv_start = size_start - footer_size;
         let rkyv_bytes = &data[rkyv_start..size_start];
 
-        // Copy into an aligned buffer – the slice may not be aligned to the
-        // requirements of the archived types after being read from storage.
+        // Bytes read from storage carry no alignment guarantee, and the
+        // archived types need one.
         let mut aligned: rkyv::util::AlignedVec = rkyv::util::AlignedVec::new();
         aligned.extend_from_slice(rkyv_bytes);
 
@@ -135,17 +143,21 @@ impl Footer {
     }
 }
 
+impl Default for Footer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Reads and deserializes the footer from storage.
 ///
-/// Performs a two-pass read: first reads the 12-byte trailer to learn
-/// the footer size, then reads the full footer payload if needed.
-pub async fn read_footer(storage: &(dyn Storage + Sync)) -> Result<Footer> {
+/// Two reads: the 12-byte trailer to learn the footer size, then the footer.
+pub(crate) async fn read_footer(storage: &(dyn Storage + Sync)) -> Result<Footer> {
     let file_size = storage.size().await?;
     if (file_size as usize) < TRAILER_SIZE {
         return Err(Error::InvalidFooter("file too short for trailer".into()));
     }
 
-    // First pass: read the trailer to learn the footer size.
     let trailer = storage
         .read_range(file_size - TRAILER_SIZE as u64..file_size)
         .await?;
@@ -156,75 +168,113 @@ pub async fn read_footer(storage: &(dyn Storage + Sync)) -> Result<Footer> {
     let footer_size = u64::from_le_bytes(trailer[..8].try_into().unwrap()) as usize;
     let total = footer_size + TRAILER_SIZE;
 
-    // Second pass: read footer payload + trailer.
     let start = file_size - total as u64;
     let data = storage.read_range(start..file_size).await?;
     Footer::deserialize(&data)
 }
 
-impl Default for Footer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address::{BlockId, ChunkAddress};
+    use crate::address::BlockId;
+    use crate::attr::{AttributeValue, StringPool};
     use crate::block::CodecId;
-    use crate::dtype::DType;
-    use crate::layout::{ArrayLayout, ChunkEntry, StorageLayout};
+    use crate::stats::StatValue;
+    use crate::storage::InMemoryStorage;
 
-    #[test]
-    fn roundtrip_empty_footer() {
-        let footer = Footer::new();
-        let bytes = footer.serialize().unwrap();
-        let restored = Footer::deserialize(&bytes).unwrap();
-        assert_eq!(footer, restored);
+    fn chunk(coord: Vec<u32>, block: u32, offset: u32, size: u32) -> ChunkEntry {
+        ChunkEntry {
+            coord,
+            address: ChunkAddress {
+                block_id: BlockId(block),
+                offset,
+                size,
+            },
+        }
     }
 
-    #[test]
-    fn roundtrip_with_data() {
-        let footer = Footer {
+    fn sample_footer() -> Footer {
+        let mut pool = StringPool::default();
+        let units_key = pool.intern("units");
+        let units = DiskValue::encode(&AttributeValue::String("m/s".into()), &mut pool);
+        let scale_key = pool.intern("scale");
+        let scale = DiskValue::encode(&AttributeValue::Float64(0.01), &mut pool);
+
+        Footer {
             version: FOOTER_VERSION,
             blocks: vec![BlockMeta {
                 id: BlockId(0),
                 file_offset: 0,
                 compressed_size: 8192,
-                uncompressed_size: 8192,
-                codec: CodecId::None,
+                uncompressed_size: 16000,
+                codec: CodecId::Named("lz4".into()),
             }],
+            strings: pool.into_strings(),
             arrays: vec![ArrayMeta {
                 name: "temperature".into(),
                 dtype: DType::Float32,
-                layout: ArrayLayout {
-                    shape: vec![1000, 1000],
-                    dimension_names: vec!["x".into(), "y".into()],
-                    storage: StorageLayout {
-                        chunk_shape: vec![1000, 1000],
-                        chunks: vec![ChunkEntry {
-                            coord: vec![0, 0],
-                            address: ChunkAddress {
-                                block_id: BlockId(0),
-                                offset: 0,
-                                size: 4000,
-                            },
-                        }],
-                    },
-                },
-                fill_value: Some(crate::layout::FillValue::Float(f64::NAN)),
-                deleted: false,
-                attributes: crate::layout::Attributes::U16(vec![]),
+                shape: vec![100, 40],
+                dimension_names: vec!["x".into(), "y".into()],
+                chunk_shape: vec![50, 40],
+                chunks: vec![
+                    chunk(vec![0, 0], 0, 0, 8000),
+                    chunk(vec![1, 0], 0, 8000, 8000),
+                ],
+                fill_value: Some(FillValue::Float(f64::NAN)),
+                attributes: vec![(units_key, units), (scale_key, scale)],
+                stats: Some(ArrayStats {
+                    name: "temperature".into(),
+                    min: Some(StatValue::Float(-3.5)),
+                    max: Some(StatValue::Float(41.0)),
+                    null_count: 0,
+                    row_count: 4000,
+                }),
             }],
-            attr_keys: vec![],
-            attr_values: vec![],
-            overlay_index: 0,
-            base_file_hint: String::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn roundtrip_empty_footer() {
+        let footer = Footer::new();
+        let bytes = footer.serialize().unwrap();
+        assert_eq!(Footer::deserialize(&bytes).unwrap(), footer);
+    }
+
+    #[test]
+    fn roundtrip_with_data() {
+        let footer = sample_footer();
         let bytes = footer.serialize().unwrap();
         let restored = Footer::deserialize(&bytes).unwrap();
-        assert_eq!(footer, restored);
+        assert_eq!(restored, footer);
+
+        // The attribute survives the pool indirection.
+        let strings: Vec<ecow::EcoString> =
+            restored.strings.iter().map(ecow::EcoString::from).collect();
+        let (key, value) = &restored.arrays[0].attributes[0];
+        assert_eq!(strings[*key as usize], "units");
+        assert_eq!(
+            value.decode(&strings).unwrap(),
+            AttributeValue::String("m/s".into())
+        );
+    }
+
+    #[test]
+    fn chunk_lookup_uses_the_sorted_order() {
+        let footer = sample_footer();
+        let chunks = &footer.arrays[0].chunks;
+        assert_eq!(find_chunk(chunks, &[1, 0]).map(|a| a.offset), Some(8000));
+        assert_eq!(find_chunk(chunks, &[0, 0]).map(|a| a.offset), Some(0));
+        assert!(find_chunk(chunks, &[2, 0]).is_none());
+        assert!(find_chunk(chunks, &[0, 1]).is_none());
+    }
+
+    #[test]
+    fn older_versions_are_rejected() {
+        let mut footer = Footer::new();
+        footer.version = 5;
+        let bytes = footer.serialize().unwrap();
+        let err = Footer::deserialize(&bytes).unwrap_err();
+        assert!(matches!(err, Error::InvalidFooter(ref m) if m.contains("version 5")));
     }
 
     #[test]
@@ -244,12 +294,17 @@ mod tests {
     fn trailer_has_correct_structure() {
         let bytes = Footer::new().serialize().unwrap();
         let len = bytes.len();
-
-        // Last 4 bytes are magic
         assert_eq!(&bytes[len - 4..], b"ARRF");
-
-        // Preceding 8 bytes are footer_size as u64 LE
         let footer_size = u64::from_le_bytes(bytes[len - 12..len - 4].try_into().unwrap());
         assert_eq!(footer_size as usize, len - TRAILER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn read_footer_finds_it_behind_a_data_region() {
+        let footer = sample_footer();
+        let mut file = vec![0xAAu8; 8192]; // pretend data region
+        file.extend(footer.serialize().unwrap());
+        let storage = InMemoryStorage::from_bytes(file);
+        assert_eq!(read_footer(&storage).await.unwrap(), footer);
     }
 }

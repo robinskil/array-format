@@ -3,62 +3,73 @@
 //! Attributes attach to arrays, so to store metadata about the *file* as a
 //! whole (title, provenance, schema version, …) without any real data, define a
 //! scalar placeholder array with an empty shape and hang the attributes on it.
-//! No data is ever written to it, so `flush` skips stats and it costs almost
-//! nothing.
+//! Nothing is written to it, so it costs its attributes and a few bytes of
+//! metadata.
 //!
 //! ```sh
 //! cargo run --example 10_file_metadata
 //! ```
 
-use array_format::{ArrayFile, AttributeValue, FileConfig, NoCompression};
+use std::sync::Arc;
+
+use array_format::{ArrayWriter, AttributeValue, NoCompression, WriterConfig};
+use object_store::memory::InMemory;
 
 /// Reserved array name used to hold file-level metadata.
 const FILE_META: &str = "__file__";
 
 #[tokio::main]
 async fn main() {
-    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
+    let mut writer = ArrayWriter::new(WriterConfig::new(NoCompression));
+
+    // A scalar placeholder: empty shape means no dimensions, and it is never
+    // written, so it has no chunks.
+    writer
+        .define_array::<u8>(FILE_META, vec![], vec![], None, None)
+        .unwrap();
+
+    writer
+        .set_attribute(
+            FILE_META,
+            "title",
+            AttributeValue::String("My Dataset".into()),
+        )
+        .unwrap();
+    writer
+        .set_attribute(FILE_META, "schema_version", AttributeValue::Int32(3))
+        .unwrap();
+    writer
+        .set_attribute(
+            FILE_META,
+            "authors",
+            AttributeValue::StringList(Box::new(["alice".into(), "bob".into()])),
+        )
+        .unwrap();
+
+    // A metadata-only file is completely valid.
+    let file = writer
+        .finish(
+            Arc::new(InMemory::new()),
+            object_store::path::Path::from("meta.af"),
+        )
         .await
         .unwrap();
 
-    // A scalar placeholder: empty shape means no dimensions and no chunks, so
-    // nothing is ever stored for it beyond its attributes.
-    file.define_array::<u8>(FILE_META, vec![], vec![], None, None)
-        .unwrap();
-
-    file.set_attribute(
-        FILE_META,
-        "title",
-        AttributeValue::String("My Dataset".into()),
-    )
-    .unwrap();
-    file.set_attribute(FILE_META, "schema_version", AttributeValue::Int32(3))
-        .unwrap();
-    file.set_attribute(
-        FILE_META,
-        "authors",
-        AttributeValue::StringList(vec!["alice".into(), "bob".into()]),
-    )
-    .unwrap();
-
-    // Persist — a metadata-only file is completely valid.
-    file.flush().await.unwrap();
-
     // Read the file-level metadata back.
-    let title = file.get_attribute(FILE_META, "title").unwrap();
-    let version = file.get_attribute(FILE_META, "schema_version").unwrap();
-    let authors = file.get_attribute(FILE_META, "authors").unwrap();
+    let title = file.get_attribute(FILE_META, "title");
+    let version = file.get_attribute(FILE_META, "schema_version");
+    let authors = file.get_attribute(FILE_META, "authors");
     println!("title          = {title:?}");
     println!("schema_version = {version:?}");
     println!("authors        = {authors:?}");
 
-    // The placeholder shows up in list_arrays like any array; filter it out to
-    // present only real data arrays to users.
-    let data_arrays: Vec<String> = file
-        .list_arrays()
-        .into_iter()
-        .map(|m| m.name)
-        .filter(|name| name != FILE_META)
+    // The placeholder is listed like any array; filter it out to present only
+    // real data arrays to users.
+    let data_arrays: Vec<&str> = file
+        .arrays()
+        .iter()
+        .map(|info| info.name.as_str())
+        .filter(|name| *name != FILE_META)
         .collect();
     println!("data arrays    = {data_arrays:?}"); // [] — metadata only
 

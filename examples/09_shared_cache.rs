@@ -1,8 +1,8 @@
-//! Sharing a single `DeltaCache` across multiple `ArrayFile`s.
+//! Sharing a single `BlockCache` across multiple `ArrayFile`s.
 //!
 //! Each `ArrayFile` would normally build its own cache. When you open many
-//! files, set `config.cache` to a pre-built `Arc<DeltaCache>` so they share
-//! one bounded byte budget. Entries are keyed by `(file_path, block_id)`,
+//! files, set `ReadConfig::cache` to a pre-built `Arc<BlockCache>` so they
+//! share one bounded byte budget. Entries are keyed by `(file_path, block_id)`,
 //! so files do not collide.
 //!
 //! ```sh
@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use array_format::{ArrayFile, DeltaCache, FileConfig, Lz4Codec};
+use array_format::{ArrayFile, ArrayWriter, BlockCache, Lz4Codec, ReadConfig, WriterConfig};
 use ndarray::Array;
 use object_store::local::LocalFileSystem;
 
@@ -22,7 +22,7 @@ async fn main() {
         as Arc<dyn object_store::ObjectStore>;
 
     // One cache, shared by every file opened below.
-    let shared = Arc::new(DeltaCache::new(
+    let shared = Arc::new(BlockCache::new(
         64 * 1024 * 1024, // 64 MiB decompressed block budget
         16 * 1024 * 1024, // 16 MiB raw I/O slab budget
     ));
@@ -31,30 +31,33 @@ async fn main() {
 
     // Write three files.
     for (i, name) in paths.iter().enumerate() {
-        let path = object_store::path::Path::from(*name);
-        let mut cfg = FileConfig::new(Lz4Codec);
-        cfg.cache = Some(Arc::clone(&shared));
-
-        let mut file = ArrayFile::create(Arc::clone(&store), path, cfg)
-            .await
-            .unwrap();
-        file.define_array::<f32>("v", vec!["i".into()], vec![4], None, None)
+        let mut writer = ArrayWriter::new(WriterConfig::new(Lz4Codec));
+        writer
+            .define_array::<f32>("v", vec!["i".into()], vec![4], None, None)
             .unwrap();
         let data = Array::from_vec(vec![i as f32; 4]).into_dyn();
-        file.write_array("v", vec![0], data.view()).await.unwrap();
-        file.flush().await.unwrap();
+        writer.write_array("v", vec![0], data.view()).unwrap();
+        writer
+            .finish(Arc::clone(&store), object_store::path::Path::from(*name))
+            .await
+            .unwrap();
     }
 
-    // Re-open all three with the shared cache and read each.
+    // Open all three with the shared cache and read each.
     let mut files = Vec::new();
     for name in &paths {
-        let path = object_store::path::Path::from(*name);
-        let mut cfg = FileConfig::new(Lz4Codec);
-        cfg.cache = Some(Arc::clone(&shared));
+        let config = ReadConfig {
+            cache: Some(Arc::clone(&shared)),
+            ..ReadConfig::default()
+        };
         files.push(
-            ArrayFile::open(Arc::clone(&store), path, cfg)
-                .await
-                .unwrap(),
+            ArrayFile::open(
+                Arc::clone(&store),
+                object_store::path::Path::from(*name),
+                config,
+            )
+            .await
+            .unwrap(),
         );
     }
 
@@ -68,4 +71,5 @@ async fn main() {
         "shared cache Arc strong count: {}",
         Arc::strong_count(&shared)
     );
+    assert_eq!(Arc::strong_count(&shared), 4);
 }

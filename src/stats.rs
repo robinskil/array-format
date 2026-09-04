@@ -1,18 +1,14 @@
-//! Per-array statistics stored in an optional `.stats` sidecar.
+//! Per-array statistics.
 //!
-//! A [`StatsFile`] holds [`ArrayStats`] (e.g. min/max as [`StatValue`]) for the
-//! arrays in a file. It is serialized to its own sidecar with an `ARST` trailer,
-//! mirroring the footer format, so stats can be read without touching the data.
+//! [`ArrayStats`] holds min and max as [`StatValue`], plus null and row
+//! counts, for one array. The writer computes a partial per chunk as it is
+//! written and stores the merged result in the footer, so stats cost no
+//! second pass and need no sidecar.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::dtype::DType;
-use crate::error::{Error, Result};
 use crate::layout::FillValue;
-use crate::storage::Storage;
-
-const MAGIC: [u8; 4] = *b"ARST";
-const TRAILER_SIZE: usize = 12;
 
 /// A typed min or max value.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
@@ -54,127 +50,6 @@ impl ArrayStats {
             row_count: 0,
         }
     }
-}
-
-/// Current `.stats` sidecar format version. Bumped whenever the encoded shape
-/// changes, so a sidecar written by an older build is rejected with a clear
-/// error instead of being misread.
-pub const STATS_VERSION: u32 = 1;
-
-/// The stats file: one [`ArrayStats`] per array.
-///
-/// Stored in `{stem}.stats` alongside the `.af` file using the same
-/// rkyv + trailer format as the footer:
-/// `[rkyv_bytes][size: u64 LE][MAGIC: b"ARST"]`
-#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
-pub struct StatsFile {
-    /// Format version; see [`STATS_VERSION`].
-    pub version: u32,
-    /// Per-array statistics, one entry per array in the file.
-    pub arrays: Vec<ArrayStats>,
-}
-
-impl Default for StatsFile {
-    fn default() -> Self {
-        Self {
-            version: STATS_VERSION,
-            arrays: Vec::new(),
-        }
-    }
-}
-
-impl StatsFile {
-    pub(crate) fn upsert(&mut self, new_stats: ArrayStats) {
-        if let Some(existing) = self.arrays.iter_mut().find(|a| a.name == new_stats.name) {
-            *existing = new_stats;
-        } else {
-            self.arrays.push(new_stats);
-        }
-    }
-
-    /// Drops the statistics for `name`, if present. Returns whether an entry
-    /// was removed.
-    ///
-    /// Needed because a logically deleted array never re-enters the dirty set
-    /// (`mark_deleted` clears its chunk list), so without an explicit removal
-    /// its stale stats would survive every flush until the next compaction.
-    pub(crate) fn remove(&mut self, name: &str) -> bool {
-        let before = self.arrays.len();
-        self.arrays.retain(|a| a.name != name);
-        self.arrays.len() != before
-    }
-
-    /// Returns the statistics for the array named `name`, if present.
-    pub fn get_array(&self, name: &str) -> Option<&ArrayStats> {
-        self.arrays.iter().find(|a| a.name == name)
-    }
-
-    /// All entries in the file, in storage order.
-    ///
-    /// The bulk counterpart to [`get_array`](Self::get_array): building a
-    /// column over N arrays via `get_array` is O(N²), since each call scans the
-    /// whole `Vec`. Callers assembling a cross-array index should iterate once
-    /// through this instead.
-    pub fn entries(&self) -> &[ArrayStats] {
-        &self.arrays
-    }
-
-    pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
-        let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        let size = rkyv_bytes.len() as u64;
-        let mut out = Vec::with_capacity(rkyv_bytes.len() + TRAILER_SIZE);
-        out.extend_from_slice(&rkyv_bytes);
-        out.extend_from_slice(&size.to_le_bytes());
-        out.extend_from_slice(&MAGIC);
-        Ok(out)
-    }
-
-    fn deserialize(data: &[u8]) -> Result<Self> {
-        if data.len() < TRAILER_SIZE {
-            return Err(Error::InvalidFooter("stats data too short".into()));
-        }
-        let magic_start = data.len() - 4;
-        if data[magic_start..] != MAGIC {
-            return Err(Error::InvalidFooter("invalid stats magic".into()));
-        }
-        let size_start = magic_start - 8;
-        let size = u64::from_le_bytes(data[size_start..magic_start].try_into().unwrap()) as usize;
-        if size > size_start {
-            return Err(Error::InvalidFooter("stats size exceeds data".into()));
-        }
-        let rkyv_start = size_start - size;
-        let mut aligned: rkyv::util::AlignedVec = rkyv::util::AlignedVec::new();
-        aligned.extend_from_slice(&data[rkyv_start..size_start]);
-        let decoded: Self = rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        if decoded.version != STATS_VERSION {
-            return Err(Error::InvalidFooter(format!(
-                "unsupported stats version {} (expected {STATS_VERSION})",
-                decoded.version
-            )));
-        }
-        Ok(decoded)
-    }
-}
-
-/// Reads and deserializes a stats file from `storage`.
-pub(crate) async fn read_stats_file(storage: &(dyn Storage + Sync)) -> Result<StatsFile> {
-    let file_size = storage.size().await?;
-    if (file_size as usize) < TRAILER_SIZE {
-        return Err(Error::InvalidFooter("stats file too short".into()));
-    }
-    let trailer = storage
-        .read_range(file_size - TRAILER_SIZE as u64..file_size)
-        .await?;
-    if trailer[8..] != MAGIC {
-        return Err(Error::InvalidFooter("invalid stats magic".into()));
-    }
-    let size = u64::from_le_bytes(trailer[..8].try_into().unwrap()) as usize;
-    let total = size + TRAILER_SIZE;
-    let start = file_size - total as u64;
-    let data = storage.read_range(start..file_size).await?;
-    StatsFile::deserialize(&data)
 }
 
 // ── Macros (must appear before use) ──────────────────────────────────────────
@@ -599,31 +474,6 @@ mod tests {
         assert_eq!(stats.max, Some(StatValue::Int(10)));
         assert_eq!(stats.null_count, 1);
         assert_eq!(stats.row_count, 5);
-    }
-
-    #[test]
-    fn statsfile_serialize_deserialize_roundtrip() {
-        let sf = StatsFile {
-            version: STATS_VERSION,
-            arrays: vec![ArrayStats {
-                name: "arr".into(),
-                min: Some(StatValue::Int(-1)),
-                max: Some(StatValue::Int(99)),
-                null_count: 3,
-                row_count: 100,
-            }],
-        };
-        let bytes = sf.serialize().unwrap();
-        let restored = StatsFile::deserialize(&bytes).unwrap();
-        assert_eq!(sf, restored);
-    }
-
-    #[test]
-    fn statsfile_empty_roundtrip() {
-        let sf = StatsFile::default();
-        let bytes = sf.serialize().unwrap();
-        let restored = StatsFile::deserialize(&bytes).unwrap();
-        assert_eq!(sf, restored);
     }
 
     #[test]

@@ -4,15 +4,17 @@
 //! cargo run --example 04_vlen_strings
 //! ```
 
-use array_format::{ArrayFile, FileConfig, NoCompression};
+use std::sync::Arc;
+
+use array_format::{ArrayWriter, NoCompression, WriterConfig};
+use object_store::memory::InMemory;
 
 #[tokio::main]
 async fn main() {
-    let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression))
-        .await
-        .unwrap();
+    let mut writer = ArrayWriter::new(WriterConfig::new(NoCompression));
 
-    file.define_array::<String>("labels", vec!["i".into()], vec![4], None, None)
+    writer
+        .define_array::<String>("labels", vec!["i".into()], vec![4], None, None)
         .unwrap();
     let labels = ndarray::arr1(&[
         "alpha".to_string(),
@@ -21,11 +23,17 @@ async fn main() {
         "delta".to_string(),
     ])
     .into_dyn();
-    file.write_array("labels", vec![0], labels.view())
-        .await
+    writer
+        .write_array("labels", vec![0], labels.view())
         .unwrap();
 
-    file.flush().await.unwrap();
+    let file = writer
+        .finish(
+            Arc::new(InMemory::new()),
+            object_store::path::Path::from("labels.af"),
+        )
+        .await
+        .unwrap();
 
     let out = file
         .read_array::<String>("labels", vec![], vec![])

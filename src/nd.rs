@@ -10,8 +10,8 @@ use std::ops::Range;
 use crate::array::ArrayElement;
 use crate::error::{Error, Result};
 
-use super::reader::{ArrayFile, ArrayInfo};
-use super::writer::ArrayWriter;
+use crate::reader::{ArrayFile, ArrayInfo};
+use crate::writer::ArrayWriter;
 
 pub(crate) fn make_si(
     ranges: &[Range<usize>],

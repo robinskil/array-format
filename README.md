@@ -6,148 +6,143 @@
 [![license](https://img.shields.io/crates/l/array-format.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/)
 
-`array-format` stores many n-dimensional arrays in a single file. It uses a **delta/overlay architecture**: each flush produces a self-describing sidecar file that stacks on top of the base, recording only the chunks that changed. Reads fall through to older layers for unchanged chunks. Layers can be merged into a single file with `compact`.
+`array-format` stores many n-dimensional arrays in a single **immutable** file. An `ArrayWriter` builds the file and writes it once. An `ArrayFile` opens it read-only, with every array's metadata, attributes and statistics in memory from the first moment. To change a file, copy what you keep into a new writer and finish to a new path.
 
 ## Why this format exists
 
-- Store many arrays in one object or a small set of related files
-- Append new arrays and update individual chunks without rewriting the whole file
-- Block-level compression (LZ4, Zstd, or none) recorded per block so readers need no configuration
+- Store many arrays in one object, on any `object_store` backend (local filesystem, S3, GCS, Azure)
+- Block-level compression (LZ4, Zstd, or none) recorded per block, so readers need no configuration
 - Chunked or single-chunk layouts with coordinate-addressed reads
-- Logical deletes with periodic compaction to reclaim space
-- Works with any `object_store`-compatible backend (local filesystem, S3, GCS, Azure)
+- Per-array key-value attributes, in memory on open; one attribute across every array is a single call
+- Per-array statistics (min, max, null count, row count) computed while writing and stored in the footer
+- One file, one footer, no sidecars, no layers to merge
 
 ## Quick start
 
 ```rust
 use std::sync::Arc;
-use array_format::{ArrayFile, FileConfig, Lz4Codec};
+use array_format::{ArrayFile, ArrayWriter, Lz4Codec, ReadConfig, WriterConfig};
 use ndarray::Array;
 use object_store::{ObjectStore, local::LocalFileSystem};
 
-// Back the file with any object_store backend
 let store = Arc::new(LocalFileSystem::new_with_prefix("/data")?) as Arc<dyn ObjectStore>;
-// `path` is the base file (must end in `.af`), not a directory. Sidecars and
-// stats are written next to it in the same prefix: signal.1.af, signal.stats, …
 let path = object_store::path::Path::from("signal.af");
 
-// Create a new file
-let mut file = ArrayFile::create(store, path, FileConfig::new(Lz4Codec)).await?;
-
-// Define and write a 1-D f32 array
-file.define_array::<f32>("signal", vec!["t".into()], vec![1024], None, None)?;
+// Build the file: define arrays, write data, set attributes.
+let mut writer = ArrayWriter::new(WriterConfig::new(Lz4Codec));
+writer.define_array::<f32>("signal", vec!["t".into()], vec![1024], None, None)?;
 let data = Array::from_vec(vec![0.0f32; 1024]).into_dyn();
-file.write_array("signal", vec![0], data.view()).await?;
+writer.write_array("signal", vec![0], data.view())?;
 
-// Commit to a sidecar file ({stem}.1.af)
-file.flush().await?;
-
-// Read back — any session after open
+// Write it once. `finish` returns the file open for reading.
+let file = writer.finish(Arc::clone(&store), path.clone()).await?;
 let result = file.read_array::<f32>("signal", vec![], vec![]).await?;
+
+// Any later session opens it read-only. No codec is needed to open a file.
+let file = ArrayFile::open(store, path, ReadConfig::default()).await?;
 ```
 
 Variable-length types like `String` and `Vec<u8>` use the same methods:
 
 ```rust
-file.define_array::<String>("labels", vec!["i".into()], vec![100], None, None)?;
+writer.define_array::<String>("labels", vec!["i".into()], vec![100], None, None)?;
 let labels = ndarray::arr1(&["alpha".to_string(), "beta".to_string()]).into_dyn();
-file.write_array("labels", vec![0], labels.view()).await?;
+writer.write_array("labels", vec![0], labels.view())?;
+// ...
 let out = file.read_array::<String>("labels", vec![], vec![]).await?;
 ```
 
-## Delta / overlay architecture
+## Immutable files
 
-Opening a file discovers the base file and all sidecars:
+A finished file never changes. That is what makes the reader simple: one footer, one block table, one chunk table per array, and no state to reconcile.
 
-```text
-mydata.af        ← base (overlay_index 0, written by ArrayFile::create)
-mydata.1.af      ← first flush
-mydata.2.af      ← second flush
-...
+To change a file, rewrite it. `copy_array` moves one array's definition, written chunks and attributes from an open file into a writer:
+
+```rust
+let source = ArrayFile::open(Arc::clone(&store), old_path, ReadConfig::default()).await?;
+
+let mut writer = ArrayWriter::new(WriterConfig::new(Lz4Codec));
+for info in source.arrays() {
+    if info.name != "obsolete" {                      // drop an array
+        writer.copy_array(&source, &info.name).await?;
+    }
+}
+writer.write_array("signal", vec![10], patch.view())?; // patch a copied array
+writer.define_array::<u8>("flags", vec!["t".into()], vec![1024], None, None)?; // add one
+
+let edited = writer.finish(store, new_path).await?;    // the original is untouched
 ```
 
-Each sidecar is fully self-describing: it contains its own block table and array metadata. On read, layers are walked newest-first; the first layer that has a chunk wins. `compact()` merges all layers into a new base and deletes the sidecars.
-
-```text
-Before compact:
-  mydata.af   mydata.1.af   mydata.2.af
-
-After compact:
-  mydata.af   (single merged file)
-```
+Copied chunks are read decompressed and packed into the new writer's blocks, so a rewrite can also change the codec or block size. Statistics are recomputed from the copied bytes.
 
 ## File API
 
 ```rust
-// On-disk — store: Arc<dyn ObjectStore>, path: object_store::path::Path
-ArrayFile::create(store, path, config).await?
-ArrayFile::open(store, path, config).await?   // base + any sidecars
+// Writer
+let mut writer = ArrayWriter::new(WriterConfig::new(codec));
+writer.define_array::<T>(name, dim_names, shape, chunk_shape, fill_value)?
+writer.write_array(name, start, ndarray_view)?          // sync; partial chunks are read-modify-written
+writer.set_attribute(name, key, AttributeValue::String("m/s".into()))?
+writer.copy_array(&source_file, name).await?            // from an open ArrayFile
+let file = writer.finish(store, path).await?            // writes once, returns the open file
 
-// In-memory (for testing) — backed by object_store's in-memory backend
-ArrayFile::create_memory(config).await?   // then flush()/compact() as normal
+// Reader — store: Arc<dyn ObjectStore>, path: object_store::path::Path
+let file = ArrayFile::open(store, path, ReadConfig::default()).await?;
+file.arrays()                       // &[ArrayInfo], file order, borrowed
+file.array(name)                    // Option<&ArrayInfo>
+file.read_array::<T>(name, start, shape).await?   // vec![], vec![] for the whole array
 
-// Schema
-file.define_array::<T>(name, dim_names, shape, chunk_shape, fill_value)?
-file.delete(name)?                        // logical delete (hidden until compact)
-file.list_arrays()                        // Vec<MergedArrayMeta>, deleted excluded
-file.num_layers()
+// Attributes (in memory from open)
+file.get_attribute(name, key)       // Option<&AttributeValue>
+file.attributes(name)               // Option<&HashMap<EcoString, AttributeValue>>
+file.attribute_index(key)           // Vec<(&str, Option<&AttributeValue>)>, one attribute across all arrays
 
-// ndarray read / write — works for all ArrayElement types
-file.write_array(name, start, ndarray_view).await?
-file.read_array::<T>(name, start, shape).await?   // vec![], vec![] for full array
-
-// Attributes
-file.set_attribute(name, key, AttributeValue::String("m/s".into()))?
-file.get_attribute(name, key)?
-file.attribute_index(key)                 // Vec<(&str, Option<&AttributeValue>)> — one attribute across all arrays, for pruning
-
-// Statistics (min/max/null_count/row_count, refreshed on flush & compact)
-file.array_stats(name)                    // Option<&ArrayStats>
-
-// Flush and compact
-file.flush().await?
-file.compact().await?
+// Statistics (in the footer, available on open)
+file.array_stats(name)              // Option<&ArrayStats>
+file.stats()                        // iterator over every array's ArrayStats
 ```
 
-### `FileConfig`
+### `WriterConfig` and `ReadConfig`
 
 ```rust
-FileConfig::new(Lz4Codec)                // defaults: 8 MiB blocks, 256 MiB block cache, 64 MiB I/O cache, no shared cache
-
-FileConfig {
+WriterConfig::new(Lz4Codec)          // default: 8 MiB blocks
+WriterConfig {
     codec: ZstdCodec { level: 3 },
     block_target_size: 8 * 1024 * 1024,
+}
+
+ReadConfig::default()                // 256 MiB block cache, 64 MiB I/O cache, no shared cache
+ReadConfig {
     cache_capacity: 256 * 1024 * 1024,
     io_cache_capacity: 64 * 1024 * 1024,
-    cache: None,                         // see "Sharing a cache across files"
+    cache: None,                     // see "Sharing a cache across files"
 }
 ```
 
+A reader needs no codec. Every block records its own.
+
 ### Sharing a cache across files
 
-By default each `ArrayFile` builds its own `DeltaCache` sized by `cache_capacity` and
-`io_cache_capacity`. When you open many files, that adds up. Set `config.cache` to a
-pre-built `Arc<DeltaCache>` to put every file under one shared byte budget — entries
-are keyed by `(file_path, block_id)`, so files do not interfere with each other.
+By default each `ArrayFile` builds its own `BlockCache` sized by `cache_capacity` and
+`io_cache_capacity`. When you open many files, that adds up. Set `ReadConfig::cache` to a
+pre-built `Arc<BlockCache>` to put every file under one shared byte budget. Entries are
+keyed by `(file_path, block_id)`, so files do not interfere with each other.
 
 ```rust
 use std::sync::Arc;
-use array_format::{ArrayFile, DeltaCache, FileConfig, Lz4Codec};
+use array_format::{ArrayFile, BlockCache, ReadConfig};
 
-let shared = Arc::new(DeltaCache::new(
+let shared = Arc::new(BlockCache::new(
     256 * 1024 * 1024,   // decompressed block budget
     64 * 1024 * 1024,    // raw I/O slab budget (0 to disable)
 ));
 
-let mut cfg = FileConfig::new(Lz4Codec);
-cfg.cache = Some(Arc::clone(&shared));
-
-let file_a = ArrayFile::open(store.clone(), path_a, cfg).await?;
+let config = ReadConfig { cache: Some(Arc::clone(&shared)), ..ReadConfig::default() };
+let file_a = ArrayFile::open(store.clone(), path_a, config).await?;
 // reuse `shared` for file_b, file_c, ... — all bounded by the same budget
 ```
 
-When `config.cache` is `Some`, the `cache_capacity` / `io_cache_capacity` fields are
-ignored for that file.
+When `cache` is `Some`, the two capacity fields are ignored for that file.
 
 ## Supported data types
 
@@ -171,6 +166,7 @@ Values stored contiguously, little-endian, no per-element headers. Safe zero-cop
 | `u8`, `u16`, `u32`, `u64`   | `UInt8` … `UInt64`   |
 | `i8`, `i16`, `i32`, `i64`   | `Int8` … `Int64`     |
 | `f32`, `f64`                | `Float32`, `Float64` |
+| `TimestampNs`               | `TimestampNs`        |
 
 ### Variable-length types
 
@@ -191,10 +187,10 @@ payload bytes   : 63 61 74  65 6C 65 70 68 61 6E 74
 
 ## Chunked layout
 
-Defining an array with a `chunk_shape` smaller than the full shape tiles the array into a coordinate grid. Each chunk is stored independently and can be updated without touching others.
+Defining an array with a `chunk_shape` smaller than the full shape tiles the array into a coordinate grid. Each chunk is stored independently, and a read touches only the chunks that overlap the requested region.
 
 ```rust
-file.define_array::<f32>(
+writer.define_array::<f32>(
     "grid",
     vec!["x".into(), "y".into()],
     vec![4000, 3000],           // full shape
@@ -215,7 +211,7 @@ file.define_array::<f32>(
   +--------+--------+--------+
 ```
 
-`write_array` performs read-modify-write automatically for partial chunk writes. Chunks that haven't been written are filled with the array's fill value on read.
+`write_array` need not be chunk-aligned. A chunk the region only partly covers is read back from the writer's own blocks, patched and written again. Chunks that are never written are not stored; they read as the array's fill value.
 
 When `chunk_shape` is `None`, the entire array is stored as a single chunk.
 
@@ -224,7 +220,7 @@ When `chunk_shape` is `None`, the entire array is stored as a single chunk.
 An axis may have length 0. The array then holds no elements. NetCDF declares such a dimension when the records it holds are absent, for example `N_HISTORY` in an Argo profile.
 
 ```rust
-file.define_array::<f32>(
+writer.define_array::<f32>(
     "history",
     vec!["n_history".into(), "x".into()],
     vec![0, 3],                 // an empty axis
@@ -235,7 +231,7 @@ file.define_array::<f32>(
 
 `write_array` with an empty view writes nothing and returns `Ok`. `read_array` returns an empty array of shape `[0, 3]`. A chunk extent of 0 on such an axis is stored as 1, because an empty axis yields no chunks. A chunk extent of 0 on a non-empty axis is rejected with `Error::InvalidChunkShape`.
 
-## On-disk layout (per delta file)
+## On-disk layout
 
 ```text
 +-------------------------------+ 0
@@ -253,11 +249,12 @@ file.define_array::<f32>(
 
 **Footer contents:**
 
-- `version` — format version (currently `5`)
-- `overlay_index` — which layer this file represents (`0` = base)
-- `base_file_hint` — stem of the base file
-- `blocks` — `Vec<BlockMeta>`: id, file offset, compressed/uncompressed sizes, codec
-- `arrays` — `Vec<ArrayMeta>`: name, dtype, shape, chunk_shape, chunk coordinates → `ChunkAddress`, fill_value, deleted flag, attributes
+- `version` — format version (currently `6`; files from version 5 and below are rejected)
+- `blocks` — `Vec<BlockMeta>`: id, file offset, compressed/uncompressed sizes, codec. Ids are dense, so `blocks[id]` is the block.
+- `strings` — the string pool: every attribute key and string value, stored once
+- `arrays` — `Vec<ArrayMeta>`, in definition order: name, dtype, shape, dimension names, chunk shape, fill value, the chunk table (coordinate → `ChunkAddress`, sorted by coordinate), attributes as `(key index, value)` pairs, and statistics
+
+Only strings are interned. An attribute value's `String` and `StringList` variants hold indices into the pool; every other value is stored inline.
 
 **`ChunkAddress`:**
 
@@ -265,19 +262,18 @@ file.define_array::<f32>(
 (block_id: u32, offset: u32, size: u32)
 ```
 
-Find the block by id, decompress, slice `[offset..offset+size]`.
+Find the block by id, decompress, slice `[offset..offset+size]`. The chunk table is sorted, so a coordinate is found by binary search.
 
-The footer is serialized with `rkyv`. Reading it is a two-pass operation: first read the 12-byte trailer to get `footer_size`, then read the footer payload.
+The footer is serialized with `rkyv`. Reading it is a two-pass operation: first read the 12-byte trailer to get `footer_size`, then read the footer payload. Nothing else is read until a chunk is requested.
 
 ## Storage
 
 Files are read and written through any
 [`object_store`](https://docs.rs/object_store) backend — local filesystem, S3,
-GCS, Azure, or its in-memory backend. Pass the `Arc<dyn ObjectStore>` and a base
-`path` (ending in `.af`) to `ArrayFile::create` / `ArrayFile::open`; array-format
-manages the base file, sidecars, and stats file within that store. There is no
-separate storage trait to implement — in-memory use goes through
-[`create_memory`](#in-memory-usage), which uses `object_store`'s in-memory backend.
+GCS, Azure, or its in-memory backend. Pass the `Arc<dyn ObjectStore>` and a
+`path` to `ArrayWriter::finish` and `ArrayFile::open`. A file is one object;
+there are no sidecars. `finish` streams the data region and the footer to the
+store in one pass without holding the whole file in memory.
 
 ## Compression codecs
 
@@ -287,41 +283,30 @@ separate storage trait to implement — in-memory use goes through
 | `Lz4Codec`            | Fast, via `lz4_flex`  |
 | `ZstdCodec { level }` | Level 1–22, default 3 |
 
-The codec is set once in `FileConfig`. Each block records its own codec in the block table, so files can be opened without specifying the codec that was used to write them.
-
-## Deletes and compaction
-
-`file.delete(name)` writes a tombstone to the pending layer. Deleted arrays are excluded from `list_arrays()` and all reads immediately, but their bytes remain on disk until `compact()`.
-
-```rust
-file.delete("old_array")?;
-file.flush().await?;
-
-// Later: merge all layers into a new base, delete sidecars, reclaim space
-file.compact().await?;
-assert_eq!(file.num_layers(), 1);
-```
+The codec is set once in `WriterConfig`. Each block records its own codec in the block table, so a file opens without any knowledge of how it was written.
 
 ## Attributes
 
-Each array carries user-defined key-value attributes (units, scale factors, provenance, …). Set and read them per array:
+Each array carries user-defined key-value attributes (units, scale factors, provenance, …). Set them on the writer, read them from the file:
 
 ```rust
-file.set_attribute("pressure", "units", AttributeValue::String("hPa".into()))?;
-file.get_attribute("pressure", "units")?;   // Option<&AttributeValue>
+writer.set_attribute("pressure", "units", AttributeValue::String("hPa".into()))?;
+// ...
+file.get_attribute("pressure", "units");   // Option<&AttributeValue>
+file.attributes("pressure");               // Option<&HashMap<EcoString, AttributeValue>>
 ```
 
-An `AttributeValue` is a scalar (`Bool`, the sized `Int*`/`UInt*`, `Float32`/`Float64`, `String`), raw `Binary(Vec<u8>)`, or a typed list of any of those (`Int32List`, `Float64List`, `StringList`, `BinaryList`, …):
+An `AttributeValue` is a scalar (`Bool`, the sized `Int*`/`UInt*`, `Float32`/`Float64`, `String`), raw `Binary`, or a typed list of any of those (`Int32List`, `Float64List`, `StringList`, `BinaryList`, …). Strings are `EcoString` and lists are boxed slices:
 
 ```rust
-file.set_attribute("pressure", "checksum", AttributeValue::Binary(vec![0xde, 0xad]))?;
-file.set_attribute("pressure", "valid_range", AttributeValue::Float32List(vec![0.0, 1100.0]))?;
+writer.set_attribute("pressure", "checksum", AttributeValue::Binary(Box::new([0xde, 0xad])))?;
+writer.set_attribute("pressure", "valid_range", AttributeValue::Float32List(Box::new([0.0, 1100.0])))?;
 ```
 
-Attributes live in the footer dictionaries and are fully in memory once the file is open, so there is no sidecar to maintain. To prune by attribute, `attribute_index` returns one attribute across every visible array in a single call — a full column with `None` where the attribute is absent — instead of walking arrays one by one:
+Attributes are in memory from the moment a file opens: one map per array, built straight from the footer. `get_attribute` is two hash lookups. `attribute_index` returns one attribute across every array in a single pass — a full column with `None` where the attribute is absent — so you can select arrays by attribute without a call per array:
 
 ```rust
-// Select the arrays measured in hPa without a per-array loop.
+// Select the arrays measured in hPa.
 let hpa: Vec<&str> = file
     .attribute_index("units")               // Vec<(&str, Option<&AttributeValue>)>
     .into_iter()
@@ -330,40 +315,31 @@ let hpa: Vec<&str> = file
     .collect();
 ```
 
-Logically deleted arrays are omitted from the result.
+Names and values borrow from the open file; the call allocates one vector.
 
-Each layer interns its own keys and values, so an attribute index is only
-meaningful against the layer that stores the array. Opening a file resolves
-every layer into one shared column store, keyed by attribute and interned once.
-`attribute_index` then reads a prebuilt column: 100K arrays return in under a
-millisecond, and both names and values borrow from the open file.
-
-Unflushed changes are not in that store, so a call made while writes are
-pending falls back to a per-array walk. `flush` before a run of these calls.
+The memory layout is deliberate. `EcoString` is 16 bytes and keeps up to 15 bytes inline, so a key like `units` or a value like `m/s` costs no allocation. Longer strings are one allocation shared by every array that carries the same value, because the on-disk pool stores each string once and the reader hands out clones. Lists are `Box<[T]>`, 16 bytes, which keeps the whole `AttributeValue` at 24 bytes.
 
 ### File-level metadata
 
-Attributes attach to arrays, so to describe the *file* as a whole (title, provenance, schema version) — including a metadata-only file with no data — define a scalar placeholder array with an empty shape and hang the attributes on it. Nothing is ever written to it, so `flush` skips stats and it costs almost nothing:
+Attributes attach to arrays, so to describe the *file* as a whole (title, provenance, schema version) — including a metadata-only file with no data — define a scalar placeholder array with an empty shape and hang the attributes on it. Nothing is written to it, so it costs its attributes and a few bytes of metadata:
 
 ```rust
-file.define_array::<u8>("__file__", vec![], vec![], None, None)?;   // empty shape → no data
-file.set_attribute("__file__", "title", AttributeValue::String("My Dataset".into()))?;
-file.flush().await?;
+writer.define_array::<u8>("__file__", vec![], vec![], None, None)?;   // empty shape → no data
+writer.set_attribute("__file__", "title", AttributeValue::String("My Dataset".into()))?;
 ```
 
-The placeholder appears in `list_arrays()` like any array; filter out its name to show only real data arrays. See `examples/10_file_metadata.rs`.
+The placeholder appears in `arrays()` like any array; filter out its name to show only real data arrays. See `examples/10_file_metadata.rs`.
 
 ## Statistics
 
-Every array carries aggregate statistics, recomputed automatically on `flush()` and `compact()` and persisted to a `{stem}.stats` sidecar (same rkyv + trailer format as the footer, magic `b"ARST"`). On `open()` they are loaded if present; a missing or unreadable stats file is not an error — `array_stats` simply returns `None` until the next flush.
+Every array carries aggregate statistics. The writer computes a partial (min, max, null count) for each chunk as it is written; a chunk written twice keeps only the last partial. `finish` merges the partials per array and stores the result in the footer, so statistics cost no second pass over the data and are available the moment a file opens.
 
 ```rust
-file.flush().await?;                       // computes & writes {stem}.stats
-
 if let Some(s) = file.array_stats("signal") {
     println!("{:?} .. {:?}", s.min, s.max);
     println!("{} of {} are fill/unwritten", s.null_count, s.row_count);
 }
+for s in file.stats() { /* every array, in file order */ }
 ```
 
 `ArrayStats` covers all chunks of one array:
@@ -387,21 +363,21 @@ pub enum StatValue {
 }
 ```
 
-Stats are computed incrementally: a flush only recomputes arrays whose chunks were dirtied in that flush and merges them with the previously stored stats, so unchanged arrays are not re-scanned.
-
 ## In-memory usage
 
-`create_memory` backs the file with `object_store`'s in-memory backend, so it
-behaves exactly like an on-disk file — same `flush`/`compact` — but keeps
-everything in process. Handy for tests and ephemeral pipelines.
+`object_store`'s in-memory backend makes a file that behaves exactly like one on disk but never leaves the process. Handy for tests and ephemeral pipelines.
 
 ```rust
-use array_format::{ArrayFile, FileConfig, NoCompression};
+use std::sync::Arc;
+use array_format::{ArrayWriter, NoCompression, WriterConfig};
+use object_store::memory::InMemory;
 
-let mut file = ArrayFile::create_memory(FileConfig::new(NoCompression)).await?;
-file.define_array::<i32>("data", vec!["x".into()], vec![10], None, None)?;
+let mut writer = ArrayWriter::new(WriterConfig::new(NoCompression));
+writer.define_array::<i32>("data", vec!["x".into()], vec![10], None, None)?;
 // ... write ...
-file.flush().await?;
+let file = writer
+    .finish(Arc::new(InMemory::new()), object_store::path::Path::from("data.af"))
+    .await?;
 ```
 
 ## License
