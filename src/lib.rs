@@ -76,6 +76,9 @@ mod attr_index;
 pub mod block;
 mod footer;
 pub mod layout;
+// The immutable format. Replaces the delta modules once its writer and reader
+// land; crate-private until then.
+mod v6;
 
 // ── Layer 2: Codec extension trait ──────────────────────────────────
 pub mod codec;
