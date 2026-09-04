@@ -1,6 +1,6 @@
 [package]
 name = "array-format"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A block-backed, footer-indexed container for storing multiple n-dimensional arrays in a single immutable file, with per-block compression, in-memory attributes and statistics, and any object_store backend."
