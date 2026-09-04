@@ -18,7 +18,10 @@ use crate::{
     codec::CompressionCodec,
     // The allocator is the block packer of the old delta layer. It moves here
     // under this name once the delta modules are removed.
-    delta::{AllocatorOutput, DeltaAllocator as BlockWriter, write_file_then_bytes},
+    delta::{
+        AllocatorOutput, DeltaAllocator as BlockWriter, DeltaCache as BlockCache,
+        write_file_then_bytes,
+    },
     dtype::DType,
     error::{Error, Result},
     file::DEFAULT_BLOCK_TARGET_SIZE,
@@ -27,7 +30,10 @@ use crate::{
     storage::{ObjectStoreBackend, Storage},
 };
 
-use super::{ArrayMeta, AttributeValue, DiskValue, FOOTER_VERSION, Footer, StringPool, nd};
+use super::{
+    ArrayFile, ArrayMeta, AttributeValue, DiskValue, FOOTER_VERSION, Footer, ReadConfig,
+    StringPool, nd,
+};
 
 /// Options for an [`ArrayWriter`].
 pub struct WriterConfig<C: CompressionCodec> {
@@ -194,19 +200,31 @@ impl ArrayWriter {
         Ok(())
     }
 
-    /// Writes the data region and the footer to `path` in `store`, then
-    /// consumes the writer.
+    /// Writes the data region and the footer to `path` in `store`, consumes
+    /// the writer, and returns the finished file open for reading.
+    ///
+    /// The reader is built from the footer in memory, so nothing is read
+    /// back. It uses the default [`ReadConfig`]; open the path again for a
+    /// shared cache.
     pub async fn finish(
         self,
         store: Arc<dyn object_store::ObjectStore>,
         path: object_store::path::Path,
-    ) -> Result<()> {
-        let storage = ObjectStoreBackend::new(store, path);
-        self.finish_to(&storage).await
+    ) -> Result<ArrayFile> {
+        let key: Arc<str> = Arc::from(path.as_ref());
+        let storage: Arc<dyn Storage> = Arc::new(ObjectStoreBackend::new(store, path));
+        self.finish_to(storage, key, ReadConfig::default().resolve_cache())
+            .await
     }
 
-    /// Writes the file to any [`Storage`].
-    pub(crate) async fn finish_to(self, storage: &dyn Storage) -> Result<()> {
+    /// Writes the file to any [`Storage`] and opens it. `path` is only the
+    /// reader's cache key.
+    pub(crate) async fn finish_to(
+        self,
+        storage: Arc<dyn Storage>,
+        path: Arc<str>,
+        cache: Option<Arc<BlockCache>>,
+    ) -> Result<ArrayFile> {
         let ArrayWriter { blocks, arrays } = self;
         let AllocatorOutput {
             mut file,
@@ -266,7 +284,8 @@ impl ArrayWriter {
             arrays: metas,
         };
         let footer_bytes = footer.serialize()?;
-        write_file_then_bytes(&mut file, output_size, &footer_bytes, storage).await
+        write_file_then_bytes(&mut file, output_size, &footer_bytes, &*storage).await?;
+        ArrayFile::from_footer(footer, storage, path, cache)
     }
 
     fn array(&self, name: &str) -> Result<&PendingArray> {
@@ -354,7 +373,7 @@ mod tests {
     use super::*;
     use crate::codec::decompress_by_id;
     use crate::stats::StatValue;
-    use crate::storage::InMemoryStorage;
+    use crate::storage::{InMemoryStorage, Storage};
     use crate::v6::read_footer;
     use crate::{NoCompression, ZstdCodec};
 
@@ -365,11 +384,14 @@ mod tests {
         })
     }
 
-    /// Finishes into memory and returns the raw file plus its parsed footer.
+    /// Finishes into memory and returns the raw file plus its parsed footer,
+    /// read back from the bytes, so these tests check what is on disk.
     async fn finish(w: ArrayWriter) -> (Vec<u8>, Footer) {
-        let storage = InMemoryStorage::new();
-        w.finish_to(&storage).await.unwrap();
-        let footer = read_footer(&storage).await.unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        w.finish_to(storage.clone(), Arc::from("mem"), None)
+            .await
+            .unwrap();
+        let footer = read_footer(&*storage).await.unwrap();
         let size = storage.size().await.unwrap();
         let raw = storage.read_range(0..size).await.unwrap().to_vec();
         (raw, footer)

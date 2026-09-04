@@ -1,14 +1,16 @@
-//! n-dimensional helpers for the writer.
+//! n-dimensional helpers shared by the writer and the reader.
 //!
 //! [`write_nd`] scatters an `ndarray` view into the chunks it covers. A chunk
 //! that the region only partly covers is read back from the writer's own
-//! blocks, patched, and written again.
+//! blocks, patched, and written again. [`assemble_nd`] gathers a region back
+//! out of a finished file, reading only the written chunks that overlap it.
 
 use std::ops::Range;
 
 use crate::array::ArrayElement;
 use crate::error::{Error, Result};
 
+use super::reader::{ArrayFile, ArrayInfo};
 use super::writer::ArrayWriter;
 
 pub(crate) fn make_si(
@@ -162,4 +164,95 @@ where
     }
 
     Ok(())
+}
+
+/// Assembles a region of `info` from `file`. `None` means the whole array.
+///
+/// The output starts as the fill value. Only written chunks that overlap the
+/// region are read, so an array that is mostly unwritten costs little.
+pub(crate) async fn assemble_nd<T>(
+    file: &ArrayFile,
+    info: &ArrayInfo,
+    slice: Option<&[Range<usize>]>,
+) -> Result<ndarray::ArcArray<T, ndarray::IxDyn>>
+where
+    T: ArrayElement,
+{
+    if info.dtype != T::DTYPE {
+        return Err(Error::DTypeMismatch {
+            expected: info.dtype.clone(),
+            actual: T::DTYPE,
+        });
+    }
+    let fill = T::fill_element(info.fill_value.as_ref());
+    let full_shape: Vec<usize> = info.shape.iter().map(|&x| x as usize).collect();
+    let chunk_shape: Vec<usize> = info.chunk_shape.iter().map(|&x| x as usize).collect();
+    let ndim = full_shape.len();
+
+    let effective: Vec<Range<usize>> = match slice {
+        None => full_shape.iter().map(|&s| 0..s).collect(),
+        Some(s) => {
+            if s.len() != ndim {
+                return Err(Error::InvalidFooter(format!(
+                    "slice has {} axes but '{}' has {ndim}",
+                    s.len(),
+                    info.name
+                )));
+            }
+            s.iter()
+                .zip(&full_shape)
+                .map(|(r, &s)| r.start.min(s)..r.end.min(s))
+                .collect()
+        }
+    };
+
+    let output_shape: Vec<usize> = effective.iter().map(|r| r.end - r.start).collect();
+    let mut output =
+        ndarray::Array::<T, ndarray::IxDyn>::from_elem(ndarray::IxDyn(&output_shape), fill);
+
+    for coord in info.written_chunks() {
+        let chunk_range: Vec<Range<usize>> = (0..ndim)
+            .map(|i| {
+                let start = coord[i] as usize * chunk_shape[i];
+                let end = (start + chunk_shape[i]).min(full_shape[i]);
+                start..end
+            })
+            .collect();
+
+        let overlap: Vec<Range<usize>> = (0..ndim)
+            .map(|i| {
+                effective[i].start.max(chunk_range[i].start)
+                    ..effective[i].end.min(chunk_range[i].end)
+            })
+            .collect();
+
+        if overlap.iter().any(|r| r.is_empty()) {
+            continue;
+        }
+
+        let values = file.read_chunk::<T>(info, coord).await?;
+        let chunk_actual_shape: Vec<usize> = chunk_range.iter().map(|r| r.end - r.start).collect();
+        let chunk_nd = ndarray::Array::from_shape_vec(ndarray::IxDyn(&chunk_actual_shape), values)
+            .map_err(|e| Error::InvalidFooter(e.to_string()))?;
+
+        let chunk_si = make_si(
+            &(0..ndim)
+                .map(|i| {
+                    (overlap[i].start - chunk_range[i].start)
+                        ..(overlap[i].end - chunk_range[i].start)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let out_si = make_si(
+            &(0..ndim)
+                .map(|i| {
+                    (overlap[i].start - effective[i].start)..(overlap[i].end - effective[i].start)
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        output.slice_mut(out_si).assign(&chunk_nd.slice(chunk_si));
+    }
+
+    Ok(output.into_shared())
 }

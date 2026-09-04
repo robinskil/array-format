@@ -70,13 +70,18 @@ pub(crate) struct ArrayMeta {
 
 impl ArrayMeta {
     /// Returns the address of the chunk at `coord`, or `None` if it was
-    /// never written. Binary search, since `chunks` is sorted.
+    /// never written.
     pub(crate) fn chunk(&self, coord: &[u32]) -> Option<&ChunkAddress> {
-        self.chunks
-            .binary_search_by(|e| e.coord.as_slice().cmp(coord))
-            .ok()
-            .map(|i| &self.chunks[i].address)
+        find_chunk(&self.chunks, coord)
     }
+}
+
+/// Binary search over a chunk table sorted by coordinate.
+pub(crate) fn find_chunk<'a>(chunks: &'a [ChunkEntry], coord: &[u32]) -> Option<&'a ChunkAddress> {
+    chunks
+        .binary_search_by(|e| e.coord.as_slice().cmp(coord))
+        .ok()
+        .map(|i| &chunks[i].address)
 }
 
 impl Footer {

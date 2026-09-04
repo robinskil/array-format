@@ -13,8 +13,10 @@
 pub(crate) mod attr;
 pub(crate) mod footer;
 pub(crate) mod nd;
+pub(crate) mod reader;
 pub(crate) mod writer;
 
 pub(crate) use attr::{AttributeValue, DiskValue, StringPool};
 pub(crate) use footer::{ArrayMeta, FOOTER_VERSION, Footer, read_footer};
+pub(crate) use reader::{ArrayFile, ArrayInfo, ReadConfig};
 pub(crate) use writer::{ArrayWriter, WriterConfig};
