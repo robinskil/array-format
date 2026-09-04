@@ -1,5 +1,6 @@
 //! Pending delta layer: accumulates writes in memory before being sealed.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -34,6 +35,10 @@ pub struct DeltaMutable {
     pub attr_keys: Vec<String>,
     /// Interned attribute values, parallel to `attr_keys`.
     pub attr_values: Vec<AttributeValue>,
+    /// Key string to its index in `attr_keys`.
+    attr_key_ids: HashMap<String, usize>,
+    /// Value to its index in `attr_values`.
+    attr_value_ids: HashMap<AttributeValue, usize>,
 }
 
 fn alloc_addr_from_chunk(addr: &ChunkAddress) -> BlockAllocAddress {
@@ -54,6 +59,8 @@ impl Delta<DeltaMutable> {
                 allocator: DeltaAllocator::new(codec, block_target_size),
                 attr_keys: Vec::new(),
                 attr_values: Vec::new(),
+                attr_key_ids: HashMap::new(),
+                attr_value_ids: HashMap::new(),
             },
         }
     }
@@ -155,22 +162,24 @@ impl Delta<DeltaMutable> {
 
     /// Interns `key` into the attribute key dictionary, returning its index.
     pub fn intern_attr_key(&mut self, key: &str) -> usize {
-        if let Some(i) = self.inner.attr_keys.iter().position(|k| k == key) {
-            i
-        } else {
-            self.inner.attr_keys.push(key.to_string());
-            self.inner.attr_keys.len() - 1
+        if let Some(&i) = self.inner.attr_key_ids.get(key) {
+            return i;
         }
+        let i = self.inner.attr_keys.len();
+        self.inner.attr_keys.push(key.to_string());
+        self.inner.attr_key_ids.insert(key.to_string(), i);
+        i
     }
 
     /// Interns `value` into the attribute value dictionary, returning its index.
     pub fn intern_attr_value(&mut self, value: AttributeValue) -> usize {
-        if let Some(i) = self.inner.attr_values.iter().position(|v| *v == value) {
-            i
-        } else {
-            self.inner.attr_values.push(value);
-            self.inner.attr_values.len() - 1
+        if let Some(&i) = self.inner.attr_value_ids.get(&value) {
+            return i;
         }
+        let i = self.inner.attr_values.len();
+        self.inner.attr_value_ids.insert(value.clone(), i);
+        self.inner.attr_values.push(value);
+        i
     }
 
     /// Reads raw (uncompressed) chunk bytes previously written into this

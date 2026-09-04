@@ -912,6 +912,9 @@ impl ArrayFile {
         // that point at the wrong strings.
         let mut attr_keys: Vec<String> = Vec::new();
         let mut attr_values: Vec<crate::layout::AttributeValue> = Vec::new();
+        let mut key_ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut value_ids: std::collections::HashMap<crate::layout::AttributeValue, usize> =
+            std::collections::HashMap::new();
 
         for name in &merged_names {
             let (meta, attr_entries) = {
@@ -957,8 +960,14 @@ impl ArrayFile {
             new_meta.layout.storage.chunks = new_chunks;
             let mut attributes = Attributes::empty(new_meta.attributes.index_kind());
             for (k, v) in attr_entries {
-                let key_idx = intern(&mut attr_keys, k);
-                let val_idx = intern(&mut attr_values, v);
+                let key_idx = *key_ids.entry(k.clone()).or_insert_with(|| {
+                    attr_keys.push(k);
+                    attr_keys.len() - 1
+                });
+                let val_idx = *value_ids.entry(v.clone()).or_insert_with(|| {
+                    attr_values.push(v);
+                    attr_values.len() - 1
+                });
                 attributes.upsert(key_idx, val_idx);
             }
             new_meta.attributes = attributes;
@@ -1032,17 +1041,6 @@ fn resolve_cache<C: CompressionCodec>(config: &FileConfig<C>) -> Option<Arc<Delt
             config.cache_capacity as u64,
             config.io_cache_capacity as u64,
         )))
-    }
-}
-
-/// Returns the index of `item` in `dict`, appending it if absent.
-fn intern<T: PartialEq>(dict: &mut Vec<T>, item: T) -> usize {
-    match dict.iter().position(|d| *d == item) {
-        Some(i) => i,
-        None => {
-            dict.push(item);
-            dict.len() - 1
-        }
     }
 }
 
